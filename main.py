@@ -53,9 +53,9 @@ def sanitize_id(raw_id):
 
 try:
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-    CONTROL_CENTER_ID = sanitize_id(os.getenv("CONTROL_CENTER_ID"))
+    raw_cc_id = os.getenv("CONTROL_CENTER_ID")
+    INPUT_CC_ID = sanitize_id(raw_cc_id)
     
-    # Client初期化
     notion = Client(auth=os.getenv("NOTION_TOKEN"))
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     
@@ -67,6 +67,42 @@ try:
 except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
+
+# --- ★重要：ID自動探索機能 ---
+def resolve_real_database_id(candidate_id):
+    """
+    ユーザーがページIDを入れてしまった場合、その中にあるデータベースIDを自動で探す
+    """
+    print(f"🔍 Validating ID: {candidate_id[:4]}...{candidate_id[-4:]}", flush=True)
+    
+    # 1. まずデータベースとしてアクセスしてみる
+    try:
+        notion.request(path=f"databases/{candidate_id}", method="GET")
+        print("✅ ID is a valid Database.", flush=True)
+        return candidate_id
+    except Exception:
+        print("⚠️ ID is not a Database directly. Checking if it's a Page...", flush=True)
+
+    # 2. ダメならページとして中身（Blocks）を見る
+    try:
+        response = notion.request(path=f"blocks/{candidate_id}/children", method="GET")
+        children = response.get('results', [])
+        
+        # ページの中にある「インラインデータベース」を探す
+        for block in children:
+            if block['type'] == 'child_database':
+                found_id = block['id'].replace("-", "")
+                title = block.get('child_database', {}).get('title', 'Untitled')
+                print(f"🎯 Found Inline Database inside the page! Name: {title}", flush=True)
+                print(f"🔄 Switching ID to: {found_id}", flush=True)
+                return found_id
+                
+        print("❌ Error: Provided ID is a Page, but no Database was found inside it.", flush=True)
+        return None
+        
+    except Exception as e:
+        print(f"❌ ID Resolution Failed: {e}", flush=True)
+        return None
 
 # --- Helper Functions ---
 
@@ -159,14 +195,14 @@ def analyze_audio_auto(file_path):
         以下の音声はコーチングセッションの録音です。
         以下の情報を抽出し、JSON形式のみを出力してください。Markdown装飾は不要です。
         
-        【生徒名の抽出ルール】
-        1. 会話中の呼びかけ（「〇〇さん」）から名前を特定してください。
-        2. 登録名と一致するか不明でも、聞こえたままの音（カタカナやニックネーム）を入力してください。
-        3. 絶対に 'Unknown' にせず、候補を挙げてください。
+        【生徒名の特定ルール】
+        1. 呼びかけから生徒名を推測してください。
+        2. 「デッティー」と聞こえた場合は、必ず『Tetu』と出力してください。
+        3. 登録名と一致するか不明でも、聞こえたままの音（カタカナやニックネーム）を入力してください。
         
         {
-          "student_name": "生徒の名前（例: Tetu, デッティー, 田中）",
-          "date": "YYYY-MM-DD (不明なら 'Today' と出力)",
+          "student_name": "生徒の名前（例: Tetu, Tanaka）",
+          "date": "YYYY-MM-DD (不明ならToday)",
           "summary": "セッション要約（300文字以内）",
           "next_action": "次回の宿題"
         }
@@ -179,7 +215,6 @@ def analyze_audio_auto(file_path):
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match: 
             data = json.loads(match.group(0))
-            # 日付補正
             if data.get('date') in ['Unknown', 'Today']:
                 data['date'] = datetime.now().strftime('%Y-%m-%d')
             return data
@@ -190,8 +225,13 @@ def analyze_audio_auto(file_path):
         raise e
 
 def main():
-    print("--- VERSION: RAW REQUEST MODE (v11.0) ---", flush=True)
+    print("--- VERSION: DATABASE HUNTER (v13.0) ---", flush=True)
     
+    # 1. IDの自動解決 (Page ID -> DB ID)
+    REAL_CC_ID = resolve_real_database_id(INPUT_CC_ID)
+    if not REAL_CC_ID:
+        return # 解決不能なら終了
+
     if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
         return
@@ -241,14 +281,15 @@ def main():
         
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
         
-        # ★ここが変更点: requestメソッドで直通信
         cc_res = notion.request(
-            path=f"databases/{CONTROL_CENTER_ID}/query",
+            path=f"databases/{REAL_CC_ID}/query", # ここで解決済みのIDを使う
             method="POST",
             body={
                 "filter": {
                     "property": "Name",
-                    "rich_text": {"equals": result['student_name']}
+                    "title": { # rich_text -> title
+                        "equals": result['student_name']
+                    }
                 }
             }
         )
@@ -259,15 +300,17 @@ def main():
             target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             if target_id_prop:
                 target_id = sanitize_id(target_id_prop[0]["plain_text"])
-                if target_id:
-                    print(f"📝 Writing to Student DB: {target_id}", flush=True)
+                # 生徒側IDも同様に解決を試みる（念のため）
+                real_target_id = resolve_real_database_id(target_id)
+                
+                if real_target_id:
+                    print(f"📝 Writing to Student DB: {real_target_id}", flush=True)
                     
-                    # 書き込みも直通信
                     notion.request(
                         path="pages",
                         method="POST",
                         body={
-                            "parent": {"database_id": target_id},
+                            "parent": {"database_id": real_target_id},
                             "properties": {
                                 "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
                                 "日付": {"date": {"start": result['date']}}
@@ -284,12 +327,12 @@ def main():
                     processed_folder_id = get_or_create_processed_folder()
                     move_files_to_processed(processed_file_ids, processed_folder_id)
                 else:
-                     print("❌ Error: TargetID in Notion is invalid.", flush=True)
+                     print("❌ Error: TargetID in Notion is invalid or empty.", flush=True)
             else:
-                print("❌ Error: TargetID is empty in Control Center.", flush=True)
+                print("❌ Error: TargetID column is empty in Control Center.", flush=True)
         else:
             print(f"❌ Error: Student '{result['student_name']}' not found in Control Center.", flush=True)
-            print("ℹ️ Check exact spelling in Notion.", flush=True)
+            print("ℹ️ Check spelling in Notion.", flush=True)
 
     except Exception as e:
         print(f"❌ Processing Failed: {e}", flush=True)

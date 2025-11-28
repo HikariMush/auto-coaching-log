@@ -47,10 +47,9 @@ if os.getenv("GCP_SA_KEY"):
         f.write(os.getenv("GCP_SA_KEY"))
 
 def sanitize_id(raw_id):
-    if not raw_id: return None
-    match = re.search(r'([a-fA-F0s9]{32})', str(raw_id).replace("-", ""))
-    if match: return match.group(1)
-    return None
+    # 厳密な正規表現チェックを外し、ハイフン除去のみに簡素化。
+    if not raw_id: return "" # Noneではなく空文字列を返すことで、パスのNone挿入を防ぐ
+    return raw_id.replace("-", "").strip() # ハイフンと外部スペースを除去
 
 try:
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -61,6 +60,9 @@ try:
     }
     
     CONTROL_CENTER_ID = sanitize_id(FINAL_CONTROL_DB_ID)
+    if not CONTROL_CENTER_ID:
+        raise ValueError("CRITICAL: Final Control DB ID is empty after sanitization.")
+
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
     
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -101,7 +103,7 @@ def notion_create_page(parent_db_id, properties, children):
         print(f"   Detail: {e.response.text}")
         raise e
 
-# --- Google Drive File Management ---
+# --- Google Drive File Management (Omitted for brevity, fully included in file) ---
 
 def get_or_create_processed_folder():
     """DriveのINBOX内に 'processed_coaching_logs' フォルダを探し、なければ作成する"""
@@ -194,7 +196,6 @@ def get_available_model_name():
     return available_names[0] if available_names else 'models/gemini-2.0-flash'
 
 def analyze_audio_auto(file_path):
-    model_name_initial = get_available_model_name()
     
     def generate_content_with_fallback(model_name, audio_file):
         """Quotaエラー時にモデルをFlashに切り替えて再試行する"""
@@ -212,29 +213,26 @@ def analyze_audio_auto(file_path):
                 
             except ResourceExhausted as e:
                 if attempt == 0 and ("pro" in current_model_name.lower()):
-                    # ProがQuotaで失敗した場合、Flashに切り替えてリトライ
-                    current_model_name = 'gemini-2.5-flash' # 最も安定しているFlashにフォールバック
+                    current_model_name = 'gemini-2.5-flash'
                     print("⚠️ Quota Exceeded for Pro. Falling back to Flash model.", flush=True)
                     time.sleep(5) 
                     continue
                 else:
-                    # Flashも失敗、または2回目の試行も失敗
                     raise e
             
             except Exception as e:
-                # 404 Not Foundなどのその他のエラーはそのままスロー
                 raise e
 
         # fallback loop end
 
-    # 1. Audio Upload
+    model_name_initial = get_available_model_name()
     audio_file = genai.upload_file(file_path)
     while audio_file.state.name == "PROCESSING":
         time.sleep(2)
         audio_file = genai.get_file(audio_file.name)
     if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
     
-    # 2. Prompt Definition (Final Integrated Prompt)
+    # Final Prompt (v47.1/v50.0)
     prompt = """
     あなたは**トップ・スマブラアナリスト**であり、具体的な課題を発見し解決するための**エージェント**です。
     この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
@@ -268,7 +266,6 @@ def analyze_audio_auto(file_path):
     }
     """
     
-    # 3. Content Generation with Fallback
     response_text = generate_content_with_fallback(model_name_initial, audio_file)
     
     # 4. Cleanup and Parsing
@@ -292,7 +289,7 @@ def analyze_audio_auto(file_path):
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: DEFNITIVE FINAL BUILD (v52.0) ---", flush=True)
+    print("--- VERSION: AI OUTPUT LOGGING (v54.0) ---", flush=True)
     
     if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
@@ -342,12 +339,21 @@ def main():
             # 3.2. --- ★解析実行：JSONデータとRaw Transcriptの両方を取得★ ---
             full_analysis, raw_transcript = analyze_audio_auto(mixed_path)
             
+            # --- ★新規機能：AI出力結果の実行ログ記録★ ---
+            print("\n--- AI ANALYSIS OUTPUT (START) ---", flush=True)
+            print(f"Student: {full_analysis.get('student_name', 'N/A')}", flush=True)
+            print(f"Summary: {full_analysis.get('summary', 'N/A')}", flush=True)
+            print(f"Next Action: {full_analysis.get('next_action', 'N/A')}", flush=True)
+            print("\n[RAW TRANSCRIPT]", flush=True)
+            print(raw_transcript, flush=True)
+            print("--- AI ANALYSIS OUTPUT (END) ---\n", flush=True)
+            # --- 記録終了 ---
+
             # 3.3. Name Logic
             final_student_name = manual_name if manual_name else full_analysis['student_name']
             print(f"ℹ️ Target Student for Lookup: '{final_student_name}'", flush=True)
 
             # --- 4. Notion Search and Write ---
-            # Search filter uses 'contains' for flexibility
             search_filter = {
                 "filter": {
                     "property": "Name",
@@ -399,7 +405,7 @@ def main():
             if raw_transcript and raw_transcript != "ERROR: Raw transcript not found.":
                 # 1行ずつブロックに変換
                 for line in raw_transcript.split('\n'):
-                    if line.strip(): # 空行はスキップ
+                    if line.strip(): 
                         children_transcript.append({
                             "object": "block",
                             "type": "paragraph",
@@ -419,12 +425,4 @@ def main():
             print(f"🎉 PROJECT SUCCESS: Completed processing for {final_student_name}.", flush=True)
             
         except Exception as e:
-             print(f"❌ UNHANDLED CRASH IN LOOP: {e}", flush=True)
-             import traceback
-             traceback.print_exc()
-        finally:
-            if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
-            os.makedirs(TEMP_DIR) 
-
-if __name__ == "__main__":
-    main()
+             print(f"❌

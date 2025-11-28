@@ -31,8 +31,8 @@ from googleapiclient.http import MediaIoBaseDownload
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- 最終設定 ---
-# ⚠️ 注意: ここが Control Center DBのIDです。
+# --- 最終設定（ハードコード） ---
+# Control Center DBのID (通知Botで実績のあるID)
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664" 
 
 # --- 初期化 ---
@@ -175,17 +175,27 @@ def mix_audio_files(file_paths):
         return max(file_paths, key=os.path.getsize)
 
 def get_available_model_name():
+    print("🔍 Searching for highest available Pro model...", flush=True)
     models = list(genai.list_models())
     available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+
+    # 優先順位 1: 2.5 Pro (最高品質)
+    for name in available_names:
+        if 'gemini-2.5-pro' in name: return name 
+
+    # 優先順位 2: 2.0 Pro
+    for name in available_names:
+        if 'gemini-2.0-pro' in name: return name 
+
+    # 優先順位 3: 2.5/2.0 Flash (安定/速度重視)
     for name in available_names:
         if 'gemini-2.0-flash' in name and 'exp' not in name: return name
     for name in available_names:
         if 'gemini-2.5-flash' in name: return name
     for name in available_names:
-        if 'gemini-2.0-flash' in name: return name
-    for name in available_names:
         if 'flash' in name: return name
-    return 'models/gemini-2.0-flash'
+
+    return available_names[0] if available_names else 'models/gemini-2.0-flash'
 
 def analyze_audio_auto(file_path):
     model_name = get_available_model_name()
@@ -197,35 +207,63 @@ def analyze_audio_auto(file_path):
         audio_file = genai.get_file(audio_file.name)
     if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
     
+    # ★プロンプト修正：最終版スマブラ専門用語と認知分析、デュアル出力
     prompt = """
-    【生徒名の特定ルール】
-    1. 呼びかけから生徒名を推測してください。
-    2. それ以外の場合も、聞こえたままの音（カタカナやニックネーム）を入力してください。
+    あなたは**トップ・スマブラアナリスト**であり、具体的な課題を発見し解決するための**エージェント**です。
+    この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
+
+    【制約事項と文脈の優先度】
+    1. **最優先ドメイン用語**: 「着地狩り」「崖際」「復帰阻止」「間合い」「確定反撃」などの専門用語を優先して正確に抽出せよ。
+    2. **会話のフロー**: 会話は、(1)取り組み全般、(2)過去の課題フィードバック、(3)新しい課題発見と解決策提示、の工程に分かれる。
+
+    ---
+    **[RAW_TRANSCRIPTION_START]**
+    まず、会話全体を可能な限り正確に、逐語訳形式で文字起こしせよ。
+    **[RAW_TRANSCRIPTION_END]**
+    ---
+
+    【コア分析構造：5要素抽出】
+    上記の文字起こしに基づき、スマブラの内容および生活改善、取り組み改善における話題は、以下の5要素に分割し、詳細な議事録として記録せよ。
+    * **現状** (Current Status)
+    * **課題** (Problem/Issue)
+    * **原因** (Root Cause)
+    * **改善案** (Proposed Solution)
+    * **やること** (Next Action/Commitment)
+
+    【最終出力形式】
+    上記の詳細分析に基づき、最終的なコミットメントの記録として、以下のJSON構造のみを生成せよ。
     
     {
-      "student_name": "生徒の名前（例: でっていう, 田中）",
+      "student_name": "生徒の名前（例: らぎぴ, トロピウス）",
       "date": "YYYY-MM-DD (不明ならToday)",
-      "summary": "セッション要約（300文字以内）",
-      "next_action": "次回の宿題"
+      "summary": "[感情アイコン] - セッションで特定されたコアな課題と、それを超えるための新しい**コミットメント**（150字以内）。",
+      "next_action": "クライアントが具体的にコミットした、次のタスクと**期限（YYYY-MM-DDまたはN日後）**"
     }
     """
-    response = model.generate_content(prompt, audio_file)
+    response = model.generate_content([prompt, audio_file])
     try: genai.delete_file(audio_file.name)
     except: pass
-    
+
     text = response.text.strip()
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if match: 
-        data = json.loads(match.group(0))
+    
+    # 1. RAW TRANSCRIPTIONを抽出
+    transcript_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
+    raw_transcript = transcript_match.group(1).strip() if transcript_match else "ERROR: Raw transcript not found."
+    
+    # 2. JSONを抽出
+    json_match = re.search(r'\{.*\}', text, re.DOTALL)
+    if json_match: 
+        data = json.loads(json_match.group(0))
+        
         if data.get('date') in ['Unknown', 'Today']:
             data['date'] = datetime.now().strftime('%Y-%m-%d')
-        return data
+        return data, raw_transcript # ★両方のデータを返す
     else: 
         raise ValueError("JSON Parse Failed")
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: FINAL PRODUCTION BUILD (v40.0) ---", flush=True)
+    print("--- VERSION: FINAL PRODUCTION BUILD (v47.0) ---", flush=True)
     
     if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
@@ -256,14 +294,12 @@ def main():
         file_id = file['id']
         file_name = file['name']
         
-        # Audio Processing & Analysis (Must be performed for summary)
         try:
             print(f"\nProcessing File: {file_name}", flush=True)
             
-            # 3.1. Audio Processing (Download, Mix, Analyze)
+            # 3.1. Audio Processing
             local_audio_paths = []
             
-            # --- Download/Extract Logic ---
             path = download_file(file_id, file_name)
             if file_name.lower().endswith('.zip'):
                 local_audio_paths.extend(extract_audio_from_zip(path))
@@ -275,20 +311,14 @@ def main():
             
             mixed_path = mix_audio_files(local_audio_paths)
             
-            # --- Result Generation ---
-            full_analysis = analyze_audio_auto(mixed_path)
+            # 3.2. --- ★解析実行：JSONデータとRaw Transcriptの両方を取得★ ---
+            full_analysis, raw_transcript = analyze_audio_auto(mixed_path)
             
-            if manual_name:
-                # MANUAL PATH: Use manual name, keep AI summary
-                final_student_name = manual_name
-                print(f"✅ MANUAL MODE: Overriding name to '{final_student_name}'.", flush=True)
-            else:
-                # FULL AUTO PATH: Use AI's extracted name
-                final_student_name = full_analysis['student_name']
-                print(f"ℹ️ AUTO MODE: Using AI-extracted name '{final_student_name}'.", flush=True)
+            # 3.3. Name Logic
+            final_student_name = manual_name if manual_name else full_analysis['student_name']
+            print(f"ℹ️ Target Student for Lookup: '{final_student_name}'", flush=True)
 
             # --- 4. Notion Search and Write ---
-            # Search filter uses 'contains' for flexibility
             search_filter = {
                 "filter": {
                     "property": "Name",
@@ -306,32 +336,59 @@ def main():
             # 5. Extract Target ID and Write
             target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             
-            if target_id_prop:
-                final_target_id = sanitize_id(target_id_prop[0]["plain_text"])
+            if not target_id_prop:
+                print("❌ Error: TargetID is empty in Control Center. Skipping write.", flush=True)
+                continue
+            
+            final_target_id = sanitize_id(target_id_prop[0]["plain_text"])
+
+            if not final_target_id:
+                print(f"❌ Error: TargetID for {final_student_name} is invalid.", flush=True)
+                continue
+
+            # 5.1. --- ★メインログ（要約）の作成と書き込み★ ---
+            properties_summary = {
+                "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ (要約)"}}]},
+                "日付": {"date": {"start": full_analysis['date']}}
+            }
+            children_summary = [
+                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": full_analysis['summary']}}]}},
+                {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
+                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": full_analysis.get('next_action', 'なし')}}]}}
+            ]
+            notion_create_page(final_target_id, properties_summary, children_summary)
+            print(f"✅ Summary Log written for {final_student_name}.", flush=True)
+
+            
+            # 5.2. --- ★新規機能：純粋な文字起こしログの作成と書き込み★ ---
+            
+            properties_transcript = {
+                "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ (全文)"}}]},
+                "日付": {"date": {"start": full_analysis['date']}}
+            }
+            
+            children_transcript = []
+            if raw_transcript and raw_transcript != "ERROR: Raw transcript not found.":
+                # 1行ずつブロックに変換
+                for line in raw_transcript.split('\n'):
+                    if line.strip(): # 空行はスキップ
+                        children_transcript.append({
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {"rich_text": [{"text": {"content": line}}]}
+                        })
+            
+            if children_transcript:
+                notion_create_page(final_target_id, properties_transcript, children_transcript)
+                print(f"✅ Full Transcript written for {final_student_name}.", flush=True)
+            else:
+                print("⚠️ Transcript was empty or not found. Skipping full text write.", flush=True)
                 
-                if final_target_id:
-                    print(f"📝 Writing log to Target DB ID: {final_target_id}", flush=True)
-                    
-                    # 4. ページ作成 (Raw Request)
-                    properties = {
-                        "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ"}}]},
-                        "日付": {"date": {"start": full_analysis['date']}}
-                    }
-                    children = [
-                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": full_analysis['summary']}}]}},
-                        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
-                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": full_analysis.get('next_action', 'なし')}}]}}
-                    ]
-                    
-                    notion_create_page(final_target_id, properties, children)
-                    
-                    print(f"✅ Successfully updated Notion for {final_student_name}.", flush=True)
-                    
-                    # 6. File cleanup (Must be inside successful write block)
-                    processed_folder_id = get_or_create_processed_folder()
-                    move_files_to_processed([file_id], processed_folder_id)
-                else:
-                     print(f"❌ Error: TargetID in Control Center for {final_student_name} is invalid.", flush=True)
+            
+            # 6. クリーンアップ
+            processed_folder_id = get_or_create_processed_folder()
+            move_files_to_processed([file_id], processed_folder_id)
+            print(f"🎉 PROJECT SUCCESS: Completed processing for {final_student_name}.", flush=True)
             
         except Exception as e:
              print(f"❌ UNHANDLED CRASH IN LOOP: {e}", flush=True)

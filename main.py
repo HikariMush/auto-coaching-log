@@ -44,17 +44,10 @@ if os.getenv("GCP_SA_KEY"):
     with open("service_account.json", "w") as f:
         f.write(os.getenv("GCP_SA_KEY"))
 
-# IDクリーニング
-def sanitize_id(raw_id):
-    if not raw_id: return None
-    match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
-    if match: return match.group(1)
-    return None
-
 try:
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-    raw_cc_id = os.getenv("CONTROL_CENTER_ID")
-    INPUT_CC_ID = sanitize_id(raw_cc_id)
+    # 一応IDは読むが、間違っていたら検索モードに入る
+    ENV_CC_ID = os.getenv("CONTROL_CENTER_ID")
     
     notion = Client(auth=os.getenv("NOTION_TOKEN"))
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -68,40 +61,58 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- ★重要：ID自動探索機能 ---
-def resolve_real_database_id(candidate_id):
+# --- ★根本解決：データベース自動探索機能 ---
+def find_real_control_center_id():
     """
-    ユーザーがページIDを入れてしまった場合、その中にあるデータベースIDを自動で探す
+    IDが間違っていても、Botが見える全データベースから
+    'Control Center' という名前のものを探して特定する
     """
-    print(f"🔍 Validating ID: {candidate_id[:4]}...{candidate_id[-4:]}", flush=True)
+    print("🔍 Scanning all accessible databases...", flush=True)
     
-    # 1. まずデータベースとしてアクセスしてみる
     try:
-        notion.request(path=f"databases/{candidate_id}", method="GET")
-        print("✅ ID is a valid Database.", flush=True)
-        return candidate_id
-    except Exception:
-        print("⚠️ ID is not a Database directly. Checking if it's a Page...", flush=True)
+        # Botがアクセス可能なすべてのデータベースを検索
+        results = notion.search(filter={"value": "database", "property": "object"}).get("results", [])
+        
+        candidates = []
+        print(f"ℹ️ Found {len(results)} accessible databases.", flush=True)
+        
+        for db in results:
+            # タイトルを取得
+            title_list = db.get("title", [])
+            if title_list:
+                title = title_list[0]["plain_text"]
+            else:
+                title = "Untitled"
+            
+            db_id = db["id"].replace("-", "")
+            print(f"   - Found DB: '{title}' (ID: {db_id[:4]}...)", flush=True)
+            
+            # 名前が "Control Center" を含むなら候補にする
+            if "Control Center" in title:
+                candidates.append(db_id)
+        
+        if len(candidates) == 1:
+            print(f"✅ Auto-detected Control Center ID: {candidates[0]}", flush=True)
+            return candidates[0]
+        elif len(candidates) > 1:
+            print(f"⚠️ Multiple 'Control Center' databases found. Using the most recent one: {candidates[0]}", flush=True)
+            return candidates[0]
+        else:
+            # 名前で見つからない場合、SecretsのIDが正しいか一応チェック
+            if ENV_CC_ID:
+                clean_env_id = ENV_CC_ID.replace("-", "")
+                # 見つかったリストの中にEnvのIDがあるか？
+                for db in results:
+                    if db["id"].replace("-", "") == clean_env_id:
+                        print("✅ Configured ID matches an accessible database.", flush=True)
+                        return clean_env_id
+            
+            print("❌ Error: Could not find any database named 'Control Center'.", flush=True)
+            print("👉 Action: Please invite the Notion Bot to the 'Control Center' database.", flush=True)
+            return None
 
-    # 2. ダメならページとして中身（Blocks）を見る
-    try:
-        response = notion.request(path=f"blocks/{candidate_id}/children", method="GET")
-        children = response.get('results', [])
-        
-        # ページの中にある「インラインデータベース」を探す
-        for block in children:
-            if block['type'] == 'child_database':
-                found_id = block['id'].replace("-", "")
-                title = block.get('child_database', {}).get('title', 'Untitled')
-                print(f"🎯 Found Inline Database inside the page! Name: {title}", flush=True)
-                print(f"🔄 Switching ID to: {found_id}", flush=True)
-                return found_id
-                
-        print("❌ Error: Provided ID is a Page, but no Database was found inside it.", flush=True)
-        return None
-        
     except Exception as e:
-        print(f"❌ ID Resolution Failed: {e}", flush=True)
+        print(f"❌ Search Error: {e}", flush=True)
         return None
 
 # --- Helper Functions ---
@@ -197,11 +208,11 @@ def analyze_audio_auto(file_path):
         
         【生徒名の特定ルール】
         1. 呼びかけから生徒名を推測してください。
-        2. 「デッティー」と聞こえた場合は、必ず『Tetu』と出力してください。
-        3. 登録名と一致するか不明でも、聞こえたままの音（カタカナやニックネーム）を入力してください。
+        2. 「デッティー」や「でっていう」と聞こえた場合は、必ず『でっていう』と出力してください。
+        3. それ以外の場合も、聞こえたままの音（カタカナやニックネーム）を入力してください。
         
         {
-          "student_name": "生徒の名前（例: Tetu, Tanaka）",
+          "student_name": "生徒の名前（例: でっていう, 田中）",
           "date": "YYYY-MM-DD (不明ならToday)",
           "summary": "セッション要約（300文字以内）",
           "next_action": "次回の宿題"
@@ -225,12 +236,13 @@ def analyze_audio_auto(file_path):
         raise e
 
 def main():
-    print("--- VERSION: DATABASE HUNTER (v13.0) ---", flush=True)
+    print("--- VERSION: AUTO DISCOVERY (v15.0) ---", flush=True)
     
-    # 1. IDの自動解決 (Page ID -> DB ID)
-    REAL_CC_ID = resolve_real_database_id(INPUT_CC_ID)
+    # 1. 起動時にまずDBを探索して確定させる
+    REAL_CC_ID = find_real_control_center_id()
     if not REAL_CC_ID:
-        return # 解決不能なら終了
+        print("⛔ System stopped because Control Center Database could not be found.", flush=True)
+        return
 
     if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
@@ -281,15 +293,14 @@ def main():
         
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
         
+        # 特定したREAL_CC_IDを使う
         cc_res = notion.request(
-            path=f"databases/{REAL_CC_ID}/query", # ここで解決済みのIDを使う
+            path=f"databases/{REAL_CC_ID}/query",
             method="POST",
             body={
                 "filter": {
                     "property": "Name",
-                    "title": { # rich_text -> title
-                        "equals": result['student_name']
-                    }
+                    "title": { "equals": result['student_name'] }
                 }
             }
         )
@@ -299,18 +310,19 @@ def main():
         if results_list:
             target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             if target_id_prop:
-                target_id = sanitize_id(target_id_prop[0]["plain_text"])
-                # 生徒側IDも同様に解決を試みる（念のため）
-                real_target_id = resolve_real_database_id(target_id)
+                # ターゲットIDも念のためクリーニング
+                raw_target = target_id_prop[0]["plain_text"]
+                target_id_match = re.search(r'([a-fA-F0-9]{32})', str(raw_target).replace("-", ""))
                 
-                if real_target_id:
-                    print(f"📝 Writing to Student DB: {real_target_id}", flush=True)
+                if target_id_match:
+                    final_target_id = target_id_match.group(1)
+                    print(f"📝 Writing to Student DB: {final_target_id}", flush=True)
                     
                     notion.request(
                         path="pages",
                         method="POST",
                         body={
-                            "parent": {"database_id": real_target_id},
+                            "parent": {"database_id": final_target_id},
                             "properties": {
                                 "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
                                 "日付": {"date": {"start": result['date']}}
@@ -323,13 +335,12 @@ def main():
                         }
                     )
                     print("✅ Successfully updated Notion.", flush=True)
-                    
                     processed_folder_id = get_or_create_processed_folder()
                     move_files_to_processed(processed_file_ids, processed_folder_id)
                 else:
-                     print("❌ Error: TargetID in Notion is invalid or empty.", flush=True)
+                     print(f"❌ Error: TargetID '{raw_target}' is invalid.", flush=True)
             else:
-                print("❌ Error: TargetID column is empty in Control Center.", flush=True)
+                print("❌ Error: TargetID is empty in Control Center.", flush=True)
         else:
             print(f"❌ Error: Student '{result['student_name']}' not found in Control Center.", flush=True)
             print("ℹ️ Check spelling in Notion.", flush=True)

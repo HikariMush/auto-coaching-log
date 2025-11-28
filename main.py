@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import time
 import json
 import logging
@@ -7,8 +9,20 @@ import zipfile
 import shutil
 from datetime import datetime
 
+# --- 【強制修復】ライブラリのバージョンをコード内で強制アップデート ---
+try:
+    import google.generativeai as genai
+    # バージョン確認。古ければ更新
+    import importlib.metadata
+    ver = importlib.metadata.version("google-generativeai")
+    if ver < "0.8.3":
+        raise ImportError("Old version detected")
+except Exception:
+    print("🔄 Updating libraries to latest version...", flush=True)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "google-generativeai>=0.8.3"])
+    import google.generativeai as genai
+
 # Google Libraries
-import google.generativeai as genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -105,61 +119,79 @@ def mix_audio_files(file_paths):
 
 # --- AI & Notion ---
 
-def analyze_audio_with_fallback(file_path):
-    # 音声対応モデルのみに限定
-    models_to_try = [
-        'gemini-1.5-flash',
-        'gemini-1.5-flash-001',
-        'gemini-1.5-pro'
-    ]
+def get_available_model_name():
+    """APIから利用可能なモデル一覧を取得し、最適なものを返す"""
+    print("🔍 Searching for available Gemini models...", flush=True)
+    try:
+        models = list(genai.list_models())
+        available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        # 優先順位: 1.5 Flash -> 1.5 Pro
+        for name in available_names:
+            if 'gemini-1.5-flash' in name and '001' not in name: return name # 最新版Flash
+        for name in available_names:
+            if 'gemini-1.5-flash' in name: return name # 任意のFlash
+        for name in available_names:
+            if 'gemini-1.5-pro' in name: return name # 任意のPro
+            
+        print(f"⚠️ 1.5 series not found. Available: {available_names}", flush=True)
+        return 'models/gemini-1.5-flash' # フォールバック
+    except Exception as e:
+        print(f"⚠️ Failed to list models: {e}. Using default.", flush=True)
+        return 'gemini-1.5-flash'
 
-    last_error = None
+def analyze_audio_auto(file_path):
+    # 自動でモデル名を取得
+    model_name = get_available_model_name()
+    print(f"🧠 Analyzing with model: {model_name} ...", flush=True)
     
-    for model_name in models_to_try:
-        print(f"🧠 Analyzing with model: {model_name} ...", flush=True)
-        try:
-            model = genai.GenerativeModel(model_name)
-            audio_file = genai.upload_file(file_path)
-            
-            while audio_file.state.name == "PROCESSING":
-                time.sleep(2)
-                audio_file = genai.get_file(audio_file.name)
-            
-            if audio_file.state.name == "FAILED":
-                raise ValueError("Gemini Audio Processing Failed")
+    try:
+        model = genai.GenerativeModel(model_name)
+        audio_file = genai.upload_file(file_path)
+        
+        while audio_file.state.name == "PROCESSING":
+            time.sleep(2)
+            audio_file = genai.get_file(audio_file.name)
+        
+        if audio_file.state.name == "FAILED":
+            raise ValueError("Gemini Audio Processing Failed")
 
-            prompt = """
-            以下の音声はコーチングセッションの録音です。
-            以下の情報を抽出し、JSON形式のみを出力してください。Markdown装飾は不要です。
-            {
-              "student_name": "生徒の名前（Control Centerと一致させる。呼びかけから推測。不明なら'Unknown'）",
-              "date": "YYYY-MM-DD",
-              "summary": "セッション要約（300文字以内）",
-              "next_action": "次回の宿題"
-            }
-            """
-            response = model.generate_content([prompt, audio_file])
-            
-            try: genai.delete_file(audio_file.name)
-            except: pass
+        prompt = """
+        以下の音声はコーチングセッションの録音です。
+        以下の情報を抽出し、JSON形式のみを出力してください。Markdown装飾は不要です。
+        {
+          "student_name": "生徒の名前（Control Centerと一致させる。呼びかけから推測。不明なら'Unknown'）",
+          "date": "YYYY-MM-DD",
+          "summary": "セッション要約（300文字以内）",
+          "next_action": "次回の宿題"
+        }
+        """
+        response = model.generate_content([prompt, audio_file])
+        
+        try: genai.delete_file(audio_file.name)
+        except: pass
 
-            text = response.text.strip()
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
-            else:
-                raise ValueError(f"Failed to parse JSON: {text}")
+        text = response.text.strip()
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        else:
+            raise ValueError(f"Failed to parse JSON: {text}")
 
-        except Exception as e:
-            print(f"⚠️ Model {model_name} failed: {e}. Trying next...", flush=True)
-            last_error = e
-            time.sleep(1)
-            continue
-            
-    raise last_error
+    except Exception as e:
+        # エラー発生時は即座にスローせずログ出力
+        print(f"❌ Analysis Failed: {e}", flush=True)
+        raise e
 
 def main():
-    print("--- VERSION: FINAL COMPLETE 3.0 ---", flush=True)
+    print("--- VERSION: SELF-HEALING 4.0 ---", flush=True)
+    
+    # Check Library Version
+    try:
+        import importlib.metadata
+        print(f"ℹ️ Google Generative AI Version: {importlib.metadata.version('google-generativeai')}", flush=True)
+    except: pass
+
     if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
         return
@@ -205,8 +237,8 @@ def main():
 
         mixed_path = mix_audio_files(local_audio_paths)
         
-        # 解析実行
-        result = analyze_audio_with_fallback(mixed_path)
+        # 新しい自動解析関数を実行
+        result = analyze_audio_auto(mixed_path)
         print(f"📊 Analysis Result: {result}", flush=True)
         
         # Notion書き込み

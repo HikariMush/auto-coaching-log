@@ -9,6 +9,10 @@ import zipfile
 import shutil
 from datetime import datetime
 
+# --- 設定：ここにIDを直接書く（Secretsは無視） ---
+# 貴殿が特定した「通知ボットで動いている正解ID」をここに固定します
+HARDCODED_CC_ID = "2b71bc8521e380f99a16f512232eeb11"
+
 # --- ライブラリ強制セットアップ ---
 try:
     import google.generativeai as genai
@@ -44,10 +48,17 @@ if os.getenv("GCP_SA_KEY"):
     with open("service_account.json", "w") as f:
         f.write(os.getenv("GCP_SA_KEY"))
 
+# IDクリーニング
+def sanitize_id(raw_id):
+    if not raw_id: return None
+    match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
+    if match: return match.group(1)
+    return None
+
 try:
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-    # 設定ファイルから読み込んだID（間違っている可能性あり）
-    ENV_CC_ID = os.getenv("CONTROL_CENTER_ID")
+    # ここで環境変数ではなく、直書きしたIDを採用する
+    CONTROL_CENTER_ID = sanitize_id(HARDCODED_CC_ID)
     
     notion = Client(auth=os.getenv("NOTION_TOKEN"))
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -60,70 +71,6 @@ try:
 except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
-
-# --- ★根本解決：データベース自動探索機能（フィルターなし） ---
-def find_real_control_center_id():
-    """
-    フィルターを使わずに全オブジェクトを取得し、Python側でDBを選別する
-    """
-    print("🔍 Scanning all accessible objects (Pages & Databases)...", flush=True)
-    
-    try:
-        # フィルターなしで検索（APIエラー回避）
-        results = notion.search().get("results", [])
-        
-        candidates = []
-        print(f"ℹ️ Found {len(results)} accessible objects.", flush=True)
-        
-        for obj in results:
-            # データベース以外はスキップ
-            if obj["object"] != "database":
-                continue
-            
-            # タイトルを取得
-            title_list = obj.get("title", [])
-            if title_list:
-                title = title_list[0]["plain_text"]
-            else:
-                title = "Untitled"
-            
-            db_id = obj["id"].replace("-", "")
-            print(f"   - Found DB: '{title}' (ID: {db_id[:4]}...)", flush=True)
-            
-            # 名前が "Control Center" を含むなら候補にする
-            if "Control Center" in title:
-                candidates.append(db_id)
-        
-        if len(candidates) == 1:
-            print(f"✅ Auto-detected Control Center ID: {candidates[0]}", flush=True)
-            return candidates[0]
-        elif len(candidates) > 1:
-            # 候補が複数ある場合、Secretsの設定値と一致するものを優先
-            if ENV_CC_ID:
-                clean_env = ENV_CC_ID.replace("-", "")
-                if clean_env in candidates:
-                    print(f"✅ Configured ID matches found DB: {clean_env}", flush=True)
-                    return clean_env
-            
-            print(f"⚠️ Multiple 'Control Center' databases found. Using the most recent one: {candidates[0]}", flush=True)
-            return candidates[0]
-        else:
-            # 名前で見つからない場合、SecretsのIDが正しいか一応チェック
-            if ENV_CC_ID:
-                clean_env_id = ENV_CC_ID.replace("-", "")
-                # 見つかったリストの中にEnvのIDがあるか？
-                for obj in results:
-                    if obj["id"].replace("-", "") == clean_env_id and obj["object"] == "database":
-                        print("✅ Configured ID matches an accessible database.", flush=True)
-                        return clean_env_id
-            
-            print("❌ Error: Could not find any database named 'Control Center'.", flush=True)
-            print("👉 Action: Please invite the Notion Bot to the 'Control Center' database.", flush=True)
-            return None
-
-    except Exception as e:
-        print(f"❌ Search Error: {e}", flush=True)
-        return None
 
 # --- Helper Functions ---
 
@@ -246,14 +193,9 @@ def analyze_audio_auto(file_path):
         raise e
 
 def main():
-    print("--- VERSION: NO FILTER SEARCH (v16.0) ---", flush=True)
+    print("--- VERSION: HARDCODED ID (v18.0) ---", flush=True)
+    print(f"ℹ️ Target Database ID: {CONTROL_CENTER_ID}", flush=True)
     
-    # 1. 起動時にまずDBを探索して確定させる
-    REAL_CC_ID = find_real_control_center_id()
-    if not REAL_CC_ID:
-        print("⛔ System stopped because Control Center Database could not be found.", flush=True)
-        return
-
     if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
         return
@@ -303,9 +245,9 @@ def main():
         
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
         
-        # 特定したREAL_CC_IDを使って検索
+        # 直書きIDを使って検索
         cc_res = notion.request(
-            path=f"databases/{REAL_CC_ID}/query",
+            path=f"databases/{CONTROL_CENTER_ID}/query",
             method="POST",
             body={
                 "filter": {

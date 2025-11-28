@@ -1,4 +1,4 @@
-google-generativeai
+google-generativeai>=0.8.3
 notion-client
 google-auth
 google-api-python-client

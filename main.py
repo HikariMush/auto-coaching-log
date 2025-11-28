@@ -30,7 +30,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from pydub import AudioSegment
-from notion_client import Client
+from notion_client import Client, APIResponseError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
@@ -44,44 +44,17 @@ if os.getenv("GCP_SA_KEY"):
     with open("service_account.json", "w") as f:
         f.write(os.getenv("GCP_SA_KEY"))
 
-# ★ID厳格化・クリーニング関数
-def validate_and_clean_id(raw_id, name):
-    if not raw_id:
-        print(f"❌ Error: {name} is empty in GitHub Secrets.", flush=True)
-        return None
-    
-    # 文字列化して改行・スペース除去
-    clean_id = str(raw_id).strip()
-    
-    # 32桁の英数字（ハイフンありなし両対応）を抽出
-    # URLが混じっていても、そこから32桁のHEXを探し出す
-    match = re.search(r'([a-fA-F0-9]{32})', clean_id.replace("-", ""))
-    
-    if match:
-        final_id = match.group(1)
-        # IDの一部を表示して確認（デバッグ用）
-        masked = final_id[:4] + "*" * 24 + final_id[-4:]
-        print(f"ℹ️ {name} Validated: {masked} (Len: {len(final_id)})", flush=True)
-        return final_id
-    else:
-        print(f"❌ Error: {name} format is invalid. It must contain a 32-char UUID.", flush=True)
-        # どんな文字列が入ってしまっているか（長さだけ）ヒント表示
-        print(f"   (Input value length: {len(clean_id)} chars. Did you paste a full URL?)", flush=True)
-        return None
+# IDクリーニング
+def sanitize_id(raw_id):
+    if not raw_id: return None
+    match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
+    if match: return match.group(1)
+    return None
 
 try:
-    # 環境変数の読み込みと即時チェック
-    raw_drive_id = os.getenv("DRIVE_FOLDER_ID")
-    raw_cc_id = os.getenv("CONTROL_CENTER_ID")
+    INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+    CONTROL_CENTER_ID = sanitize_id(os.getenv("CONTROL_CENTER_ID"))
     
-    INBOX_FOLDER_ID = raw_drive_id # DriveIDは形式緩いのでそのまま
-    CONTROL_CENTER_ID = validate_and_clean_id(raw_cc_id, "CONTROL_CENTER_ID")
-    
-    # IDが不正ならここで即死させる（無駄な処理をさせない）
-    if not CONTROL_CENTER_ID or not INBOX_FOLDER_ID:
-        print("⛔ STOPPING due to Secret ID errors. Please fix GitHub Secrets.", flush=True)
-        exit(1)
-
     notion = Client(auth=os.getenv("NOTION_TOKEN"))
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     
@@ -94,7 +67,30 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- Helper Functions ---
+# --- ★重要：Notion接続診断機能 ---
+def check_database_connection():
+    print(f"🔍 Diagnosing Control Center ID: {CONTROL_CENTER_ID[:4]}...{CONTROL_CENTER_ID[-4:]}", flush=True)
+    
+    if not CONTROL_CENTER_ID:
+        print("❌ Error: Control Center ID is invalid.", flush=True)
+        return False
+
+    try:
+        # まずデータベースとして取得できるか試す
+        db = notion.databases.retrieve(database_id=CONTROL_CENTER_ID)
+        print(f"✅ Connection OK! Database Name: {db['title'][0]['plain_text'] if db['title'] else 'Untitled'}", flush=True)
+        return True
+    except APIResponseError as e:
+        if e.code == "object_not_found":
+            print("❌ Error: ID not found. (Check permissions? Did you invite the bot?)", flush=True)
+        elif e.status == 400:
+            print("❌ Error: This ID is not a Database. It might be a Page ID.", flush=True)
+            print("👉 Fix: Open Notion, click the '...' next to the database title (not the page corner), 'Copy link', and extract that ID.", flush=True)
+        else:
+            print(f"❌ Connection Error: {e}", flush=True)
+        return False
+
+# --- 通常関数 ---
 
 def get_or_create_processed_folder():
     query = f"'{INBOX_FOLDER_ID}' in parents and name = 'Processed' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -153,11 +149,10 @@ def mix_audio_files(file_paths):
         return max(file_paths, key=os.path.getsize)
 
 def get_available_model_name():
-    print("🔍 Searching for available Gemini models...", flush=True)
     try:
         models = list(genai.list_models())
         available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        
+        # 優先順位: 2.0 -> 1.5
         for name in available_names:
             if 'gemini-2.0-flash' in name and 'exp' not in name: return name
         for name in available_names:
@@ -183,11 +178,18 @@ def analyze_audio_auto(file_path):
         
         if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
 
+        # ★プロンプト改善：不明でも聞こえた名前を出すように指示
         prompt = """
         以下の音声はコーチングセッションの録音です。
         以下の情報を抽出し、JSON形式のみを出力してください。Markdown装飾は不要です。
+        
+        【生徒名の抽出ルール】
+        1. 会話中の呼びかけ（「〇〇さん」）から名前を特定してください。
+        2. もし登録名と一致するか不明でも、聞こえたままの音（カタカナやニックネーム）を入力してください。
+        3. 絶対に 'Unknown' にせず、候補を挙げてください。
+        
         {
-          "student_name": "生徒の名前（Control Centerと一致させる。呼びかけから推測。不明なら'Unknown'）",
+          "student_name": "生徒の名前（例: Tetu, デッティー, 田中）",
           "date": "YYYY-MM-DD",
           "summary": "セッション要約（300文字以内）",
           "next_action": "次回の宿題"
@@ -206,8 +208,14 @@ def analyze_audio_auto(file_path):
         raise e
 
 def main():
-    print("--- VERSION: ID VALIDATOR (v9.0) ---", flush=True)
+    print("--- VERSION: DIAGNOSTIC & RELAXED PROMPT (v10.0) ---", flush=True)
     
+    # 1. 起動時診断
+    if not check_database_connection():
+        print("⛔ System stopped due to Notion ID error.", flush=True)
+        # IDエラーでも処理済み移動はしない（リトライのため）
+        return
+
     try:
         results = drive_service.files().list(
             q=f"'{INBOX_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
@@ -251,19 +259,19 @@ def main():
         result = analyze_audio_auto(mixed_path)
         print(f"📊 Analysis Result: {result}", flush=True)
         
+        if result['student_name'] == 'Unknown':
+            print("⚠️ Student Name is Unknown. Skipping Notion search to avoid error.", flush=True)
+            # Unknownなら移動せず終了（次回リトライ、または手動確認用）
+            return
+
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
         
-        # 修正: タイトル検索フィルター
-        cc_res = notion.request(
-            path=f"databases/{CONTROL_CENTER_ID}/query",
-            method="POST",
-            body={
-                "filter": {
-                    "property": "Name",
-                    "title": {
-                        "equals": result['student_name']
-                    }
-                }
+        # ライブラリの正規メソッドを使用（診断が通っていれば動くはず）
+        cc_res = notion.databases.query(
+            database_id=CONTROL_CENTER_ID,
+            filter={
+                "property": "Name",
+                "rich_text": {"equals": result['student_name']}
             }
         )
         
@@ -272,37 +280,30 @@ def main():
         if results_list:
             target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             if target_id_prop:
-                # TargetIDも検証する
-                target_id = validate_and_clean_id(target_id_prop[0]["plain_text"], "TARGET_ID (From Notion)")
+                target_id = sanitize_id(target_id_prop[0]["plain_text"])
+                print(f"📝 Writing to Student DB: {target_id}", flush=True)
                 
-                if target_id:
-                    print(f"📝 Writing to Student DB: {target_id}", flush=True)
-                    notion.request(
-                        path="pages",
-                        method="POST",
-                        body={
-                            "parent": {"database_id": target_id},
-                            "properties": {
-                                "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
-                                "日付": {"date": {"start": result['date']}}
-                            },
-                            "children": [
-                                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result['summary']}}]}},
-                                {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
-                                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
-                            ]
-                        }
-                    )
-                    print("✅ Successfully updated Notion.", flush=True)
-                    
-                    processed_folder_id = get_or_create_processed_folder()
-                    move_files_to_processed(processed_file_ids, processed_folder_id)
-                else:
-                     print("❌ Error: TargetID in Notion is invalid (not a 32-char UUID).", flush=True)
+                notion.pages.create(
+                    parent={"database_id": target_id},
+                    properties={
+                        "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
+                        "日付": {"date": {"start": result['date']}}
+                    },
+                    children=[
+                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result['summary']}}]}},
+                        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
+                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
+                    ]
+                )
+                print("✅ Successfully updated Notion.", flush=True)
+                
+                processed_folder_id = get_or_create_processed_folder()
+                move_files_to_processed(processed_file_ids, processed_folder_id)
             else:
                 print("❌ Error: TargetID is empty in Control Center.", flush=True)
         else:
             print(f"❌ Error: Student '{result['student_name']}' not found in Control Center.", flush=True)
+            print("ℹ️ Hint: Check if the name in Notion matches exactly (Case sensitive / Kanji / Katakana).", flush=True)
 
     except Exception as e:
         print(f"❌ Processing Failed: {e}", flush=True)

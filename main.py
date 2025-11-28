@@ -9,11 +9,12 @@ import zipfile
 import shutil
 from datetime import datetime
 
-# --- ライブラリ強制セットアップ ---
+# --- 【必須】APIエラー処理ライブラリのインポート ---
 try:
     import requests
     import google.generativeai as genai
     from pydub import AudioSegment
+    from google.api_core.exceptions import ResourceExhausted 
 except ImportError:
     print("🔄 Installing core libraries...", flush=True)
     subprocess.check_call([
@@ -23,7 +24,9 @@ except ImportError:
     ])
     import requests
     import google.generativeai as genai
-    from pydiffub import AudioSegment
+    from pydub import AudioSegment
+    from google.api_core.exceptions import ResourceExhausted
+
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -32,6 +35,7 @@ from googleapiclient.http import MediaIoBaseDownload
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # --- 最終設定（ハードコード） ---
+# Control Center DBのID (通知Botで実績のあるIDを使用)
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664" 
 
 # --- 初期化 ---
@@ -45,7 +49,7 @@ if os.getenv("GCP_SA_KEY"):
 
 def sanitize_id(raw_id):
     if not raw_id: return None
-    match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
+    match = re.search(r'([a-fA-F0s9]{32})', str(raw_id).replace("-", ""))
     if match: return match.group(1)
     return None
 
@@ -182,33 +186,58 @@ def get_available_model_name():
     for name in available_names:
         if 'gemini-2.5-pro' in name: return name 
 
-    # 優先順位 2: 2.0 Pro
     for name in available_names:
         if 'gemini-2.0-pro' in name: return name 
-
-    # 優先順位 3: 2.5/2.0 Flash (安定/速度重視)
-    for name in available_names:
-        if 'gemini-2.0-flash' in name and 'exp' not in name: return name
+    
+    # Flashモデルは Quota Fallback用として残す
     for name in available_names:
         if 'gemini-2.5-flash' in name: return name
     for name in available_names:
-        if 'gemini-2.0-flash' in name: return name
-    for name in available_names:
-        if 'flash' in name: return name
-
+        if 'gemini-2.0-flash' in name and 'exp' not in name: return name
+    
     return available_names[0] if available_names else 'models/gemini-2.0-flash'
 
 def analyze_audio_auto(file_path):
-    model_name = get_available_model_name()
-    model = genai.GenerativeModel(model_name)
+    
+    def generate_content_with_fallback(model_name, audio_file):
+        """Quotaエラー時にモデルをFlashに切り替えて再試行する"""
+        
+        current_model_name = model_name
+        for attempt in range(2): # 最大2回試行 (Pro -> Flash)
+            try:
+                print(f"🧠 Analyzing with model: {current_model_name} (Attempt {attempt+1})", flush=True)
+                model = genai.GenerativeModel(current_model_name)
+                
+                # Content Generation
+                response = model.generate_content([prompt, audio_file])
+                
+                # 成功したら戻る
+                return response.text
+                
+            except ResourceExhausted as e:
+                if attempt == 0 and ("pro" in current_model_name.lower()):
+                    # ProがQuotaで失敗した場合、Flashに切り替えてリトライ
+                    current_model_name = 'gemini-2.5-flash' # 最も安定しているFlashにフォールバック
+                    print("⚠️ Quota Exceeded for Pro. Falling back to Flash model.", flush=True)
+                    time.sleep(5) 
+                    continue
+                else:
+                    # Flashも失敗、または2回目の試行も失敗
+                    raise e
+            
+            except Exception as e:
+                # 404 Not Foundなどのその他のエラーはそのままスロー
+                raise e
+
+    model_name_initial = get_available_model_name()
     audio_file = genai.upload_file(file_path)
     
     while audio_file.state.name == "PROCESSING":
         time.sleep(2)
         audio_file = genai.get_file(audio_file.name)
     if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
-
-    # ★最終プロンプト：スマブラ専門用語と認知分析、デュアル出力
+    
+    # ★プロンプト修正：最終版スマブラ専門用語と認知分析、デュアル出力
     prompt = """
     あなたは**トップ・スマブラアナリスト**であり、具体的な課題を発見し解決するための**エージェント**です。
     この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
@@ -241,30 +270,32 @@ def analyze_audio_auto(file_path):
       "next_action": "クライアントが具体的にコミットした、次のタスクと**期限（YYYY-MM-DDまたはN日後）**"
     }
     """
-    response = model.generate_content([prompt, audio_file])
+    
+    # 3. Content Generation with Fallback
+    response_text = generate_content_with_fallback(model_name_initial, audio_file)
+    
+    # 4. Cleanup and Parsing
     try: genai.delete_file(audio_file.name)
     except: pass
 
-    text = response.text.strip()
+    text = response_text.strip()
     
-    # 1. RAW TRANSCRIPTIONを抽出
     transcript_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
     raw_transcript = transcript_match.group(1).strip() if transcript_match else "ERROR: Raw transcript not found."
     
-    # 2. JSONを抽出
     json_match = re.search(r'\{.*\}', text, re.DOTALL)
     if json_match: 
         data = json.loads(json_match.group(0))
         
         if data.get('date') in ['Unknown', 'Today']:
             data['date'] = datetime.now().strftime('%Y-%m-%d')
-        return data, raw_transcript # ★両方のデータを返す
+        return data, raw_transcript 
     else: 
         raise ValueError("JSON Parse Failed")
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: FINAL PRODUCTION BUILD (v47.1) ---", flush=True)
+    print("--- VERSION: QUOTA FALLBACK SYSTEM (v48.0) ---", flush=True)
     
     if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
@@ -300,7 +331,6 @@ def main():
             
             # 3.1. Audio Processing
             local_audio_paths = []
-            
             path = download_file(file_id, file_name)
             if file_name.lower().endswith('.zip'):
                 local_audio_paths.extend(extract_audio_from_zip(path))
@@ -312,7 +342,7 @@ def main():
             
             mixed_path = mix_audio_files(local_audio_paths)
             
-            # 3.2. --- ★解析実行：JSONデータとRaw Transcriptの両方を取得★ ---
+            # 3.2. --- ★解析実行：Quota Fallback込み★ ---
             full_analysis, raw_transcript = analyze_audio_auto(mixed_path)
             
             # 3.3. Name Logic

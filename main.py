@@ -9,7 +9,7 @@ import zipfile
 import shutil
 from datetime import datetime
 
-# --- 【必須】APIエラー処理ライブラリのインポート ---
+# --- ライブラリ強制セットアップ ---
 try:
     import requests
     import google.generativeai as genai
@@ -26,7 +26,6 @@ except ImportError:
     import google.generativeai as genai
     from pydub import AudioSegment
     from google.api_core.exceptions import ResourceExhausted
-
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -87,7 +86,7 @@ def notion_query_database(db_id, query_filter):
         raise e
 
 def notion_create_page(parent_db_id, properties, children):
-    url = "https://api.notion.com/v1/pages"
+    url = f"https://api.notion.com/v1/pages"
     payload = {
         "parent": {"database_id": parent_db_id},
         "properties": properties,
@@ -163,7 +162,6 @@ def extract_audio_from_zip(zip_path):
     return extracted_files
 
 def mix_audio_files(file_paths):
-    if not file_paths: return None
     print(f"🎛️ Mixing {len(file_paths)} audio tracks...", flush=True)
     try:
         mixed = AudioSegment.from_file(file_paths[0])
@@ -182,22 +180,21 @@ def get_available_model_name():
     models = list(genai.list_models())
     available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
 
-    # 優先順位 1: 2.5 Pro (最高品質)
     for name in available_names:
         if 'gemini-2.5-pro' in name: return name 
 
     for name in available_names:
         if 'gemini-2.0-pro' in name: return name 
     
-    # Flashモデルは Quota Fallback用として残す
     for name in available_names:
         if 'gemini-2.5-flash' in name: return name
     for name in available_names:
-        if 'gemini-2.0-flash' in name and 'exp' not in name: return name
+        if 'gemini-2.0-flash' in name: return name
     
     return available_names[0] if available_names else 'models/gemini-2.0-flash'
 
 def analyze_audio_auto(file_path):
+    model_name_initial = get_available_model_name()
     
     def generate_content_with_fallback(model_name, audio_file):
         """Quotaエラー時にモデルをFlashに切り替えて再試行する"""
@@ -211,7 +208,6 @@ def analyze_audio_auto(file_path):
                 # Content Generation
                 response = model.generate_content([prompt, audio_file])
                 
-                # 成功したら戻る
                 return response.text
                 
             except ResourceExhausted as e:
@@ -229,15 +225,16 @@ def analyze_audio_auto(file_path):
                 # 404 Not Foundなどのその他のエラーはそのままスロー
                 raise e
 
-    model_name_initial = get_available_model_name()
+        # fallback loop end
+
+    # 1. Audio Upload
     audio_file = genai.upload_file(file_path)
-    
     while audio_file.state.name == "PROCESSING":
         time.sleep(2)
         audio_file = genai.get_file(audio_file.name)
     if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
     
-    # ★プロンプト修正：最終版スマブラ専門用語と認知分析、デュアル出力
+    # 2. Prompt Definition (Final Integrated Prompt)
     prompt = """
     あなたは**トップ・スマブラアナリスト**であり、具体的な課題を発見し解決するための**エージェント**です。
     この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
@@ -295,7 +292,7 @@ def analyze_audio_auto(file_path):
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: QUOTA FALLBACK SYSTEM (v48.0) ---", flush=True)
+    print("--- VERSION: DEFNITIVE FINAL BUILD (v52.0) ---", flush=True)
     
     if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
@@ -342,7 +339,7 @@ def main():
             
             mixed_path = mix_audio_files(local_audio_paths)
             
-            # 3.2. --- ★解析実行：Quota Fallback込み★ ---
+            # 3.2. --- ★解析実行：JSONデータとRaw Transcriptの両方を取得★ ---
             full_analysis, raw_transcript = analyze_audio_auto(mixed_path)
             
             # 3.3. Name Logic

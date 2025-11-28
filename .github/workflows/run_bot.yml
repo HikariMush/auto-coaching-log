@@ -2,8 +2,9 @@ name: Auto Coaching Log
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # 15分ごとに実行
-  workflow_dispatch:        # 手動実行ボタンも有効化
+    # UTC 0:00(JST 9:00) ～ UTC 15:00(JST 24:00) の間、30分おき
+    - cron: '*/30 0-15 * * *'
+  workflow_dispatch:
 
 jobs:
   run-script:

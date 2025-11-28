@@ -18,11 +18,8 @@ except ImportError:
     print("🔄 Installing core libraries...", flush=True)
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "--upgrade", 
-        "requests", 
-        "google-generativeai>=0.8.3", 
-        "pydub",
-        "google-api-python-client", 
-        "google-auth"
+        "requests", "google-generativeai>=0.8.3", "pydub",
+        "google-api-python-client", "google-auth"
     ])
     import requests
     import google.generativeai as genai
@@ -37,10 +34,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 # --- 最終設定 ---
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664" 
 
-# --- 初期化 (v27.0) ---
+# --- 初期化 ---
 TEMP_DIR = "downloads"
-if os.path.exists(TEMP_DIR):
-    shutil.rmtree(TEMP_DIR)
+if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
 os.makedirs(TEMP_DIR)
 
 if os.getenv("GCP_SA_KEY"):
@@ -54,7 +50,6 @@ def sanitize_id(raw_id):
     return None
 
 try:
-    # Notion API用ヘッダー
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -64,8 +59,7 @@ try:
     
     CONTROL_CENTER_ID = sanitize_id(FINAL_CONTROL_DB_ID)
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-
-    # Gemini & Drive Setup
+    
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     SCOPES = ['https://www.googleapis.com/auth/drive']
     creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
@@ -75,9 +69,10 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- Notion API Function Fix ---
+# --- Notion API 関数群 (Raw Requests) ---
 
 def notion_query_database(db_id, query_filter):
+    """データベースをクエリする (Raw Request)"""
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     try:
         res = requests.post(url, headers=HEADERS, json=query_filter)
@@ -85,26 +80,31 @@ def notion_query_database(db_id, query_filter):
         return res.json()
     except requests.exceptions.HTTPError as e:
         print(f"❌ Notion Query Error ({db_id}): Status {e.response.status_code}")
-        print(f"   Detail: {e.response.text}") # ★修正: textプロパティはresオブジェクトのもの
+        print(f"   Detail: {e.response.text}")
         raise e
 
 def notion_create_page(parent_db_id, properties, children):
+    """新しいページを作成する (Raw Request)"""
     url = "https://api.notion.com/v1/pages"
     payload = {
         "parent": {"database_id": parent_db_id},
         "properties": properties,
         "children": children
     }
+    # ★ DEBUG: ペイロードをログに出力
+    print("\n[DEBUG: PAYLOAD SENT]", flush=True)
+    print(json.dumps(payload, indent=2), flush=True)
+    
     try:
         res = requests.post(url, headers=HEADERS, json=payload)
         res.raise_for_status()
         return res.json()
     except requests.exceptions.HTTPError as e:
         print(f"❌ Notion Create Page Error: Status {e.response.status_code}")
-        print(f"   Detail: {e.response.text}") # ★修正: textプロパティはresオブジェクトのもの
+        print(f"   Detail: {e.response.text}") # エラー詳細を出力
         raise e
 
-# --- Audio/Drive/Gemini Helpers (Omitted for brevity, but full functionality assumed) ---
+# --- Audio/Drive/Gemini Helpers (Omitted for brevity) ---
 
 def download_file(file_id, file_name):
     request = drive_service.files().get_media(fileId=file_id)
@@ -188,23 +188,19 @@ def analyze_audio_auto(file_path):
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: ALIGNMENT AND FIX (v27.0) ---", flush=True)
+    print("--- VERSION: TRANSPARENCY DEBUG (v28.0) ---", flush=True)
     
-    if not INBOX_FOLDER_ID:
+    if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
         return
 
-    # ★ 簡略化された実行パス（ここでは実際のファイル処理は省略）
-    # ユーザーは必ずファイルをアップロードして実行しているため、
-    # 以下の処理は「データが処理され、Geminiが応答した状態」を再現
-    
-    # 仮定データ (Geminiからの成功応答)
+    # 1. ファイル処理 (簡略化された実行パス)
+    # ここは、前回の実行で成功したと仮定したデータを使用
+    # ★このデータこそが、Notionに書き込まれる最終的な情報です。
     result = {'student_name': 'でっていう', 'date': '2025-11-28', 'summary': '着地狩りについてコーチングを行うセッション。', 'next_action': '次回の練習メニュー確認'}
 
     
-    # --- 1. Notion検索 (成功実績のあるIDで実行) ---
-    print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
-    
+    # --- 2. Notion検索 (Control Center) ---
     search_filter = {
         "filter": {
             "property": "Name",
@@ -215,10 +211,10 @@ def main():
     try:
         cc_res_data = notion_query_database(CONTROL_CENTER_ID, search_filter)
     except Exception as e:
-        print(f"❌ CRITICAL FAILURE: Cannot query Control Center. Error: {e}", flush=True)
+        print("❌ CRITICAL: Cannot query Control Center. Check ID/Permissions.", flush=True)
         return
 
-    # --- 2. 生徒データの抽出 ---
+    # --- 3. 生徒データの抽出 ---
     results_list = cc_res_data.get("results", [])
     
     if results_list:
@@ -227,9 +223,9 @@ def main():
             final_target_id = sanitize_id(target_id_prop[0]["plain_text"])
 
             if final_target_id:
-                print(f"📝 Writing to Student DB: {final_target_id}", flush=True)
+                print(f"\n[DEBUG: TARGET DB ID] {final_target_id}", flush=True) # ★最終IDを出力
                 
-                # 3. ページ作成 (404エラーの原因箇所)
+                # 4. ページ作成 (404エラーの原因箇所)
                 properties = {
                     "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
                     "日付": {"date": {"start": result['date']}}
@@ -240,6 +236,7 @@ def main():
                     {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
                 ]
                 
+                # ここでクラッシュする
                 notion_create_page(final_target_id, properties, children)
                 
                 print("✅ Successfully updated Notion.", flush=True)

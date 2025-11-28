@@ -46,7 +46,7 @@ if os.getenv("GCP_SA_KEY"):
 
 try:
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-    # 一応IDは読むが、間違っていたら検索モードに入る
+    # 設定ファイルから読み込んだID（間違っている可能性あり）
     ENV_CC_ID = os.getenv("CONTROL_CENTER_ID")
     
     notion = Client(auth=os.getenv("NOTION_TOKEN"))
@@ -61,30 +61,33 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- ★根本解決：データベース自動探索機能 ---
+# --- ★根本解決：データベース自動探索機能（フィルターなし） ---
 def find_real_control_center_id():
     """
-    IDが間違っていても、Botが見える全データベースから
-    'Control Center' という名前のものを探して特定する
+    フィルターを使わずに全オブジェクトを取得し、Python側でDBを選別する
     """
-    print("🔍 Scanning all accessible databases...", flush=True)
+    print("🔍 Scanning all accessible objects (Pages & Databases)...", flush=True)
     
     try:
-        # Botがアクセス可能なすべてのデータベースを検索
-        results = notion.search(filter={"value": "database", "property": "object"}).get("results", [])
+        # フィルターなしで検索（APIエラー回避）
+        results = notion.search().get("results", [])
         
         candidates = []
-        print(f"ℹ️ Found {len(results)} accessible databases.", flush=True)
+        print(f"ℹ️ Found {len(results)} accessible objects.", flush=True)
         
-        for db in results:
+        for obj in results:
+            # データベース以外はスキップ
+            if obj["object"] != "database":
+                continue
+            
             # タイトルを取得
-            title_list = db.get("title", [])
+            title_list = obj.get("title", [])
             if title_list:
                 title = title_list[0]["plain_text"]
             else:
                 title = "Untitled"
             
-            db_id = db["id"].replace("-", "")
+            db_id = obj["id"].replace("-", "")
             print(f"   - Found DB: '{title}' (ID: {db_id[:4]}...)", flush=True)
             
             # 名前が "Control Center" を含むなら候補にする
@@ -95,6 +98,13 @@ def find_real_control_center_id():
             print(f"✅ Auto-detected Control Center ID: {candidates[0]}", flush=True)
             return candidates[0]
         elif len(candidates) > 1:
+            # 候補が複数ある場合、Secretsの設定値と一致するものを優先
+            if ENV_CC_ID:
+                clean_env = ENV_CC_ID.replace("-", "")
+                if clean_env in candidates:
+                    print(f"✅ Configured ID matches found DB: {clean_env}", flush=True)
+                    return clean_env
+            
             print(f"⚠️ Multiple 'Control Center' databases found. Using the most recent one: {candidates[0]}", flush=True)
             return candidates[0]
         else:
@@ -102,8 +112,8 @@ def find_real_control_center_id():
             if ENV_CC_ID:
                 clean_env_id = ENV_CC_ID.replace("-", "")
                 # 見つかったリストの中にEnvのIDがあるか？
-                for db in results:
-                    if db["id"].replace("-", "") == clean_env_id:
+                for obj in results:
+                    if obj["id"].replace("-", "") == clean_env_id and obj["object"] == "database":
                         print("✅ Configured ID matches an accessible database.", flush=True)
                         return clean_env_id
             
@@ -236,7 +246,7 @@ def analyze_audio_auto(file_path):
         raise e
 
 def main():
-    print("--- VERSION: AUTO DISCOVERY (v15.0) ---", flush=True)
+    print("--- VERSION: NO FILTER SEARCH (v16.0) ---", flush=True)
     
     # 1. 起動時にまずDBを探索して確定させる
     REAL_CC_ID = find_real_control_center_id()
@@ -293,7 +303,7 @@ def main():
         
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
         
-        # 特定したREAL_CC_IDを使う
+        # 特定したREAL_CC_IDを使って検索
         cc_res = notion.request(
             path=f"databases/{REAL_CC_ID}/query",
             method="POST",
@@ -310,7 +320,7 @@ def main():
         if results_list:
             target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             if target_id_prop:
-                # ターゲットIDも念のためクリーニング
+                # ターゲットIDのクリーニング
                 raw_target = target_id_prop[0]["plain_text"]
                 target_id_match = re.search(r'([a-fA-F0-9]{32})', str(raw_target).replace("-", ""))
                 

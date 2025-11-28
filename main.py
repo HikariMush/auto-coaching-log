@@ -13,10 +13,8 @@ from datetime import datetime
 try:
     import google.generativeai as genai
     import importlib.metadata
-    # Gemini用チェック
     ver = importlib.metadata.version("google-generativeai")
     if ver < "0.8.3": raise ImportError
-    # Notion用チェック
     import notion_client
 except Exception:
     print("🔄 Installing libraries...", flush=True)
@@ -28,7 +26,6 @@ except Exception:
     ])
     import google.generativeai as genai
 
-# Google Libraries
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -47,27 +44,36 @@ if os.getenv("GCP_SA_KEY"):
     with open("service_account.json", "w") as f:
         f.write(os.getenv("GCP_SA_KEY"))
 
+# ★IDの自動クリーニング関数（ここが修正ポイント）
+def sanitize_id(raw_id):
+    if not raw_id: return None
+    # 32桁の英数字（ハイフンなし）を探す
+    match = re.search(r'([a-fA-F0-9]{32})', raw_id.replace("-", ""))
+    if match:
+        return match.group(1)
+    return raw_id # 見つからなければそのまま返す
+
 try:
-    # Notionクライアント
-    notion = Client(auth=os.getenv("NOTION_TOKEN"))
+    INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+    raw_cc_id = os.getenv("CONTROL_CENTER_ID")
     
-    # Gemini
+    # ここでURLからIDだけを抜き取る
+    CONTROL_CENTER_ID = sanitize_id(raw_cc_id)
+    print(f"ℹ️ Sanitized Control Center ID: {CONTROL_CENTER_ID}", flush=True)
+
+    notion = Client(auth=os.getenv("NOTION_TOKEN"))
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     
-    # Drive
     SCOPES = ['https://www.googleapis.com/auth/drive']
     creds = service_account.Credentials.from_service_account_file(
         "service_account.json", scopes=SCOPES)
     drive_service = build('drive', 'v3', credentials=creds)
     
-    INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-    CONTROL_CENTER_ID = os.getenv("CONTROL_CENTER_ID")
-    
 except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- Helper Functions ---
+# --- Drive操作関数 ---
 
 def get_or_create_processed_folder():
     query = f"'{INBOX_FOLDER_ID}' in parents and name = 'Processed' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -125,13 +131,14 @@ def mix_audio_files(file_paths):
         print(f"⚠️ Mixing Error: {e}. Using largest file instead.", flush=True)
         return max(file_paths, key=os.path.getsize)
 
+# --- AI & Notion ---
+
 def get_available_model_name():
     print("🔍 Searching for available Gemini models...", flush=True)
     try:
         models = list(genai.list_models())
         available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
         
-        # 優先順位: 2.0 -> 1.5
         for name in available_names:
             if 'gemini-2.0-flash' in name and 'exp' not in name: return name
         for name in available_names:
@@ -147,7 +154,6 @@ def get_available_model_name():
 def analyze_audio_auto(file_path):
     model_name = get_available_model_name()
     print(f"🧠 Analyzing with model: {model_name} ...", flush=True)
-    
     try:
         model = genai.GenerativeModel(model_name)
         audio_file = genai.upload_file(file_path)
@@ -176,13 +182,12 @@ def analyze_audio_auto(file_path):
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match: return json.loads(match.group(0))
         else: raise ValueError("JSON Parse Failed")
-
     except Exception as e:
         print(f"❌ Analysis Failed: {e}", flush=True)
         raise e
 
 def main():
-    print("--- VERSION: DIRECT API MODE (v7.0) ---", flush=True)
+    print("--- VERSION: URL SANITIZER (v8.0) ---", flush=True)
     
     if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
@@ -228,21 +233,21 @@ def main():
             return
 
         mixed_path = mix_audio_files(local_audio_paths)
-        
         result = analyze_audio_auto(mixed_path)
         print(f"📊 Analysis Result: {result}", flush=True)
         
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
         
-        # 【修正箇所】ライブラリの便利機能を使わず、直接APIを叩く
-        # これで AttributeError を回避
+        # 検索処理 (ID修正済み、かつ titleプロパティ対応)
         cc_res = notion.request(
             path=f"databases/{CONTROL_CENTER_ID}/query",
             method="POST",
             body={
                 "filter": {
-                    "property": "Name", 
-                    "rich_text": {"equals": result['student_name']}
+                    "property": "Name",
+                    "title": { # rich_text ではなく title に修正
+                        "equals": result['student_name']
+                    }
                 }
             }
         )
@@ -252,10 +257,9 @@ def main():
         if results_list:
             target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             if target_id_prop:
-                target_id = target_id_prop[0]["plain_text"]
+                target_id = sanitize_id(target_id_prop[0]["plain_text"]) # ターゲットIDも念のため掃除
                 print(f"📝 Writing to Student DB: {target_id}", flush=True)
                 
-                # 書き込みも直通信で行う
                 notion.request(
                     path="pages",
                     method="POST",
@@ -279,7 +283,7 @@ def main():
             else:
                 print("❌ Error: TargetID is empty in Control Center.", flush=True)
         else:
-            print(f"❌ Error: Student '{result['student_name']}' not found in Control Center.", flush=True)
+            print(f"❌ Error: Student '{result['student_name']}' not found in Control Center. (Check 'Name' column type is Title)", flush=True)
 
     except Exception as e:
         print(f"❌ Processing Failed: {e}", flush=True)

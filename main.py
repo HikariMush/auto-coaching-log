@@ -106,13 +106,11 @@ def mix_audio_files(file_paths):
 # --- AI & Notion ---
 
 def analyze_audio_with_fallback(file_path):
-    # ★ここが重要：モデル名が見つからない場合、自動で次を試すリスト
+    # 音声対応モデルのみに限定
     models_to_try = [
-        'gemini-1.5-flash',        # 基本
-        'gemini-1.5-flash-latest', # 最新
-        'gemini-1.5-flash-001',    # 固定版
-        'gemini-1.5-pro-latest',   # Pro (バックアップ)
-        'gemini-pro'               # 旧モデル (最終手段)
+        'gemini-1.5-flash',
+        'gemini-1.5-flash-001',
+        'gemini-1.5-pro'
     ]
 
     last_error = None
@@ -161,9 +159,7 @@ def analyze_audio_with_fallback(file_path):
     raise last_error
 
 def main():
-    # ★更新確認用ログ
-    print("--- VERSION: ROBUST FALLBACK 2.0 ---", flush=True)
-    
+    print("--- VERSION: FINAL COMPLETE 3.0 ---", flush=True)
     if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
         return
@@ -209,7 +205,7 @@ def main():
 
         mixed_path = mix_audio_files(local_audio_paths)
         
-        # フォールバック機能付き解析を使用
+        # 解析実行
         result = analyze_audio_with_fallback(mixed_path)
         print(f"📊 Analysis Result: {result}", flush=True)
         

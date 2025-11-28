@@ -11,7 +11,7 @@ from datetime import datetime
 
 # --- 設定：ここにIDを直接書く（Secretsは無視） ---
 # 貴殿が特定した「通知ボットで動いている正解ID」をここに固定します
-HARDCODED_CC_ID = "2b71bc8521e380f99a16f512232eeb11"
+HARDCODED_CC_ID = "2b71bc8521e380868094ec506b41f664"
 
 # --- ライブラリ強制セットアップ ---
 try:

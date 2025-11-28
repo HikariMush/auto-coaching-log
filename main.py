@@ -9,24 +9,24 @@ import zipfile
 import shutil
 from datetime import datetime
 
-# --- 【強制修復】ライブラリのバージョンをコード内で強制アップデート ---
+# --- 【強制修復】全必須ライブラリを強制インストール ---
+# GitHub Actionsの環境キャッシュ不整合を防ぐため、実行時に毎回最新を入れる
+print("🔄 Installing/Updating required libraries...", flush=True)
 try:
-    import google.generativeai as genai
-    import importlib.metadata
-    ver = importlib.metadata.version("google-generativeai")
-    if ver < "0.8.3":
-        raise ImportError("Old version detected")
-except Exception:
-    print("🔄 Updating libraries to latest version...", flush=True)
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "google-generativeai>=0.8.3"])
-    import google.generativeai as genai
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "--upgrade", 
+        "google-generativeai>=0.8.3", 
+        "notion-client", 
+        "pydub"
+    ])
+except Exception as e:
+    print(f"⚠️ Library update failed: {e}", flush=True)
 
-# Google Libraries
+# ライブラリのインポート
+import google.generativeai as genai
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-
-# Audio & Notion
 from pydub import AudioSegment
 from notion_client import Client
 
@@ -119,25 +119,23 @@ def mix_audio_files(file_paths):
 # --- AI & Notion ---
 
 def get_available_model_name():
-    """APIから利用可能なモデル一覧を取得し、最適なものを返す (Gemini 2.0対応)"""
     print("🔍 Searching for available Gemini models...", flush=True)
     try:
         models = list(genai.list_models())
         available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
         
-        # 優先順位: 2.0 Flash -> 2.0 Pro -> 1.5 Flash
-        # ログにあった 'models/gemini-2.0-flash' を最優先で狙う
+        # 優先順位: 2.0 Flash -> 1.5 Flash
         for name in available_names:
-            if 'gemini-2.0-flash' in name and 'exp' not in name: return name # 安定版 2.0 Flash
+            if 'gemini-2.0-flash' in name and 'exp' not in name: return name
         for name in available_names:
-            if 'gemini-2.5-flash' in name: return name # 2.5 Flash
+            if 'gemini-2.5-flash' in name: return name
         for name in available_names:
-            if 'gemini-2.0-flash' in name: return name # Experimental含む
+            if 'gemini-2.0-flash' in name: return name
         for name in available_names:
-            if 'flash' in name: return name # なんでもいいからFlash
+            if 'flash' in name: return name
             
         print(f"⚠️ Preferred models not found. Available: {available_names}", flush=True)
-        return available_names[0] # リストの先頭にあるものを強制使用
+        return available_names[0]
     except Exception as e:
         print(f"⚠️ Failed to list models: {e}. Using hardcoded fallback.", flush=True)
         return 'models/gemini-2.0-flash'
@@ -184,14 +182,8 @@ def analyze_audio_auto(file_path):
         raise e
 
 def main():
-    print("--- VERSION: GEMINI 2.0 READY (v5.0) ---", flush=True)
+    print("--- VERSION: FINAL FORCE-FIX (v6.0) ---", flush=True)
     
-    # Check Library Version
-    try:
-        import importlib.metadata
-        print(f"ℹ️ Google Generative AI Version: {importlib.metadata.version('google-generativeai')}", flush=True)
-    except: pass
-
     if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
         return

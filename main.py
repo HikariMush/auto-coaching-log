@@ -44,22 +44,43 @@ if os.getenv("GCP_SA_KEY"):
     with open("service_account.json", "w") as f:
         f.write(os.getenv("GCP_SA_KEY"))
 
-# ★IDの自動クリーニング関数（ここが修正ポイント）
-def sanitize_id(raw_id):
-    if not raw_id: return None
-    # 32桁の英数字（ハイフンなし）を探す
-    match = re.search(r'([a-fA-F0-9]{32})', raw_id.replace("-", ""))
+# ★ID厳格化・クリーニング関数
+def validate_and_clean_id(raw_id, name):
+    if not raw_id:
+        print(f"❌ Error: {name} is empty in GitHub Secrets.", flush=True)
+        return None
+    
+    # 文字列化して改行・スペース除去
+    clean_id = str(raw_id).strip()
+    
+    # 32桁の英数字（ハイフンありなし両対応）を抽出
+    # URLが混じっていても、そこから32桁のHEXを探し出す
+    match = re.search(r'([a-fA-F0-9]{32})', clean_id.replace("-", ""))
+    
     if match:
-        return match.group(1)
-    return raw_id # 見つからなければそのまま返す
+        final_id = match.group(1)
+        # IDの一部を表示して確認（デバッグ用）
+        masked = final_id[:4] + "*" * 24 + final_id[-4:]
+        print(f"ℹ️ {name} Validated: {masked} (Len: {len(final_id)})", flush=True)
+        return final_id
+    else:
+        print(f"❌ Error: {name} format is invalid. It must contain a 32-char UUID.", flush=True)
+        # どんな文字列が入ってしまっているか（長さだけ）ヒント表示
+        print(f"   (Input value length: {len(clean_id)} chars. Did you paste a full URL?)", flush=True)
+        return None
 
 try:
-    INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+    # 環境変数の読み込みと即時チェック
+    raw_drive_id = os.getenv("DRIVE_FOLDER_ID")
     raw_cc_id = os.getenv("CONTROL_CENTER_ID")
     
-    # ここでURLからIDだけを抜き取る
-    CONTROL_CENTER_ID = sanitize_id(raw_cc_id)
-    print(f"ℹ️ Sanitized Control Center ID: {CONTROL_CENTER_ID}", flush=True)
+    INBOX_FOLDER_ID = raw_drive_id # DriveIDは形式緩いのでそのまま
+    CONTROL_CENTER_ID = validate_and_clean_id(raw_cc_id, "CONTROL_CENTER_ID")
+    
+    # IDが不正ならここで即死させる（無駄な処理をさせない）
+    if not CONTROL_CENTER_ID or not INBOX_FOLDER_ID:
+        print("⛔ STOPPING due to Secret ID errors. Please fix GitHub Secrets.", flush=True)
+        exit(1)
 
     notion = Client(auth=os.getenv("NOTION_TOKEN"))
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -73,7 +94,7 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- Drive操作関数 ---
+# --- Helper Functions ---
 
 def get_or_create_processed_folder():
     query = f"'{INBOX_FOLDER_ID}' in parents and name = 'Processed' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -131,8 +152,6 @@ def mix_audio_files(file_paths):
         print(f"⚠️ Mixing Error: {e}. Using largest file instead.", flush=True)
         return max(file_paths, key=os.path.getsize)
 
-# --- AI & Notion ---
-
 def get_available_model_name():
     print("🔍 Searching for available Gemini models...", flush=True)
     try:
@@ -187,12 +206,8 @@ def analyze_audio_auto(file_path):
         raise e
 
 def main():
-    print("--- VERSION: URL SANITIZER (v8.0) ---", flush=True)
+    print("--- VERSION: ID VALIDATOR (v9.0) ---", flush=True)
     
-    if not INBOX_FOLDER_ID:
-        print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
-        return
-
     try:
         results = drive_service.files().list(
             q=f"'{INBOX_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
@@ -238,14 +253,14 @@ def main():
         
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
         
-        # 検索処理 (ID修正済み、かつ titleプロパティ対応)
+        # 修正: タイトル検索フィルター
         cc_res = notion.request(
             path=f"databases/{CONTROL_CENTER_ID}/query",
             method="POST",
             body={
                 "filter": {
                     "property": "Name",
-                    "title": { # rich_text ではなく title に修正
+                    "title": {
                         "equals": result['student_name']
                     }
                 }
@@ -257,33 +272,37 @@ def main():
         if results_list:
             target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             if target_id_prop:
-                target_id = sanitize_id(target_id_prop[0]["plain_text"]) # ターゲットIDも念のため掃除
-                print(f"📝 Writing to Student DB: {target_id}", flush=True)
+                # TargetIDも検証する
+                target_id = validate_and_clean_id(target_id_prop[0]["plain_text"], "TARGET_ID (From Notion)")
                 
-                notion.request(
-                    path="pages",
-                    method="POST",
-                    body={
-                        "parent": {"database_id": target_id},
-                        "properties": {
-                            "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
-                            "日付": {"date": {"start": result['date']}}
-                        },
-                        "children": [
-                            {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result['summary']}}]}},
-                            {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
-                            {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
-                        ]
-                    }
-                )
-                print("✅ Successfully updated Notion.", flush=True)
-                
-                processed_folder_id = get_or_create_processed_folder()
-                move_files_to_processed(processed_file_ids, processed_folder_id)
+                if target_id:
+                    print(f"📝 Writing to Student DB: {target_id}", flush=True)
+                    notion.request(
+                        path="pages",
+                        method="POST",
+                        body={
+                            "parent": {"database_id": target_id},
+                            "properties": {
+                                "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
+                                "日付": {"date": {"start": result['date']}}
+                            },
+                            "children": [
+                                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result['summary']}}]}},
+                                {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
+                                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
+                            ]
+                        }
+                    )
+                    print("✅ Successfully updated Notion.", flush=True)
+                    
+                    processed_folder_id = get_or_create_processed_folder()
+                    move_files_to_processed(processed_file_ids, processed_folder_id)
+                else:
+                     print("❌ Error: TargetID in Notion is invalid (not a 32-char UUID).", flush=True)
             else:
                 print("❌ Error: TargetID is empty in Control Center.", flush=True)
         else:
-            print(f"❌ Error: Student '{result['student_name']}' not found in Control Center. (Check 'Name' column type is Title)", flush=True)
+            print(f"❌ Error: Student '{result['student_name']}' not found in Control Center.", flush=True)
 
     except Exception as e:
         print(f"❌ Processing Failed: {e}", flush=True)

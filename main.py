@@ -9,21 +9,26 @@ import zipfile
 import shutil
 from datetime import datetime
 
-# --- 【強制修復】全必須ライブラリを強制インストール ---
-# GitHub Actionsの環境キャッシュ不整合を防ぐため、実行時に毎回最新を入れる
-print("🔄 Installing/Updating required libraries...", flush=True)
+# --- ライブラリ強制セットアップ ---
 try:
+    import google.generativeai as genai
+    import importlib.metadata
+    # Gemini用チェック
+    ver = importlib.metadata.version("google-generativeai")
+    if ver < "0.8.3": raise ImportError
+    # Notion用チェック
+    import notion_client
+except Exception:
+    print("🔄 Installing libraries...", flush=True)
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "--upgrade", 
         "google-generativeai>=0.8.3", 
         "notion-client", 
         "pydub"
     ])
-except Exception as e:
-    print(f"⚠️ Library update failed: {e}", flush=True)
+    import google.generativeai as genai
 
-# ライブラリのインポート
-import google.generativeai as genai
+# Google Libraries
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -43,9 +48,13 @@ if os.getenv("GCP_SA_KEY"):
         f.write(os.getenv("GCP_SA_KEY"))
 
 try:
+    # Notionクライアント
     notion = Client(auth=os.getenv("NOTION_TOKEN"))
+    
+    # Gemini
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     
+    # Drive
     SCOPES = ['https://www.googleapis.com/auth/drive']
     creds = service_account.Credentials.from_service_account_file(
         "service_account.json", scopes=SCOPES)
@@ -58,7 +67,7 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- Drive操作関数 ---
+# --- Helper Functions ---
 
 def get_or_create_processed_folder():
     query = f"'{INBOX_FOLDER_ID}' in parents and name = 'Processed' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -116,15 +125,13 @@ def mix_audio_files(file_paths):
         print(f"⚠️ Mixing Error: {e}. Using largest file instead.", flush=True)
         return max(file_paths, key=os.path.getsize)
 
-# --- AI & Notion ---
-
 def get_available_model_name():
     print("🔍 Searching for available Gemini models...", flush=True)
     try:
         models = list(genai.list_models())
         available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
         
-        # 優先順位: 2.0 Flash -> 1.5 Flash
+        # 優先順位: 2.0 -> 1.5
         for name in available_names:
             if 'gemini-2.0-flash' in name and 'exp' not in name: return name
         for name in available_names:
@@ -133,11 +140,8 @@ def get_available_model_name():
             if 'gemini-2.0-flash' in name: return name
         for name in available_names:
             if 'flash' in name: return name
-            
-        print(f"⚠️ Preferred models not found. Available: {available_names}", flush=True)
         return available_names[0]
-    except Exception as e:
-        print(f"⚠️ Failed to list models: {e}. Using hardcoded fallback.", flush=True)
+    except:
         return 'models/gemini-2.0-flash'
 
 def analyze_audio_auto(file_path):
@@ -152,8 +156,7 @@ def analyze_audio_auto(file_path):
             time.sleep(2)
             audio_file = genai.get_file(audio_file.name)
         
-        if audio_file.state.name == "FAILED":
-            raise ValueError("Gemini Audio Processing Failed")
+        if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
 
         prompt = """
         以下の音声はコーチングセッションの録音です。
@@ -166,23 +169,20 @@ def analyze_audio_auto(file_path):
         }
         """
         response = model.generate_content([prompt, audio_file])
-        
         try: genai.delete_file(audio_file.name)
         except: pass
 
         text = response.text.strip()
         match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        else:
-            raise ValueError(f"Failed to parse JSON: {text}")
+        if match: return json.loads(match.group(0))
+        else: raise ValueError("JSON Parse Failed")
 
     except Exception as e:
         print(f"❌ Analysis Failed: {e}", flush=True)
         raise e
 
 def main():
-    print("--- VERSION: FINAL FORCE-FIX (v6.0) ---", flush=True)
+    print("--- VERSION: DIRECT API MODE (v7.0) ---", flush=True)
     
     if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
@@ -202,7 +202,7 @@ def main():
     print(f"Found {len(files)} files in inbox.", flush=True)
     
     if not files:
-        print("ℹ️ No new files found. Exiting.", flush=True)
+        print("ℹ️ No new files found.", flush=True)
         return
 
     local_audio_paths = []
@@ -222,7 +222,7 @@ def main():
                 local_audio_paths.append(path)
         
         if not local_audio_paths:
-            print("⚠️ No valid audio files found inside.", flush=True)
+            print("⚠️ No valid audio files found.", flush=True)
             processed_folder_id = get_or_create_processed_folder()
             move_files_to_processed(processed_file_ids, processed_folder_id)
             return
@@ -233,26 +233,44 @@ def main():
         print(f"📊 Analysis Result: {result}", flush=True)
         
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
-        cc_res = notion.databases.query(
-            database_id=CONTROL_CENTER_ID,
-            filter={"property": "Name", "rich_text": {"equals": result['student_name']}}
-        ).get("results")
         
-        if cc_res:
-            target_id_prop = cc_res[0]["properties"].get("TargetID", {}).get("rich_text", [])
+        # 【修正箇所】ライブラリの便利機能を使わず、直接APIを叩く
+        # これで AttributeError を回避
+        cc_res = notion.request(
+            path=f"databases/{CONTROL_CENTER_ID}/query",
+            method="POST",
+            body={
+                "filter": {
+                    "property": "Name", 
+                    "rich_text": {"equals": result['student_name']}
+                }
+            }
+        )
+        
+        results_list = cc_res.get("results", [])
+        
+        if results_list:
+            target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             if target_id_prop:
                 target_id = target_id_prop[0]["plain_text"]
                 print(f"📝 Writing to Student DB: {target_id}", flush=True)
                 
-                notion.pages.create(
-                    parent={"database_id": target_id},
-                    properties={
-                        "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
-                        "日付": {"date": {"start": result['date']}}
-                    },
-                    children=[
-                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result['summary']}}]}}
-                    ]
+                # 書き込みも直通信で行う
+                notion.request(
+                    path="pages",
+                    method="POST",
+                    body={
+                        "parent": {"database_id": target_id},
+                        "properties": {
+                            "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
+                            "日付": {"date": {"start": result['date']}}
+                        },
+                        "children": [
+                            {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result['summary']}}]}},
+                            {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
+                            {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
+                        ]
+                    }
                 )
                 print("✅ Successfully updated Notion.", flush=True)
                 

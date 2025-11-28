@@ -1,0 +1,8 @@
+google-generativeai
+notion-client
+google-auth
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+pydub
+python-dotenv

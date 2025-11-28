@@ -61,7 +61,7 @@ try:
     CONTROL_CENTER_ID = sanitize_id(FINAL_CONTROL_DB_ID)
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
     
-    # Gemini & Drive Setup (簡略化)
+    # Gemini & Drive Setup
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     SCOPES = ['https://www.googleapis.com/auth/drive']
     creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
@@ -74,7 +74,7 @@ except Exception as e:
 # --- Notion API 関数群 (Raw Requests) ---
 
 def notion_query_database(db_id, query_filter):
-    """データベースをクエリする (通知Bot準拠のRaw Request)"""
+    """データベースをクエリする (Raw Request)"""
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     try:
         res = requests.post(url, headers=HEADERS, json=query_filter)
@@ -139,17 +139,22 @@ def mix_audio_files(file_paths):
     return output_path
 
 def get_available_model_name():
-    models = list(genai.list_models())
-    available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-    for name in available_names:
-        if 'gemini-2.0-flash' in name and 'exp' not in name: return name
-    for name in available_names:
-        if 'gemini-2.5-flash' in name: return name
-    for name in available names:
-        if 'gemini-2.0-flash' in name: return name
-    for name in available_names:
-        if 'flash' in name: return name
-    return 'models/gemini-2.0-flash'
+    try:
+        models = list(genai.list_models())
+        available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        
+        # ★FIX: Syntax Error修正後のループ
+        for name in available_names: 
+            if 'gemini-2.0-flash' in name and 'exp' not in name: return name
+        for name in available_names:
+            if 'gemini-2.5-flash' in name: return name
+        for name in available_names:
+            if 'gemini-2.0-flash' in name: return name
+        for name in available_names:
+            if 'flash' in name: return name
+        return available_names[0]
+    except:
+        return 'models/gemini-2.0-flash'
 
 def analyze_audio_auto(file_path):
     model_name = get_available_model_name()
@@ -189,9 +194,9 @@ def analyze_audio_auto(file_path):
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: RAGIBI TARGET TEST (v32.0) ---", flush=True)
+    print("--- VERSION: SYNTAX AND RAGIBI TEST (v34.0) ---", flush=True)
     
-    if not INBOX_FOLDER_ID:
+    if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
         return
 

@@ -12,7 +12,6 @@ from datetime import datetime
 # --- 【強制修復】ライブラリのバージョンをコード内で強制アップデート ---
 try:
     import google.generativeai as genai
-    # バージョン確認。古ければ更新
     import importlib.metadata
     ver = importlib.metadata.version("google-generativeai")
     if ver < "0.8.3":
@@ -120,28 +119,30 @@ def mix_audio_files(file_paths):
 # --- AI & Notion ---
 
 def get_available_model_name():
-    """APIから利用可能なモデル一覧を取得し、最適なものを返す"""
+    """APIから利用可能なモデル一覧を取得し、最適なものを返す (Gemini 2.0対応)"""
     print("🔍 Searching for available Gemini models...", flush=True)
     try:
         models = list(genai.list_models())
         available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
         
-        # 優先順位: 1.5 Flash -> 1.5 Pro
+        # 優先順位: 2.0 Flash -> 2.0 Pro -> 1.5 Flash
+        # ログにあった 'models/gemini-2.0-flash' を最優先で狙う
         for name in available_names:
-            if 'gemini-1.5-flash' in name and '001' not in name: return name # 最新版Flash
+            if 'gemini-2.0-flash' in name and 'exp' not in name: return name # 安定版 2.0 Flash
         for name in available_names:
-            if 'gemini-1.5-flash' in name: return name # 任意のFlash
+            if 'gemini-2.5-flash' in name: return name # 2.5 Flash
         for name in available_names:
-            if 'gemini-1.5-pro' in name: return name # 任意のPro
+            if 'gemini-2.0-flash' in name: return name # Experimental含む
+        for name in available_names:
+            if 'flash' in name: return name # なんでもいいからFlash
             
-        print(f"⚠️ 1.5 series not found. Available: {available_names}", flush=True)
-        return 'models/gemini-1.5-flash' # フォールバック
+        print(f"⚠️ Preferred models not found. Available: {available_names}", flush=True)
+        return available_names[0] # リストの先頭にあるものを強制使用
     except Exception as e:
-        print(f"⚠️ Failed to list models: {e}. Using default.", flush=True)
-        return 'gemini-1.5-flash'
+        print(f"⚠️ Failed to list models: {e}. Using hardcoded fallback.", flush=True)
+        return 'models/gemini-2.0-flash'
 
 def analyze_audio_auto(file_path):
-    # 自動でモデル名を取得
     model_name = get_available_model_name()
     print(f"🧠 Analyzing with model: {model_name} ...", flush=True)
     
@@ -179,12 +180,11 @@ def analyze_audio_auto(file_path):
             raise ValueError(f"Failed to parse JSON: {text}")
 
     except Exception as e:
-        # エラー発生時は即座にスローせずログ出力
         print(f"❌ Analysis Failed: {e}", flush=True)
         raise e
 
 def main():
-    print("--- VERSION: SELF-HEALING 4.0 ---", flush=True)
+    print("--- VERSION: GEMINI 2.0 READY (v5.0) ---", flush=True)
     
     # Check Library Version
     try:
@@ -237,11 +237,9 @@ def main():
 
         mixed_path = mix_audio_files(local_audio_paths)
         
-        # 新しい自動解析関数を実行
         result = analyze_audio_auto(mixed_path)
         print(f"📊 Analysis Result: {result}", flush=True)
         
-        # Notion書き込み
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
         cc_res = notion.databases.query(
             database_id=CONTROL_CENTER_ID,

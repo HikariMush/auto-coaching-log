@@ -34,7 +34,6 @@ from googleapiclient.http import MediaIoBaseDownload
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # --- 最終設定（ハードコード） ---
-# Control Center DBのID (通知Botで実績のあるIDを使用)
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664" 
 
 # --- 初期化 ---
@@ -47,9 +46,8 @@ if os.getenv("GCP_SA_KEY"):
         f.write(os.getenv("GCP_SA_KEY"))
 
 def sanitize_id(raw_id):
-    # 厳密な正規表現チェックを外し、ハイフン除去のみに簡素化。
-    if not raw_id: return "" # Noneではなく空文字列を返すことで、パスのNone挿入を防ぐ
-    return raw_id.replace("-", "").strip() # ハイフンと外部スペースを除去
+    if not raw_id: return ""
+    return raw_id.replace("-", "").strip()
 
 try:
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -83,8 +81,8 @@ def notion_query_database(db_id, query_filter):
         res.raise_for_status()
         return res.json()
     except requests.exceptions.HTTPError as e:
-        print(f"❌ Notion Query Error ({db_id}): Status {e.response.status_code}")
-        print(f"   Detail: {e.response.text}")
+        print(f"❌ Notion Query Error ({db_id}): Status {e.response.status_code}", flush=True)
+        print(f"   Detail: {e.response.text}", flush=True)
         raise e
 
 def notion_create_page(parent_db_id, properties, children):
@@ -99,11 +97,11 @@ def notion_create_page(parent_db_id, properties, children):
         res.raise_for_status()
         return res.json()
     except requests.exceptions.HTTPError as e:
-        print(f"❌ Notion Create Page Error: Status {e.response.status_code}")
-        print(f"   Detail: {e.response.text}")
+        print(f"❌ Notion Create Page Error: Status {e.response.status_code}", flush=True)
+        print(f"   Detail: {e.response.text}", flush=True)
         raise e
 
-# --- Google Drive File Management (Omitted for brevity, fully included in file) ---
+# --- Google Drive File Management ---
 
 def get_or_create_processed_folder():
     """DriveのINBOX内に 'processed_coaching_logs' フォルダを探し、なければ作成する"""
@@ -218,9 +216,11 @@ def analyze_audio_auto(file_path):
                     time.sleep(5) 
                     continue
                 else:
+                    # Flashも失敗、または2回目の試行も失敗
                     raise e
             
             except Exception as e:
+                # 404 Not Foundなどのその他のエラーはそのままスロー
                 raise e
 
         # fallback loop end
@@ -289,13 +289,18 @@ def analyze_audio_auto(file_path):
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: AI OUTPUT LOGGING (v54.0) ---", flush=True)
+    print("--- VERSION: SYNTAX FINAL FIX (v55.1) ---", flush=True)
     
     if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
         return
 
-    # 1. Drive Search (Find unprocessed files)
+    # 1. Notion API IDテスト (Corrected NameError location)
+    if not CONTROL_CENTER_ID:
+        print("❌ CRITICAL ERROR: Control Center ID is NULL after setup.", flush=True)
+        return
+
+    # 2. Drive Search (Find unprocessed files)
     try:
         results = drive_service.files().list(
             q=f"'{INBOX_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
@@ -312,10 +317,10 @@ def main():
         print("ℹ️ No new files found. Exiting.", flush=True)
         return
 
-    # 2. Manual Input Check
+    # 3. Manual Input Check
     manual_name = os.getenv("MANUAL_STUDENT_NAME")
 
-    # 3. Main Processing Loop
+    # 4. Main Processing Loop
     for file in files:
         file_id = file['id']
         file_name = file['name']
@@ -323,7 +328,7 @@ def main():
         try:
             print(f"\nProcessing File: {file_name}", flush=True)
             
-            # 3.1. Audio Processing
+            # 4.1. Audio Processing
             local_audio_paths = []
             path = download_file(file_id, file_name)
             if file_name.lower().endswith('.zip'):
@@ -336,24 +341,14 @@ def main():
             
             mixed_path = mix_audio_files(local_audio_paths)
             
-            # 3.2. --- ★解析実行：JSONデータとRaw Transcriptの両方を取得★ ---
+            # 4.2. --- ★解析実行：JSONデータとRaw Transcriptの両方を取得★ ---
             full_analysis, raw_transcript = analyze_audio_auto(mixed_path)
             
-            # --- ★新規機能：AI出力結果の実行ログ記録★ ---
-            print("\n--- AI ANALYSIS OUTPUT (START) ---", flush=True)
-            print(f"Student: {full_analysis.get('student_name', 'N/A')}", flush=True)
-            print(f"Summary: {full_analysis.get('summary', 'N/A')}", flush=True)
-            print(f"Next Action: {full_analysis.get('next_action', 'N/A')}", flush=True)
-            print("\n[RAW TRANSCRIPT]", flush=True)
-            print(raw_transcript, flush=True)
-            print("--- AI ANALYSIS OUTPUT (END) ---\n", flush=True)
-            # --- 記録終了 ---
-
-            # 3.3. Name Logic
+            # 4.3. Name Logic
             final_student_name = manual_name if manual_name else full_analysis['student_name']
             print(f"ℹ️ Target Student for Lookup: '{final_student_name}'", flush=True)
 
-            # --- 4. Notion Search and Write ---
+            # --- 5. Notion Search and Write ---
             search_filter = {
                 "filter": {
                     "property": "Name",
@@ -368,7 +363,7 @@ def main():
                 print(f"❌ Error: Student '{final_student_name}' not found in Control Center. Skipping write.", flush=True)
                 continue 
 
-            # 5. Extract Target ID and Write
+            # 5.2. Extract Target ID
             target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             
             if not target_id_prop:
@@ -381,7 +376,7 @@ def main():
                 print(f"❌ Error: TargetID for {final_student_name} is invalid.", flush=True)
                 continue
 
-            # 5.1. --- ★メインログ（要約）の作成と書き込み★ ---
+            # 5.3. --- ★メインログ（要約）の作成と書き込み★ ---
             properties_summary = {
                 "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ (要約)"}}]},
                 "日付": {"date": {"start": full_analysis['date']}}
@@ -395,7 +390,7 @@ def main():
             print(f"✅ Summary Log written for {final_student_name}.", flush=True)
 
             
-            # 5.2. --- ★新規機能：純粋な文字起こしログの作成と書き込み★ ---
+            # 5.4. --- ★新規機能：純粋な文字起こしログの作成と書き込み★ ---
             properties_transcript = {
                 "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ (全文)"}}]},
                 "日付": {"date": {"start": full_analysis['date']}}
@@ -403,7 +398,6 @@ def main():
             
             children_transcript = []
             if raw_transcript and raw_transcript != "ERROR: Raw transcript not found.":
-                # 1行ずつブロックに変換
                 for line in raw_transcript.split('\n'):
                     if line.strip(): 
                         children_transcript.append({
@@ -424,7 +418,7 @@ def main():
             move_files_to_processed([file_id], processed_folder_id)
             print(f"🎉 PROJECT SUCCESS: Completed processing for {final_student_name}.", flush=True)
             
-       except Exception as e:
+        except Exception as e:
              print(f"❌ UNHANDLED CRASH IN LOOP: {e}", flush=True)
              import traceback
              traceback.print_exc()

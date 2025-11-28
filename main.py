@@ -31,7 +31,8 @@ from googleapiclient.http import MediaIoBaseDownload
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- 最終設定 ---
+# --- 最終設定（ハードコード） ---
+# Notification Botで実績のあるControl Center IDを使用
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664" 
 
 # --- 初期化 ---
@@ -50,18 +51,16 @@ def sanitize_id(raw_id):
     return None
 
 try:
-    # Notion API用ヘッダー (Raw Request)
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28"
+        "Notion-Version": "2022-06-28" 
     }
     
     CONTROL_CENTER_ID = sanitize_id(FINAL_CONTROL_DB_ID)
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
     
-    # Gemini & Drive Setup
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     SCOPES = ['https://www.googleapis.com/auth/drive']
     creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
@@ -93,9 +92,6 @@ def notion_create_page(parent_db_id, properties, children):
         "properties": properties,
         "children": children
     }
-    print("\n[DEBUG: PAYLOAD SENT]", flush=True)
-    print(json.dumps(payload, indent=2), flush=True)
-    
     try:
         res = requests.post(url, headers=HEADERS, json=payload)
         res.raise_for_status()
@@ -130,13 +126,18 @@ def extract_audio_from_zip(zip_path):
 
 def mix_audio_files(file_paths):
     if not file_paths: return None
-    mixed = AudioSegment.from_file(file_paths[0])
-    for path in file_paths[1:]:
-        track = AudioSegment.from_file(path)
-        mixed = mixed.overlay(track)
-    output_path = os.path.join(TEMP_DIR, "mixed_session.mp3")
-    mixed.export(output_path, format="mp3")
-    return output_path
+    print(f"🎛️ Mixing {len(file_paths)} audio tracks...", flush=True)
+    try:
+        mixed = AudioSegment.from_file(file_paths[0])
+        for path in file_paths[1:]:
+            track = AudioSegment.from_file(path)
+            mixed = mixed.overlay(track)
+        output_path = os.path.join(TEMP_DIR, "mixed_session.mp3")
+        mixed.export(output_path, format="mp3")
+        return output_path
+    except Exception as e:
+        print(f"⚠️ Mixing Error: {e}. Using largest file instead.", flush=True)
+        return max(file_paths, key=os.path.getsize)
 
 def get_available_model_name():
     models = list(genai.list_models())
@@ -163,7 +164,7 @@ def analyze_audio_auto(file_path):
     
     prompt = """
     【生徒名の特定ルール】
-    1. 「デッティー」や「でっていう」と聞こえた場合は、必ず『でっていう』と出力してください。
+    1. 呼びかけから生徒名を推測してください。
     2. それ以外の場合も、聞こえたままの音（カタカナやニックネーム）を入力してください。
     
     {
@@ -189,71 +190,119 @@ def analyze_audio_auto(file_path):
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: FINAL DATA FIX (v36.0) ---", flush=True)
+    print("--- VERSION: FINAL PRODUCTION BUILD (v39.0) ---", flush=True)
     
-    if not os.getenv("DRIVE_FOLDER_ID"):
+    if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
         return
 
-    # 1. ファイル処理 (簡略化された実行パス)
-    # Target ID抽出のため、検索キーを「らぎぴ」に変更
-    result = {
-        'student_name': 'らぎぴ', 
-        'date': '2025-11-28', 
-        'summary': '【らぎぴさんのログ】着地狩りについてコーチングを行うセッションの最終検証。', 
-        'next_action': 'TargetIDの健全性確認。'
-    }
-
-    
-    # --- 2. Notion検索 (Control Center) ---
-    print(f"ℹ️ Control Center ID used: {CONTROL_CENTER_ID}", flush=True)
-    
-    # ★検索フィルターを「らぎぴ」に変更 (Contains)
-    search_filter = {
-        "filter": {
-            "property": "Name",
-            "title": { "contains": result['student_name'] } 
-        }
-    }
-
+    # 1. Drive Search (Find unprocessed files)
     try:
-        cc_res_data = notion_query_database(CONTROL_CENTER_ID, search_filter)
+        results = drive_service.files().list(
+            q=f"'{INBOX_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
+            fields="files(id, name, createdTime)",
+            orderBy="createdTime desc"
+        ).execute()
     except Exception as e:
-        print(f"❌ CRITICAL FAILURE: Control Center Query failed. Error: {e}", flush=True)
+        print(f"❌ Drive Search Error: {e}", flush=True)
+        return
+    
+    files = results.get('files', [])
+    
+    if not files:
+        print("ℹ️ No new files found. Exiting.", flush=True)
         return
 
-    # --- 3. 生徒データの抽出 ---
-    results_list = cc_res_data.get("results", [])
-    
-    if results_list:
-        target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
-        if target_id_prop:
-            final_target_id = sanitize_id(target_id_prop[0]["plain_text"])
+    # 2. Manual Input Check
+    manual_name = os.getenv("MANUAL_STUDENT_NAME")
 
-            if final_target_id:
-                print(f"📝 Writing log to Target DB ID: {final_target_id}", flush=True)
-                
-                # 4. ページ作成 (Raw Request)
-                properties = {
-                    "名前": {"title": [{"text": {"content": f"{result['date']} ログ (RAGIPI TEST)"}}]},
-                    "日付": {"date": {"start": result['date']}}
-                }
-                children = [
-                    {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result['summary']}}]}},
-                    {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
-                    {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
-                ]
-                
-                # ここで無効なIDの場合はクラッシュする
-                notion_create_page(final_target_id, properties, children)
-                
-                print("✅ Successfully updated Notion.", flush=True)
+    # 3. Main Processing Loop
+    for file in files:
+        file_id = file['id']
+        file_name = file['name']
+        
+        try:
+            print(f"\nProcessing File: {file_name}", flush=True)
+            
+            # 3.1. Audio Processing (Download, Mix, Analyze)
+            local_audio_paths = []
+            
+            # --- Download/Extract Logic ---
+            path = download_file(file_id, file_name)
+            if file_name.lower().endswith('.zip'):
+                local_audio_paths.extend(extract_audio_from_zip(path))
             else:
-                 print("❌ Error: TargetID in Control Center for らぎぴ is invalid.", flush=True)
-        else:
-            print("❌ Error: TargetID is empty in Control Center for らぎぴ.", flush=True)
-    else:
-        print(f"❌ Error: Student '{result['student_name']}' not found in Control Center.", flush=True)
+                local_audio_paths.append(path)
+            
+            if not local_audio_paths:
+                print("⚠️ No valid audio tracks found after extraction. Skipping.", flush=True)
+                continue
+            
+            mixed_path = mix_audio_files(local_audio_paths)
+            
+            # --- Result Generation ---
+            full_analysis = analyze_audio_auto(mixed_path)
+            
+            if manual_name:
+                # MANUAL PATH: Use manual name, keep AI summary
+                final_student_name = manual_name
+                print(f"✅ MANUAL MODE: Overriding name to '{final_student_name}'.", flush=True)
+            else:
+                # FULL AUTO PATH: Use AI's extracted name
+                final_student_name = full_analysis['student_name']
+                print(f"ℹ️ AUTO MODE: Using AI-extracted name '{final_student_name}'.", flush=True)
+
+            # --- 4. Notion Search and Write ---
+            # Search filter is now robust against minor errors using 'contains'
+            search_filter = {
+                "filter": {
+                    "property": "Name",
+                    "title": { "contains": final_student_name } 
+                }
+            }
+            
+            cc_res_data = notion_query_database(CONTROL_CENTER_ID, search_filter)
+            results_list = cc_res_data.get("results", [])
+            
+            if not results_list:
+                print(f"❌ Error: Student '{final_student_name}' not found in Control Center. Skipping write.", flush=True)
+                continue 
+
+            # 5. Extract Target ID and Write
+            target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
+            
+            if target_id_prop:
+                final_target_id = sanitize_id(target_id_prop[0]["plain_text"])
+                
+                if final_target_id:
+                    print(f"📝 Writing log to Target DB ID: {final_target_id}", flush=True)
+                    
+                    # 4. ページ作成 (Raw Request)
+                    properties = {
+                        "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ"}}]},
+                        "日付": {"date": {"start": full_analysis['date']}}
+                    }
+                    children = [
+                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": full_analysis['summary']}}]}},
+                        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
+                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": full_analysis.get('next_action', 'なし')}}]}}
+                    ]
+                    
+                    notion_create_page(final_target_id, properties, children)
+                    
+                    print(f"✅ Successfully updated Notion for {final_student_name}.", flush=True)
+                    
+                    # Clean up file
+                    processed_folder_id = get_or_create_processed_folder()
+                    move_files_to_processed([file_id], processed_folder_id)
+                else:
+                     print(f"❌ Error: TargetID in Control Center for {final_student_name} is invalid.", flush=True)
+            
+        except Exception as e:
+             print(f"❌ UNHANDLED CRASH IN LOOP: {e}", flush=True)
+        finally:
+            if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
+            os.makedirs(TEMP_DIR) 
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,37 @@
+name: Auto Coaching Log
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # 15分ごとに実行
+  workflow_dispatch:        # 手動実行ボタンも有効化
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          CONTROL_CENTER_ID: ${{ secrets.CONTROL_CENTER_ID }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: python main.py

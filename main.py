@@ -424,5 +424,13 @@ def main():
             move_files_to_processed([file_id], processed_folder_id)
             print(f"🎉 PROJECT SUCCESS: Completed processing for {final_student_name}.", flush=True)
             
-        except Exception as e:
-             print(f"❌
+       except Exception as e:
+             print(f"❌ UNHANDLED CRASH IN LOOP: {e}", flush=True)
+             import traceback
+             traceback.print_exc()
+        finally:
+            if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
+            os.makedirs(TEMP_DIR) 
+
+if __name__ == "__main__":
+    main()

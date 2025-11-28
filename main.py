@@ -106,13 +106,13 @@ def mix_audio_files(file_paths):
 # --- AI & Notion ---
 
 def analyze_audio_with_fallback(file_path):
-    # 優先順位をつけてモデルを試す
+    # ★ここが重要：モデル名が見つからない場合、自動で次を試すリスト
     models_to_try = [
-        'gemini-1.5-flash',        # エイリアス
-        'gemini-1.5-flash-latest', # 最新エイリアス
-        'gemini-1.5-flash-001',    # 固定バージョン
-        'gemini-1.5-pro-latest',   # Proバックアップ
-        'gemini-pro'               # 旧モデル
+        'gemini-1.5-flash',        # 基本
+        'gemini-1.5-flash-latest', # 最新
+        'gemini-1.5-flash-001',    # 固定版
+        'gemini-1.5-pro-latest',   # Pro (バックアップ)
+        'gemini-pro'               # 旧モデル (最終手段)
     ]
 
     last_error = None
@@ -150,11 +150,10 @@ def analyze_audio_with_fallback(file_path):
             if match:
                 return json.loads(match.group(0))
             else:
-                # JSONパース失敗ならエラーとして次へ
                 raise ValueError(f"Failed to parse JSON: {text}")
 
         except Exception as e:
-            print(f"⚠️ Model {model_name} failed: {e}", flush=True)
+            print(f"⚠️ Model {model_name} failed: {e}. Trying next...", flush=True)
             last_error = e
             time.sleep(1)
             continue
@@ -162,7 +161,9 @@ def analyze_audio_with_fallback(file_path):
     raise last_error
 
 def main():
-    print("--- DEBUG START ---", flush=True)
+    # ★更新確認用ログ
+    print("--- VERSION: ROBUST FALLBACK 2.0 ---", flush=True)
+    
     if not INBOX_FOLDER_ID:
         print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
         return
@@ -208,7 +209,7 @@ def main():
 
         mixed_path = mix_audio_files(local_audio_paths)
         
-        # フォールバック機能付き解析
+        # フォールバック機能付き解析を使用
         result = analyze_audio_with_fallback(mixed_path)
         print(f"📊 Analysis Result: {result}", flush=True)
         

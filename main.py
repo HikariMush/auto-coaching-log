@@ -23,7 +23,7 @@ except ImportError:
     ])
     import requests
     import google.generativeai as genai
-    from pydub import AudioSegment
+    from pydiffub import AudioSegment
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -32,7 +32,6 @@ from googleapiclient.http import MediaIoBaseDownload
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # --- 最終設定（ハードコード） ---
-# Control Center DBのID (通知Botで実績のあるID)
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664" 
 
 # --- 初期化 ---
@@ -193,6 +192,8 @@ def get_available_model_name():
     for name in available_names:
         if 'gemini-2.5-flash' in name: return name
     for name in available_names:
+        if 'gemini-2.0-flash' in name: return name
+    for name in available_names:
         if 'flash' in name: return name
 
     return available_names[0] if available_names else 'models/gemini-2.0-flash'
@@ -206,15 +207,15 @@ def analyze_audio_auto(file_path):
         time.sleep(2)
         audio_file = genai.get_file(audio_file.name)
     if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
-    
-    # ★プロンプト修正：最終版スマブラ専門用語と認知分析、デュアル出力
+
+    # ★最終プロンプト：スマブラ専門用語と認知分析、デュアル出力
     prompt = """
     あなたは**トップ・スマブラアナリスト**であり、具体的な課題を発見し解決するための**エージェント**です。
     この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
 
     【制約事項と文脈の優先度】
     1. **最優先ドメイン用語**: 「着地狩り」「崖際」「復帰阻止」「間合い」「確定反撃」などの専門用語を優先して正確に抽出せよ。
-    2. **会話のフロー**: 会話は、(1)取り組み全般、(2)過去の課題フィードバック、(3)新しい課題発見と解決策提示、の工程に分かれる。
+    2. **思考フレームワーク**: クライアントの発言と行動パターンを分析し、**認知バイアス**（例：現状維持バイアス）とゲーム内行動を紐づけて報告せよ。
 
     ---
     **[RAW_TRANSCRIPTION_START]**
@@ -223,7 +224,7 @@ def analyze_audio_auto(file_path):
     ---
 
     【コア分析構造：5要素抽出】
-    上記の文字起こしに基づき、スマブラの内容および生活改善、取り組み改善における話題は、以下の5要素に分割し、詳細な議事録として記録せよ。
+    上記の文字起こしに基づき、スマブラの内容および取り組み改善における話題は、以下の5要素に分割し、詳細な議事録として記録せよ。
     * **現状** (Current Status)
     * **課題** (Problem/Issue)
     * **原因** (Root Cause)
@@ -263,7 +264,7 @@ def analyze_audio_auto(file_path):
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: FINAL PRODUCTION BUILD (v47.0) ---", flush=True)
+    print("--- VERSION: FINAL PRODUCTION BUILD (v47.1) ---", flush=True)
     
     if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
@@ -319,6 +320,7 @@ def main():
             print(f"ℹ️ Target Student for Lookup: '{final_student_name}'", flush=True)
 
             # --- 4. Notion Search and Write ---
+            # Search filter uses 'contains' for flexibility
             search_filter = {
                 "filter": {
                     "property": "Name",
@@ -361,7 +363,6 @@ def main():
 
             
             # 5.2. --- ★新規機能：純粋な文字起こしログの作成と書き込み★ ---
-            
             properties_transcript = {
                 "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ (全文)"}}]},
                 "日付": {"date": {"start": full_analysis['date']}}

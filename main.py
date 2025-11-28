@@ -30,7 +30,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from pydub import AudioSegment
-from notion_client import Client, APIResponseError
+from notion_client import Client
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
@@ -55,6 +55,7 @@ try:
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
     CONTROL_CENTER_ID = sanitize_id(os.getenv("CONTROL_CENTER_ID"))
     
+    # Client初期化
     notion = Client(auth=os.getenv("NOTION_TOKEN"))
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
     
@@ -67,30 +68,7 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- ★重要：Notion接続診断機能 ---
-def check_database_connection():
-    print(f"🔍 Diagnosing Control Center ID: {CONTROL_CENTER_ID[:4]}...{CONTROL_CENTER_ID[-4:]}", flush=True)
-    
-    if not CONTROL_CENTER_ID:
-        print("❌ Error: Control Center ID is invalid.", flush=True)
-        return False
-
-    try:
-        # まずデータベースとして取得できるか試す
-        db = notion.databases.retrieve(database_id=CONTROL_CENTER_ID)
-        print(f"✅ Connection OK! Database Name: {db['title'][0]['plain_text'] if db['title'] else 'Untitled'}", flush=True)
-        return True
-    except APIResponseError as e:
-        if e.code == "object_not_found":
-            print("❌ Error: ID not found. (Check permissions? Did you invite the bot?)", flush=True)
-        elif e.status == 400:
-            print("❌ Error: This ID is not a Database. It might be a Page ID.", flush=True)
-            print("👉 Fix: Open Notion, click the '...' next to the database title (not the page corner), 'Copy link', and extract that ID.", flush=True)
-        else:
-            print(f"❌ Connection Error: {e}", flush=True)
-        return False
-
-# --- 通常関数 ---
+# --- Helper Functions ---
 
 def get_or_create_processed_folder():
     query = f"'{INBOX_FOLDER_ID}' in parents and name = 'Processed' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -152,7 +130,6 @@ def get_available_model_name():
     try:
         models = list(genai.list_models())
         available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        # 優先順位: 2.0 -> 1.5
         for name in available_names:
             if 'gemini-2.0-flash' in name and 'exp' not in name: return name
         for name in available_names:
@@ -178,19 +155,18 @@ def analyze_audio_auto(file_path):
         
         if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
 
-        # ★プロンプト改善：不明でも聞こえた名前を出すように指示
         prompt = """
         以下の音声はコーチングセッションの録音です。
         以下の情報を抽出し、JSON形式のみを出力してください。Markdown装飾は不要です。
         
         【生徒名の抽出ルール】
         1. 会話中の呼びかけ（「〇〇さん」）から名前を特定してください。
-        2. もし登録名と一致するか不明でも、聞こえたままの音（カタカナやニックネーム）を入力してください。
+        2. 登録名と一致するか不明でも、聞こえたままの音（カタカナやニックネーム）を入力してください。
         3. 絶対に 'Unknown' にせず、候補を挙げてください。
         
         {
           "student_name": "生徒の名前（例: Tetu, デッティー, 田中）",
-          "date": "YYYY-MM-DD",
+          "date": "YYYY-MM-DD (不明なら 'Today' と出力)",
           "summary": "セッション要約（300文字以内）",
           "next_action": "次回の宿題"
         }
@@ -201,19 +177,23 @@ def analyze_audio_auto(file_path):
 
         text = response.text.strip()
         match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match: return json.loads(match.group(0))
-        else: raise ValueError("JSON Parse Failed")
+        if match: 
+            data = json.loads(match.group(0))
+            # 日付補正
+            if data.get('date') in ['Unknown', 'Today']:
+                data['date'] = datetime.now().strftime('%Y-%m-%d')
+            return data
+        else: 
+            raise ValueError("JSON Parse Failed")
     except Exception as e:
         print(f"❌ Analysis Failed: {e}", flush=True)
         raise e
 
 def main():
-    print("--- VERSION: DIAGNOSTIC & RELAXED PROMPT (v10.0) ---", flush=True)
+    print("--- VERSION: RAW REQUEST MODE (v11.0) ---", flush=True)
     
-    # 1. 起動時診断
-    if not check_database_connection():
-        print("⛔ System stopped due to Notion ID error.", flush=True)
-        # IDエラーでも処理済み移動はしない（リトライのため）
+    if not INBOX_FOLDER_ID:
+        print("❌ Error: DRIVE_FOLDER_ID is empty!", flush=True)
         return
 
     try:
@@ -259,19 +239,17 @@ def main():
         result = analyze_audio_auto(mixed_path)
         print(f"📊 Analysis Result: {result}", flush=True)
         
-        if result['student_name'] == 'Unknown':
-            print("⚠️ Student Name is Unknown. Skipping Notion search to avoid error.", flush=True)
-            # Unknownなら移動せず終了（次回リトライ、または手動確認用）
-            return
-
         print(f"🔍 Searching Control Center for: {result['student_name']}", flush=True)
         
-        # ライブラリの正規メソッドを使用（診断が通っていれば動くはず）
-        cc_res = notion.databases.query(
-            database_id=CONTROL_CENTER_ID,
-            filter={
-                "property": "Name",
-                "rich_text": {"equals": result['student_name']}
+        # ★ここが変更点: requestメソッドで直通信
+        cc_res = notion.request(
+            path=f"databases/{CONTROL_CENTER_ID}/query",
+            method="POST",
+            body={
+                "filter": {
+                    "property": "Name",
+                    "rich_text": {"equals": result['student_name']}
+                }
             }
         )
         
@@ -281,29 +259,37 @@ def main():
             target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
             if target_id_prop:
                 target_id = sanitize_id(target_id_prop[0]["plain_text"])
-                print(f"📝 Writing to Student DB: {target_id}", flush=True)
-                
-                notion.pages.create(
-                    parent={"database_id": target_id},
-                    properties={
-                        "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
-                        "日付": {"date": {"start": result['date']}}
-                    },
-                    children=[
-                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result['summary']}}]}},
-                        {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
-                        {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
-                    ]
-                )
-                print("✅ Successfully updated Notion.", flush=True)
-                
-                processed_folder_id = get_or_create_processed_folder()
-                move_files_to_processed(processed_file_ids, processed_folder_id)
+                if target_id:
+                    print(f"📝 Writing to Student DB: {target_id}", flush=True)
+                    
+                    # 書き込みも直通信
+                    notion.request(
+                        path="pages",
+                        method="POST",
+                        body={
+                            "parent": {"database_id": target_id},
+                            "properties": {
+                                "名前": {"title": [{"text": {"content": f"{result['date']} ログ"}}]},
+                                "日付": {"date": {"start": result['date']}}
+                            },
+                            "children": [
+                                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result['summary']}}]}},
+                                {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
+                                {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
+                            ]
+                        }
+                    )
+                    print("✅ Successfully updated Notion.", flush=True)
+                    
+                    processed_folder_id = get_or_create_processed_folder()
+                    move_files_to_processed(processed_file_ids, processed_folder_id)
+                else:
+                     print("❌ Error: TargetID in Notion is invalid.", flush=True)
             else:
                 print("❌ Error: TargetID is empty in Control Center.", flush=True)
         else:
             print(f"❌ Error: Student '{result['student_name']}' not found in Control Center.", flush=True)
-            print("ℹ️ Hint: Check if the name in Notion matches exactly (Case sensitive / Kanji / Katakana).", flush=True)
+            print("ℹ️ Check exact spelling in Notion.", flush=True)
 
     except Exception as e:
         print(f"❌ Processing Failed: {e}", flush=True)

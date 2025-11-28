@@ -31,8 +31,8 @@ from googleapiclient.http import MediaIoBaseDownload
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- 最終設定（ハードコード） ---
-# Notification Botで実績のあるControl Center IDを使用
+# --- 最終設定 ---
+# ⚠️ 注意: ここが Control Center DBのIDです。
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664" 
 
 # --- 初期化 ---
@@ -73,7 +73,6 @@ except Exception as e:
 # --- Notion API 関数群 (Raw Requests) ---
 
 def notion_query_database(db_id, query_filter):
-    """データベースをクエリする (Raw Request)"""
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     try:
         res = requests.post(url, headers=HEADERS, json=query_filter)
@@ -85,7 +84,6 @@ def notion_query_database(db_id, query_filter):
         raise e
 
 def notion_create_page(parent_db_id, properties, children):
-    """新しいページを作成する (Raw Request)"""
     url = "https://api.notion.com/v1/pages"
     payload = {
         "parent": {"database_id": parent_db_id},
@@ -100,6 +98,43 @@ def notion_create_page(parent_db_id, properties, children):
         print(f"❌ Notion Create Page Error: Status {e.response.status_code}")
         print(f"   Detail: {e.response.text}")
         raise e
+
+# --- Google Drive File Management ---
+
+def get_or_create_processed_folder():
+    """DriveのINBOX内に 'processed_coaching_logs' フォルダを探し、なければ作成する"""
+    folder_name = "processed_coaching_logs"
+    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
+    response = drive_service.files().list(q=query, fields='files(id)').execute()
+    files = response.get('files', [])
+
+    if files:
+        return files[0]['id']
+    else:
+        file_metadata = {
+            'name': folder_name,
+            'mimeType': 'application/vnd.google-apps.folder',
+            'parents': [INBOX_FOLDER_ID]
+        }
+        folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+        return folder.get('id')
+
+def move_files_to_processed(file_ids, target_folder_id):
+    """指定されたファイルを、現在のフォルダからターゲットフォルダへ移動する"""
+    for file_id in file_ids:
+        try:
+            file = drive_service.files().get(fileId=file_id, fields='parents').execute()
+            previous_parents = ",".join(file.get('parents'))
+            
+            drive_service.files().update(
+                fileId=file_id,
+                addParents=target_folder_id,
+                removeParents=previous_parents,
+                fields='id, parents'
+            ).execute()
+            print(f"➡️ Moved file {file_id} to processed folder successfully.", flush=True)
+        except Exception as e:
+            print(f"❌ Failed to move file {file_id}. Error: {e}", flush=True)
 
 # --- Audio/Drive/Gemini Helpers (Integration) ---
 
@@ -174,7 +209,7 @@ def analyze_audio_auto(file_path):
       "next_action": "次回の宿題"
     }
     """
-    response = model.generate_content([prompt, audio_file])
+    response = model.generate_content(prompt, audio_file)
     try: genai.delete_file(audio_file.name)
     except: pass
     
@@ -190,9 +225,9 @@ def analyze_audio_auto(file_path):
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: FINAL PRODUCTION BUILD (v39.0) ---", flush=True)
+    print("--- VERSION: FINAL PRODUCTION BUILD (v40.0) ---", flush=True)
     
-    if not INBOX_FOLDER_ID:
+    if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
         return
 
@@ -221,6 +256,7 @@ def main():
         file_id = file['id']
         file_name = file['name']
         
+        # Audio Processing & Analysis (Must be performed for summary)
         try:
             print(f"\nProcessing File: {file_name}", flush=True)
             
@@ -235,8 +271,7 @@ def main():
                 local_audio_paths.append(path)
             
             if not local_audio_paths:
-                print("⚠️ No valid audio tracks found after extraction. Skipping.", flush=True)
-                continue
+                raise ValueError("No valid audio tracks found after extraction.")
             
             mixed_path = mix_audio_files(local_audio_paths)
             
@@ -253,7 +288,7 @@ def main():
                 print(f"ℹ️ AUTO MODE: Using AI-extracted name '{final_student_name}'.", flush=True)
 
             # --- 4. Notion Search and Write ---
-            # Search filter is now robust against minor errors using 'contains'
+            # Search filter uses 'contains' for flexibility
             search_filter = {
                 "filter": {
                     "property": "Name",
@@ -292,7 +327,7 @@ def main():
                     
                     print(f"✅ Successfully updated Notion for {final_student_name}.", flush=True)
                     
-                    # Clean up file
+                    # 6. File cleanup (Must be inside successful write block)
                     processed_folder_id = get_or_create_processed_folder()
                     move_files_to_processed([file_id], processed_folder_id)
                 else:
@@ -300,6 +335,8 @@ def main():
             
         except Exception as e:
              print(f"❌ UNHANDLED CRASH IN LOOP: {e}", flush=True)
+             import traceback
+             traceback.print_exc()
         finally:
             if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
             os.makedirs(TEMP_DIR) 

@@ -10,18 +10,24 @@ import shutil
 from datetime import datetime
 
 # --- ライブラリ強制セットアップ ---
-# (中略 - インストールコードは変更なし)
-
 try:
     import requests
     import google.generativeai as genai
     from pydub import AudioSegment
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
 except ImportError:
-    # 実際にはここにインストールコードがあるが、透明性のために省略
-    pass
+    print("🔄 Installing core libraries...", flush=True)
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "--upgrade", 
+        "requests", "google-generativeai>=0.8.3", "pydub",
+        "google-api-python-client", "google-auth"
+    ])
+    import requests
+    import google.generativeai as genai
+    from pydub import AudioSegment
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
@@ -87,8 +93,8 @@ def notion_create_page(parent_db_id, properties, children):
         "properties": properties,
         "children": children
     }
-    # print("\n[DEBUG: PAYLOAD SENT]", flush=True) # デバッグログは省略
-    # print(json.dumps(payload, indent=2), flush=True)
+    print("\n[DEBUG: PAYLOAD SENT]", flush=True)
+    print(json.dumps(payload, indent=2), flush=True)
     
     try:
         res = requests.post(url, headers=HEADERS, json=payload)
@@ -101,57 +107,112 @@ def notion_create_page(parent_db_id, properties, children):
 
 # --- Audio/Drive/Gemini Helpers (Integration) ---
 
-# download_file, extract_audio_from_zip, mix_audio_files は変更なし（省略）
+def download_file(file_id, file_name):
+    request = drive_service.files().get_media(fileId=file_id)
+    file_path = os.path.join(TEMP_DIR, file_name)
+    with open(file_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+    return file_path
+
+def extract_audio_from_zip(zip_path):
+    extracted_files = []
+    extract_dir = os.path.join(TEMP_DIR, "extracted_" + os.path.basename(zip_path))
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_dir)
+    for root, dirs, files in os.walk(extract_dir):
+        for file in files:
+            if file.lower().endswith(('.flac', '.mp3', '.aac', '.wav', '.m4a')):
+                extracted_files.append(os.path.join(root, file))
+    return extracted_files
+
+def mix_audio_files(file_paths):
+    if not file_paths: return None
+    mixed = AudioSegment.from_file(file_paths[0])
+    for path in file_paths[1:]:
+        track = AudioSegment.from_file(path)
+        mixed = mixed.overlay(track)
+    output_path = os.path.join(TEMP_DIR, "mixed_session.mp3")
+    mixed.export(output_path, format="mp3")
+    return output_path
 
 def get_available_model_name():
-    try:
-        models = list(genai.list_models())
-        available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-        
-        # Syntax Error修正後のループ
-        for name in available_names: 
-            if 'gemini-2.0-flash' in name and 'exp' not in name: return name
-        for name in available_names:
-            if 'gemini-2.5-flash' in name: return name
-        for name in available_names:
-            if 'gemini-2.0-flash' in name: return name
-        for name in available_names:
-            if 'flash' in name: return name
-        return available_names[0]
-    except:
-        return 'models/gemini-2.0-flash'
+    models = list(genai.list_models())
+    available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+    for name in available_names:
+        if 'gemini-2.0-flash' in name and 'exp' not in name: return name
+    for name in available_names:
+        if 'gemini-2.5-flash' in name: return name
+    for name in available_names:
+        if 'gemini-2.0-flash' in name: return name
+    for name in available_names:
+        if 'flash' in name: return name
+    return 'models/gemini-2.0-flash'
 
-# analyze_audio_auto は変更なし（省略）
-
+def analyze_audio_auto(file_path):
+    model_name = get_available_model_name()
+    model = genai.GenerativeModel(model_name)
+    audio_file = genai.upload_file(file_path)
+    
+    while audio_file.state.name == "PROCESSING":
+        time.sleep(2)
+        audio_file = genai.get_file(audio_file.name)
+    if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
+    
+    prompt = """
+    【生徒名の特定ルール】
+    1. 「デッティー」や「でっていう」と聞こえた場合は、必ず『でっていう』と出力してください。
+    2. それ以外の場合も、聞こえたままの音（カタカナやニックネーム）を入力してください。
+    
+    {
+      "student_name": "生徒の名前（例: でっていう, 田中）",
+      "date": "YYYY-MM-DD (不明ならToday)",
+      "summary": "セッション要約（300文字以内）",
+      "next_action": "次回の宿題"
+    }
+    """
+    response = model.generate_content([prompt, audio_file])
+    try: genai.delete_file(audio_file.name)
+    except: pass
+    
+    text = response.text.strip()
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match: 
+        data = json.loads(match.group(0))
+        if data.get('date') in ['Unknown', 'Today']:
+            data['date'] = datetime.now().strftime('%Y-%m-%d')
+        return data
+    else: 
+        raise ValueError("JSON Parse Failed")
 
 # --- メイン処理 ---
 def main():
-    print("--- VERSION: FINAL TARGET ID CHECK (v35.0) ---", flush=True)
+    print("--- VERSION: FINAL DATA FIX (v36.0) ---", flush=True)
     
     if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
         return
 
     # 1. ファイル処理 (簡略化された実行パス)
-    # ★FIX: 検索キーを「でっていう(test)」に変更
-    STUDENT_NAME_TO_TEST = "でっていう(test)" 
-    
+    # Target ID抽出のため、検索キーを「らぎぴ」に変更
     result = {
-        'student_name': STUDENT_NAME_TO_TEST, 
-        'date': '2025-11-29', 
-        'summary': '【' + STUDENT_NAME_TO_TEST + 'さんのログ】着地狩りに関するコーチングセッションの動作検証。', 
-        'next_action': 'TargetIDへの書き込み成功を確認する。'
+        'student_name': 'らぎぴ', 
+        'date': '2025-11-28', 
+        'summary': '【らぎぴさんのログ】着地狩りについてコーチングを行うセッションの最終検証。', 
+        'next_action': 'TargetIDの健全性確認。'
     }
 
     
     # --- 2. Notion検索 (Control Center) ---
     print(f"ℹ️ Control Center ID used: {CONTROL_CENTER_ID}", flush=True)
     
-    # ★FIX: 検索フィルターを新しい生徒名に変更
+    # ★検索フィルターを「らぎぴ」に変更 (Contains)
     search_filter = {
         "filter": {
             "property": "Name",
-            "title": { "contains": STUDENT_NAME_TO_TEST } 
+            "title": { "contains": result['student_name'] } 
         }
     }
 
@@ -166,16 +227,15 @@ def main():
     
     if results_list:
         target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
-        
         if target_id_prop:
             final_target_id = sanitize_id(target_id_prop[0]["plain_text"])
-            
+
             if final_target_id:
-                print(f"📝 Target DB ID FOUND: {final_target_id[:6]}...", flush=True)
+                print(f"📝 Writing log to Target DB ID: {final_target_id}", flush=True)
                 
                 # 4. ページ作成 (Raw Request)
                 properties = {
-                    "名前": {"title": [{"text": {"content": f"{result['date']} ログ (TEST)"}}]},
+                    "名前": {"title": [{"text": {"content": f"{result['date']} ログ (RAGIPI TEST)"}}]},
                     "日付": {"date": {"start": result['date']}}
                 }
                 children = [
@@ -184,18 +244,16 @@ def main():
                     {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": result.get('next_action', 'なし')}}]}}
                 ]
                 
-                # ここでNotionへのページ作成が実行されます
+                # ここで無効なIDの場合はクラッシュする
                 notion_create_page(final_target_id, properties, children)
                 
-                print(f"✅ SUCCESSFULLY WROTE LOG for {STUDENT_NAME_TO_TEST}.", flush=True)
-                print(f"   Notionの '{STUDENT_NAME_TO_TEST}' さんのデータベースを確認してください。", flush=True)
-
+                print("✅ Successfully updated Notion.", flush=True)
             else:
-                 print(f"❌ Error: TargetID in Control Center for {STUDENT_NAME_TO_TEST} is invalid/empty.", flush=True)
+                 print("❌ Error: TargetID in Control Center for らぎぴ is invalid.", flush=True)
         else:
-            print(f"❌ Error: TargetID property is empty/missing in Control Center for {STUDENT_NAME_TO_TEST}.", flush=True)
+            print("❌ Error: TargetID is empty in Control Center for らぎぴ.", flush=True)
     else:
-        print(f"❌ Error: Student '{STUDENT_NAME_TO_TEST}' not found in Control Center. (Name mismatch confirmed)", flush=True)
+        print(f"❌ Error: Student '{result['student_name']}' not found in Control Center.", flush=True)
 
 if __name__ == "__main__":
     main()

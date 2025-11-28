@@ -1,10 +1,13 @@
 name: Auto Coaching Log
-
 on:
   schedule:
-    # UTC 0:00(JST 9:00) ～ UTC 15:00(JST 24:00) の間、30分おき
-    - cron: '*/30 0-15 * * *'
+    - cron: '*/30 0-15 * * *'  # 自動実行パス (JST 9:00 - 24:00)
   workflow_dispatch:
+    inputs:
+      target_student:
+        description: 'Target Student Name (e.g., ひ, らぎぴ)'
+        required: false
+        default: ''
 
 jobs:
   run-script:
@@ -17,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'  
+          python-version: '3.11'
 
       - name: Install FFmpeg
         run: |
@@ -25,14 +28,14 @@ jobs:
           sudo apt-get install -y ffmpeg
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Run script
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          CONTROL_CENTER_ID: ${{ secrets.CONTROL_CENTER_ID }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          # ★手動入力値の引き渡し: Pythonスクリプトのos.getenvで読み込まれます
+          MANUAL_STUDENT_NAME: ${{ github.event.inputs.target_student }} 
         run: python main.py

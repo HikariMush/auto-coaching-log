@@ -106,12 +106,13 @@ def mix_audio_files(file_paths):
 # --- AI & Notion ---
 
 def analyze_audio_with_fallback(file_path):
-    # 試行するモデル名のリスト（優先順）
+    # 優先順位をつけてモデルを試す
     models_to_try = [
-        'gemini-1.5-flash-latest', # 最新のFlash
-        'gemini-1.5-flash-001',    # バージョン固定Flash
-        'gemini-1.5-pro-latest',   # Pro（バックアップ）
-        'gemini-pro'               # 1.0 Pro（最終手段）
+        'gemini-1.5-flash',        # エイリアス
+        'gemini-1.5-flash-latest', # 最新エイリアス
+        'gemini-1.5-flash-001',    # 固定バージョン
+        'gemini-1.5-pro-latest',   # Proバックアップ
+        'gemini-pro'               # 旧モデル
     ]
 
     last_error = None
@@ -149,15 +150,15 @@ def analyze_audio_with_fallback(file_path):
             if match:
                 return json.loads(match.group(0))
             else:
+                # JSONパース失敗ならエラーとして次へ
                 raise ValueError(f"Failed to parse JSON: {text}")
 
         except Exception as e:
             print(f"⚠️ Model {model_name} failed: {e}", flush=True)
             last_error = e
-            # 次のモデルを試す
+            time.sleep(1)
             continue
             
-    # 全モデル失敗した場合
     raise last_error
 
 def main():
@@ -207,7 +208,7 @@ def main():
 
         mixed_path = mix_audio_files(local_audio_paths)
         
-        # フォールバック機能付き解析呼び出し
+        # フォールバック機能付き解析
         result = analyze_audio_with_fallback(mixed_path)
         print(f"📊 Analysis Result: {result}", flush=True)
         

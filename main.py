@@ -1,6 +1,5 @@
 import os
 import sys
-import subprocess
 import time
 import json
 import logging
@@ -9,32 +8,19 @@ import zipfile
 import shutil
 from datetime import datetime
 
-# --- ライブラリ強制セットアップ ---
-try:
-    import requests
-    import google.generativeai as genai
-    from pydub import AudioSegment
-    from google.api_core.exceptions import ResourceExhausted 
-except ImportError:
-    print("🔄 Installing core libraries...", flush=True)
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install", "--upgrade", 
-        "requests", "google-generativeai>=0.8.3", "pydub",
-        "google-api-python-client", "google-auth"
-    ])
-    import requests
-    import google.generativeai as genai
-    from pydub import AudioSegment
-    from google.api_core.exceptions import ResourceExhausted
-
+# ライブラリは run_bot.yml 側で管理するため、Python内での強制インストールは廃止
+import requests
+import google.generativeai as genai
+from pydub import AudioSegment
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- 最終設定（ハードコード） ---
+# --- 設定値 ---
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664" 
+FINAL_FALLBACK_DB_ID = "2b71bc8521e38018a5c3c4b0c6b6627c" # Inbox ID
 
 # --- 初期化 ---
 TEMP_DIR = "downloads"
@@ -46,8 +32,10 @@ if os.getenv("GCP_SA_KEY"):
         f.write(os.getenv("GCP_SA_KEY"))
 
 def sanitize_id(raw_id):
-    if not raw_id: return ""
-    return raw_id.replace("-", "").strip()
+    if not raw_id: return None
+    match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
+    if match: return match.group(1)
+    return None
 
 try:
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -58,9 +46,7 @@ try:
     }
     
     CONTROL_CENTER_ID = sanitize_id(FINAL_CONTROL_DB_ID)
-    if not CONTROL_CENTER_ID:
-        raise ValueError("CRITICAL: Final Control DB ID is empty after sanitization.")
-
+    FALLBACK_DB_ID = sanitize_id(FINAL_FALLBACK_DB_ID)
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
     
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -72,7 +58,7 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- Notion API 関数群 (Raw Requests) ---
+# --- Notion API Helpers ---
 
 def notion_query_database(db_id, query_filter):
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
@@ -80,65 +66,38 @@ def notion_query_database(db_id, query_filter):
         res = requests.post(url, headers=HEADERS, json=query_filter)
         res.raise_for_status()
         return res.json()
-    except requests.exceptions.HTTPError as e:
-        print(f"❌ Notion Query Error ({db_id}): Status {e.response.status_code}", flush=True)
-        print(f"   Detail: {e.response.text}", flush=True)
-        raise e
+    except Exception as e:
+        print(f"⚠️ Notion Query Error: {e}")
+        return None
 
 def notion_create_page(parent_db_id, properties, children):
-    url = f"https://api.notion.com/v1/pages"
-    payload = {
-        "parent": {"database_id": parent_db_id},
-        "properties": properties,
-        "children": children
-    }
+    url = "https://api.notion.com/v1/pages"
+    payload = {"parent": {"database_id": parent_db_id}, "properties": properties, "children": children}
     try:
         res = requests.post(url, headers=HEADERS, json=payload)
         res.raise_for_status()
         return res.json()
-    except requests.exceptions.HTTPError as e:
-        print(f"❌ Notion Create Page Error: Status {e.response.status_code}", flush=True)
-        print(f"   Detail: {e.response.text}", flush=True)
+    except Exception as e:
+        print(f"❌ Create Page Error: {e}")
         raise e
 
-# --- Google Drive File Management ---
+def get_student_target_id(student_name):
+    """Control Centerから生徒を検索し、TargetIDを返す。見つからなければNone"""
+    print(f"🔍 Looking up student: '{student_name}'", flush=True)
+    search_filter = {"filter": {"property": "Name", "title": {"contains": student_name}}}
+    
+    data = notion_query_database(CONTROL_CENTER_ID, search_filter)
+    if not data: return None
+    
+    results = data.get("results", [])
+    if not results: return None
+    
+    target_id_prop = results[0]["properties"].get("TargetID", {}).get("rich_text", [])
+    if not target_id_prop: return None
+    
+    return sanitize_id(target_id_prop[0]["plain_text"])
 
-def get_or_create_processed_folder():
-    """DriveのINBOX内に 'processed_coaching_logs' フォルダを探し、なければ作成する"""
-    folder_name = "processed_coaching_logs"
-    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
-    response = drive_service.files().list(q=query, fields='files(id)').execute()
-    files = response.get('files', [])
-
-    if files:
-        return files[0]['id']
-    else:
-        file_metadata = {
-            'name': folder_name,
-            'mimeType': 'application/vnd.google-apps.folder',
-            'parents': [INBOX_FOLDER_ID]
-        }
-        folder = drive_service.files().create(body=file_metadata, fields='id').execute()
-        return folder.get('id')
-
-def move_files_to_processed(file_ids, target_folder_id):
-    """指定されたファイルを、現在のフォルダからターゲットフォルダへ移動する"""
-    for file_id in file_ids:
-        try:
-            file = drive_service.files().get(fileId=file_id, fields='parents').execute()
-            previous_parents = ",".join(file.get('parents'))
-            
-            drive_service.files().update(
-                fileId=file_id,
-                addParents=target_folder_id,
-                removeParents=previous_parents,
-                fields='id, parents'
-            ).execute()
-            print(f"➡️ Moved file {file_id} to processed folder successfully.", flush=True)
-        except Exception as e:
-            print(f"❌ Failed to move file {file_id}. Error: {e}", flush=True)
-
-# --- Audio/Drive/Gemini Helpers (Integration) ---
+# --- Drive & Gemini Helpers ---
 
 def download_file(file_id, file_name):
     request = drive_service.files().get_media(fileId=file_id)
@@ -162,269 +121,235 @@ def extract_audio_from_zip(zip_path):
     return extracted_files
 
 def mix_audio_files(file_paths):
-    print(f"🎛️ Mixing {len(file_paths)} audio tracks...", flush=True)
+    if not file_paths: return None
+    print(f"🎛️ Mixing {len(file_paths)} tracks...", flush=True)
     try:
         mixed = AudioSegment.from_file(file_paths[0])
         for path in file_paths[1:]:
-            track = AudioSegment.from_file(path)
-            mixed = mixed.overlay(track)
+            mixed = mixed.overlay(AudioSegment.from_file(path))
         output_path = os.path.join(TEMP_DIR, "mixed_session.mp3")
         mixed.export(output_path, format="mp3")
         return output_path
     except Exception as e:
-        print(f"⚠️ Mixing Error: {e}. Using largest file instead.", flush=True)
+        print(f"⚠️ Mixing Error: {e}. Using largest file.", flush=True)
         return max(file_paths, key=os.path.getsize)
 
 def get_available_model_name():
-    print("🔍 Searching for highest available Pro model...", flush=True)
-    models = list(genai.list_models())
-    available_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
-
-    for name in available_names:
-        if 'gemini-2.5-pro' in name: return name 
-
-    for name in available_names:
-        if 'gemini-2.0-pro' in name: return name 
-    
-    for name in available_names:
-        if 'gemini-2.5-flash' in name: return name
-    for name in available_names:
-        if 'gemini-2.0-flash' in name: return name
-    
-    return available_names[0] if available_names else 'models/gemini-2.0-flash'
+    # 2.5 Pro優先 -> 2.0 Pro -> Flash
+    try:
+        models = list(genai.list_models())
+        names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+        for n in names: 
+            if 'gemini-2.5-pro' in n: return n
+        for n in names: 
+            if 'gemini-2.0-pro' in n: return n
+        return 'models/gemini-2.0-flash'
+    except:
+        return 'models/gemini-2.0-flash'
 
 def analyze_audio_auto(file_path):
-    
-    def generate_content_with_fallback(model_name, audio_file):
-        """Quotaエラー時にモデルをFlashに切り替えて再試行する"""
-        
-        current_model_name = model_name
-        for attempt in range(2): # 最大2回試行 (Pro -> Flash)
-            try:
-                print(f"🧠 Analyzing with model: {current_model_name} (Attempt {attempt+1})", flush=True)
-                model = genai.GenerativeModel(current_model_name)
-                
-                # Content Generation
-                response = model.generate_content([prompt, audio_file])
-                
-                return response.text
-                
-            except ResourceExhausted as e:
-                if attempt == 0 and ("pro" in current_model_name.lower()):
-                    current_model_name = 'gemini-2.5-flash'
-                    print("⚠️ Quota Exceeded for Pro. Falling back to Flash model.", flush=True)
-                    time.sleep(5) 
-                    continue
-                else:
-                    # Flashも失敗、または2回目の試行も失敗
-                    raise e
-            
-            except Exception as e:
-                # 404 Not Foundなどのその他のエラーはそのままスロー
-                raise e
-
-        # fallback loop end
-
     model_name_initial = get_available_model_name()
-    audio_file = genai.upload_file(file_path)
-    while audio_file.state.name == "PROCESSING":
-        time.sleep(2)
-        audio_file = genai.get_file(audio_file.name)
-    if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
     
-    # Final Prompt (v47.1/v50.0)
     prompt = """
-    あなたは**トップ・スマブラアナリスト**であり、具体的な課題を発見し解決するための**エージェント**です。
+    あなたは**トップ・スマブラアナリスト**です。
     この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
 
-    【制約事項と文脈の優先度】
-    1. **最優先ドメイン用語**: 「着地狩り」「崖際」「復帰阻止」「間合い」「確定反撃」などの専門用語を優先して正確に抽出せよ。
-    2. **思考フレームワーク**: クライアントの発言と行動パターンを分析し、**認知バイアス**（例：現状維持バイアス）とゲーム内行動を紐づけて報告せよ。
+    【最優先用語】: 「着地狩り」「崖際」「復帰阻止」「間合い」「確定反撃」
 
     ---
     **[RAW_TRANSCRIPTION_START]**
-    まず、会話全体を可能な限り正確に、逐語訳形式で文字起こしせよ。
+    会話全体を可能な限り正確に、逐語訳形式で文字起こしせよ。
     **[RAW_TRANSCRIPTION_END]**
     ---
 
-    【コア分析構造：5要素抽出】
-    上記の文字起こしに基づき、スマブラの内容および取り組み改善における話題は、以下の5要素に分割し、詳細な議事録として記録せよ。
+    【分析構造：5要素】
+    スマブラの内容および取り組み改善における話題は、以下の5要素に分割せよ。
     * **現状** (Current Status)
     * **課題** (Problem/Issue)
     * **原因** (Root Cause)
     * **改善案** (Proposed Solution)
     * **やること** (Next Action/Commitment)
 
-    【最終出力形式】
-    上記の詳細分析に基づき、最終的なコミットメントの記録として、以下のJSON構造のみを生成せよ。
-    
+    【最終出力形式 (JSON)】
     {
-      "student_name": "生徒の名前（例: らぎぴ, トロピウス）",
+      "student_name": "生徒の名前（例: らぎぴ, トロピウス, Unknown）",
       "date": "YYYY-MM-DD (不明ならToday)",
-      "summary": "[感情アイコン] - セッションで特定されたコアな課題と、それを超えるための新しい**コミットメント**（150字以内）。",
-      "next_action": "クライアントが具体的にコミットした、次のタスクと**期限（YYYY-MM-DDまたはN日後）**"
+      "summary": "[感情アイコン] - 5要素分析に基づく課題とコミットメントの要約（150字以内）。",
+      "next_action": "次のタスク（期限含む）"
     }
     """
-    
-    response_text = generate_content_with_fallback(model_name_initial, audio_file)
-    
-    # 4. Cleanup and Parsing
-    try: genai.delete_file(audio_file.name)
+
+    # Quota Fallback Logic included
+    current_model = model_name_initial
+    for attempt in range(2):
+        try:
+            print(f"🧠 Analyzing with {current_model}...", flush=True)
+            model = genai.GenerativeModel(current_model)
+            audio_file = genai.upload_file(file_path)
+            while audio_file.state.name == "PROCESSING": time.sleep(2); audio_file = genai.get_file(audio_file.name)
+            
+            response = model.generate_content([prompt, audio_file])
+            text = response.text.strip()
+            
+            # Cleanup
+            try: genai.delete_file(audio_file.name)
+            except: pass
+
+            # Parse
+            raw = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
+            raw_text = raw.group(1).strip() if raw else "Transcript Error"
+            
+            json_match = re.search(r'\{.*\}', text, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group(0))
+                if data.get('date') in ['Unknown', 'Today']: data['date'] = datetime.now().strftime('%Y-%m-%d')
+                return data, raw_text
+            else:
+                raise ValueError("JSON Parse Failed")
+
+        except Exception as e:
+            if attempt == 0 and "pro" in current_model.lower():
+                print("⚠️ Quota/Error on Pro. Switching to Flash.", flush=True)
+                current_model = 'gemini-2.0-flash'
+                time.sleep(2)
+                continue
+            raise e
+
+# --- File Cleanup ---
+def cleanup_drive_file(file_id):
+    folder_name = "processed_coaching_logs"
+    try:
+        q = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
+        res = drive_service.files().list(q=q, fields='files(id)').execute()
+        files = res.get('files', [])
+        target_id = files[0]['id'] if files else drive_service.files().create(body={'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]}, fields='id').execute().get('id')
+        
+        file = drive_service.files().get(fileId=file_id, fields='parents').execute()
+        drive_service.files().update(fileId=file_id, addParents=target_id, removeParents=",".join(file.get('parents')), fields='id, parents').execute()
+        print("➡️ File moved to processed folder.", flush=True)
     except: pass
 
-    text = response_text.strip()
-    
-    transcript_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
-    raw_transcript = transcript_match.group(1).strip() if transcript_match else "ERROR: Raw transcript not found."
-    
-    json_match = re.search(r'\{.*\}', text, re.DOTALL)
-    if json_match: 
-        data = json.loads(json_match.group(0))
-        
-        if data.get('date') in ['Unknown', 'Today']:
-            data['date'] = datetime.now().strftime('%Y-%m-%d')
-        return data, raw_transcript 
-    else: 
-        raise ValueError("JSON Parse Failed")
-
-# --- メイン処理 ---
+# --- Main ---
 def main():
-    print("--- VERSION: SYNTAX FINAL FIX (v55.1) ---", flush=True)
+    print("--- VERSION: OPTIMIZED & LIGHTWEIGHT (v54.0) ---", flush=True)
     
-    if not os.getenv("DRIVE_FOLDER_ID"):
-        print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
-        return
+    if not INBOX_FOLDER_ID: return
 
-    # 1. Notion API IDテスト (Corrected NameError location)
-    if not CONTROL_CENTER_ID:
-        print("❌ CRITICAL ERROR: Control Center ID is NULL after setup.", flush=True)
-        return
-
-    # 2. Drive Search (Find unprocessed files)
+    # 1. Drive Check
     try:
         results = drive_service.files().list(
             q=f"'{INBOX_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
-            fields="files(id, name, createdTime)",
-            orderBy="createdTime desc"
+            fields="files(id, name)", orderBy="createdTime desc"
         ).execute()
-    except Exception as e:
-        print(f"❌ Drive Search Error: {e}", flush=True)
-        return
+    except: return
     
     files = results.get('files', [])
-    
     if not files:
-        print("ℹ️ No new files found. Exiting.", flush=True)
+        print("ℹ️ No new files.", flush=True)
         return
 
-    # 3. Manual Input Check
+    # 2. Manual Mode Pre-Check
     manual_name = os.getenv("MANUAL_STUDENT_NAME")
+    manual_target_id = None
+    
+    # ★高速化: 手動入力がある場合、AIを動かす前にNotionでIDを確定させておく
+    if manual_name:
+        print(f"✅ Manual Mode: Checking '{manual_name}' in Notion...", flush=True)
+        manual_target_id = get_student_target_id(manual_name)
+        if not manual_target_id:
+            print(f"❌ Error: Manual name '{manual_name}' not found in Control Center. Fallback to Auto.", flush=True)
+            manual_name = None # 自動モードに戻す
 
-    # 4. Main Processing Loop
+    # 3. Processing Loop
     for file in files:
         file_id = file['id']
         file_name = file['name']
+        print(f"\nProcessing: {file_name}", flush=True)
         
         try:
-            print(f"\nProcessing File: {file_name}", flush=True)
-            
-            # 4.1. Audio Processing
-            local_audio_paths = []
+            # 3.1 Audio Prep
+            local_paths = []
             path = download_file(file_id, file_name)
-            if file_name.lower().endswith('.zip'):
-                local_audio_paths.extend(extract_audio_from_zip(path))
-            else:
-                local_audio_paths.append(path)
+            if file_name.lower().endswith('.zip'): local_paths.extend(extract_audio_from_zip(path))
+            else: local_paths.append(path)
             
-            if not local_audio_paths:
-                raise ValueError("No valid audio tracks found after extraction.")
-            
-            mixed_path = mix_audio_files(local_audio_paths)
-            
-            # 4.2. --- ★解析実行：JSONデータとRaw Transcriptの両方を取得★ ---
+            if not local_paths: continue
+            mixed_path = mix_audio_files(local_paths)
+
+            # 3.2 AI Analysis
             full_analysis, raw_transcript = analyze_audio_auto(mixed_path)
             
-            # 4.3. Name Logic
-            final_student_name = manual_name if manual_name else full_analysis['student_name']
-            print(f"ℹ️ Target Student for Lookup: '{final_student_name}'", flush=True)
+            # 3.3 Destination Logic
+            final_target_id = None
+            student_name = full_analysis['student_name']
 
-            # --- 5. Notion Search and Write ---
-            search_filter = {
-                "filter": {
-                    "property": "Name",
-                    "title": { "contains": final_student_name } 
-                }
-            }
+            if manual_target_id:
+                # 手動モードで特定済みのIDを使用
+                final_target_id = manual_target_id
+                student_name = manual_name # 名前を強制上書き
+                print(f"📝 Using Manual Target ID for: {student_name}", flush=True)
+            else:
+                # 自動モード: AIの名前から検索
+                final_target_id = get_student_target_id(student_name)
             
-            cc_res_data = notion_query_database(CONTROL_CENTER_ID, search_filter)
-            results_list = cc_res_data.get("results", [])
+            # 3.4 Fallback Logic
+            destination_id = final_target_id
+            log_suffix = ""
             
-            if not results_list:
-                print(f"❌ Error: Student '{final_student_name}' not found in Control Center. Skipping write.", flush=True)
-                continue 
-
-            # 5.2. Extract Target ID
-            target_id_prop = results_list[0]["properties"].get("TargetID", {}).get("rich_text", [])
+            if not destination_id:
+                print(f"⚠️ Student '{student_name}' not found/invalid. Routing to FALLBACK INBOX.", flush=True)
+                destination_id = FALLBACK_DB_ID
+                log_suffix = f" (Unknown: {student_name})"
             
-            if not target_id_prop:
-                print("❌ Error: TargetID is empty in Control Center. Skipping write.", flush=True)
-                continue
-            
-            final_target_id = sanitize_id(target_id_prop[0]["plain_text"])
-
-            if not final_target_id:
-                print(f"❌ Error: TargetID for {final_student_name} is invalid.", flush=True)
+            if not destination_id:
+                print("❌ Critical: No destination available.", flush=True)
                 continue
 
-            # 5.3. --- ★メインログ（要約）の作成と書き込み★ ---
-            properties_summary = {
-                "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ (要約)"}}]},
+            # 3.5 Write to Notion
+            # Summary
+            props_sum = {
+                "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ{log_suffix}"}}]},
                 "日付": {"date": {"start": full_analysis['date']}}
             }
-            children_summary = [
+            # Fallback時は生徒名を本文かプロパティに入れる（簡易的にタイトルに付与済み）
+            
+            children_sum = [
                 {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": full_analysis['summary']}}]}},
                 {"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "Next Action"}}]}},
                 {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": full_analysis.get('next_action', 'なし')}}]}}
             ]
-            notion_create_page(final_target_id, properties_summary, children_summary)
-            print(f"✅ Summary Log written for {final_student_name}.", flush=True)
+            notion_create_page(destination_id, props_sum, children_sum)
+            print("✅ Summary created.", flush=True)
 
-            
-            # 5.4. --- ★新規機能：純粋な文字起こしログの作成と書き込み★ ---
-            properties_transcript = {
-                "名前": {"title": [{"text": {"content": f"{full_analysis['date']} ログ (全文)"}}]},
+            # Transcript
+            props_trans = {
+                "名前": {"title": [{"text": {"content": f"{full_analysis['date']} 文字起こし{log_suffix}"}}]},
                 "日付": {"date": {"start": full_analysis['date']}}
             }
+            children_trans = []
+            for line in raw_transcript.split('\n'):
+                if line.strip():
+                    children_trans.append({
+                        "object": "block", "type": "paragraph", 
+                        "paragraph": {"rich_text": [{"text": {"content": line[:2000]}}]}
+                    })
             
-            children_transcript = []
-            if raw_transcript and raw_transcript != "ERROR: Raw transcript not found.":
-                for line in raw_transcript.split('\n'):
-                    if line.strip(): 
-                        children_transcript.append({
-                            "object": "block",
-                            "type": "paragraph",
-                            "paragraph": {"rich_text": [{"text": {"content": line}}]}
-                        })
-            
-            if children_transcript:
-                notion_create_page(final_target_id, properties_transcript, children_transcript)
-                print(f"✅ Full Transcript written for {final_student_name}.", flush=True)
-            else:
-                print("⚠️ Transcript was empty or not found. Skipping full text write.", flush=True)
-                
-            
-            # 6. クリーンアップ
-            processed_folder_id = get_or_create_processed_folder()
-            move_files_to_processed([file_id], processed_folder_id)
-            print(f"🎉 PROJECT SUCCESS: Completed processing for {final_student_name}.", flush=True)
-            
+            # ブロック数制限対策(簡易)
+            if len(children_trans) > 95: 
+                children_trans = children_trans[:95]
+                children_trans.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": "...(Log Truncated)..."}}]}})
+
+            notion_create_page(destination_id, props_trans, children_trans)
+            print("✅ Transcript created.", flush=True)
+
+            # 3.6 Cleanup
+            cleanup_drive_file(file_id)
+
         except Exception as e:
-             print(f"❌ UNHANDLED CRASH IN LOOP: {e}", flush=True)
-             import traceback
-             traceback.print_exc()
+            print(f"❌ Error: {e}", flush=True)
         finally:
             if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
-            os.makedirs(TEMP_DIR) 
+            os.makedirs(TEMP_DIR)
 
 if __name__ == "__main__":
     main()

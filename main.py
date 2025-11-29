@@ -9,12 +9,12 @@ import zipfile
 import shutil
 from datetime import datetime
 
-# --- ライブラリ強制セットアップ ---
+# --- 1. ライブラリ強制セットアップ ---
+# 環境差異によるエラーを防ぐため、実行時に依存関係を確認・インストールする
 try:
     import requests
     import google.generativeai as genai
     from pydub import AudioSegment
-    from google.api_core.exceptions import ResourceExhausted
 except ImportError:
     print("🔄 Installing core libraries...", flush=True)
     subprocess.check_call([
@@ -25,7 +25,6 @@ except ImportError:
     import requests
     import google.generativeai as genai
     from pydub import AudioSegment
-    from google.api_core.exceptions import ResourceExhausted
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -33,10 +32,13 @@ from googleapiclient.http import MediaIoBaseDownload
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- 最終設定 ---
-FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664" 
+# --- 2. 最終設定 (ハードコード) ---
+# Control Center (DB Viewの親ページIDではなく、API疎通確認済みのDB ID)
+FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664"
+# Fallback Inbox (生徒不明時の退避先)
+FINAL_FALLBACK_DB_ID = "2b71bc8521e38018a5c3c4b0c6b6627c"
 
-# --- 初期化 ---
+# --- 3. 初期化処理 ---
 TEMP_DIR = "downloads"
 if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
 os.makedirs(TEMP_DIR)
@@ -46,12 +48,14 @@ if os.getenv("GCP_SA_KEY"):
         f.write(os.getenv("GCP_SA_KEY"))
 
 def sanitize_id(raw_id):
+    """Notion IDを32桁の英数字（ハイフンなし）に正規化する"""
     if not raw_id: return None
     match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
     if match: return match.group(1)
     return None
 
 try:
+    # Notion API用ヘッダー
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -60,6 +64,7 @@ try:
     }
     
     CONTROL_CENTER_ID = sanitize_id(FINAL_CONTROL_DB_ID)
+    FALLBACK_DB_ID = sanitize_id(FINAL_FALLBACK_DB_ID)
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
     
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -71,9 +76,10 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- Notion API Helpers (Raw Requests + Chunking) ---
+# --- 4. Notion API 関数群 (Raw Requests + Chunking) ---
 
 def notion_query_database(db_id, query_filter):
+    """データベースを検索する"""
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     try:
         res = requests.post(url, headers=HEADERS, json=query_filter)
@@ -83,15 +89,33 @@ def notion_query_database(db_id, query_filter):
         print(f"⚠️ Notion Query Error: {e}")
         return None
 
-def notion_create_page_chunked(parent_db_id, properties, children):
+def notion_append_children(block_id, children):
+    """既存のブロック（ページ）に子ブロックを追記する"""
+    url = f"https://api.notion.com/v1/blocks/{block_id}/children"
+    # Notion制限: 1回のリクエストで100ブロックまで
+    batch_size = 100
+    
+    for i in range(0, len(children), batch_size):
+        chunk = children[i : i + batch_size]
+        payload = {"children": chunk}
+        try:
+            res = requests.patch(url, headers=HEADERS, json=payload)
+            res.raise_for_status()
+            print(f"   ...Appended blocks {i+1}-{i+len(chunk)}", flush=True)
+            time.sleep(0.2) # APIレート制限への配慮
+        except Exception as e:
+            print(f"❌ Append Error (Chunk {i}): {e}")
+
+def notion_create_page_with_heavy_content(parent_db_id, properties, all_children):
     """
-    Notionのブロック制限(100個)を回避するため、分割して書き込む関数
+    大量のブロック（文字起こし等）を含むページを作成する安全な関数。
+    最初の100個でページを作成し、残りはAppend APIで追記する。
     """
     url = "https://api.notion.com/v1/pages"
     
-    # 最初の90個（安全マージン）
-    initial_children = children[:90]
-    remaining_children = children[90:]
+    # 最初のバッチ (安全マージンをとって90個)
+    initial_children = all_children[:90]
+    remaining_children = all_children[90:]
     
     payload = {
         "parent": {"database_id": parent_db_id},
@@ -100,31 +124,18 @@ def notion_create_page_chunked(parent_db_id, properties, children):
     }
     
     try:
-        # 1. ページ作成
+        # 1. ベースページの作成
         res = requests.post(url, headers=HEADERS, json=payload)
         res.raise_for_status()
         page_data = res.json()
         page_id = page_data['id']
-        print("   ✅ Base page created. Appending remaining content...", flush=True)
+        print(f"   ✅ Base Page Created (ID: {page_id})", flush=True)
         
-        # 2. 残りのブロックを追記 (Append)
+        # 2. 残りのコンテンツを追記
         if remaining_children:
-            append_url = f"https://api.notion.com/v1/blocks/{page_id}/children"
+            print(f"   ℹ️ Appending remaining {len(remaining_children)} blocks...", flush=True)
+            notion_append_children(page_id, remaining_children)
             
-            # 100個ずつループ処理
-            batch_size = 90
-            for i in range(0, len(remaining_children), batch_size):
-                chunk = remaining_children[i : i + batch_size]
-                append_payload = {"children": chunk}
-                
-                append_res = requests.patch(append_url, headers=HEADERS, json=append_payload)
-                if append_res.status_code != 200:
-                    print(f"   ⚠️ Warning: Failed to append chunk {i}. Status: {append_res.status_code}", flush=True)
-                else:
-                    print(f"   ...Writing chunk {i} to {i+batch_size}", flush=True)
-                
-                time.sleep(0.5) # APIレート制限対策
-                
         return page_data
 
     except requests.exceptions.HTTPError as e:
@@ -134,16 +145,36 @@ def notion_create_page_chunked(parent_db_id, properties, children):
         raise e
 
 def get_student_target_id(student_name):
-    print(f"🔍 Looking up student: '{student_name}'", flush=True)
-    search_filter = {"filter": {"property": "Name", "title": {"contains": student_name}}}
-    data = notion_query_database(CONTROL_CENTER_ID, search_filter)
-    if not data or not data.get("results"): return None
+    """生徒名からControl Centerを検索し、TargetIDを返す"""
+    print(f"🔍 Looking up student in Control Center: '{student_name}'", flush=True)
     
-    target_id_prop = data["results"][0]["properties"].get("TargetID", {}).get("rich_text", [])
-    if not target_id_prop: return None
-    return sanitize_id(target_id_prop[0]["plain_text"])
+    # 柔軟な検索 (contains)
+    search_filter = {
+        "filter": {
+            "property": "Name",
+            "title": {"contains": student_name}
+        }
+    }
+    
+    data = notion_query_database(CONTROL_CENTER_ID, search_filter)
+    if not data or not data.get("results"):
+        return None, None # ID, Name
+    
+    # ヒットした最初の行を採用
+    row = data["results"][0]
+    
+    # DB上の正確な名前を取得（ログ用）
+    db_name_list = row["properties"].get("Name", {}).get("title", [])
+    official_name = db_name_list[0]["plain_text"] if db_name_list else student_name
+    
+    # TargetID取得
+    target_id_prop = row["properties"].get("TargetID", {}).get("rich_text", [])
+    if not target_id_prop:
+        return None, official_name
+    
+    return sanitize_id(target_id_prop[0]["plain_text"]), official_name
 
-# --- Drive & Gemini Helpers ---
+# --- 5. Drive & Gemini Helpers ---
 
 def download_file(file_id, file_name):
     request = drive_service.files().get_media(fileId=file_id)
@@ -168,7 +199,7 @@ def extract_audio_from_zip(zip_path):
 
 def mix_audio_files(file_paths):
     if not file_paths: return None
-    print(f"🎛️ Mixing {len(file_paths)} tracks...", flush=True)
+    print(f"🎛️ Mixing {len(file_paths)} audio tracks...", flush=True)
     try:
         mixed = AudioSegment.from_file(file_paths[0])
         for path in file_paths[1:]:
@@ -177,19 +208,19 @@ def mix_audio_files(file_paths):
         mixed.export(output_path, format="mp3")
         return output_path
     except Exception as e:
-        print(f"⚠️ Mixing Error: {e}. Using largest file.", flush=True)
+        print(f"⚠️ Mixing Error: {e}. Using largest file as fallback.", flush=True)
         return max(file_paths, key=os.path.getsize)
 
 def analyze_audio_auto(file_path):
-    # Flashモデル固定 (Resource Efficiency)
-    model_name_initial = 'models/gemini-2.0-flash'
+    # トークン効率と速度重視でFlash固定
+    model_name = 'models/gemini-2.0-flash'
     
-    # ★完全版プロンプト（文字起こし＋詳細レポート＋JSON）
+    # ★最終確定プロンプト
     prompt = """
     あなたは**トップ・スマブラアナリスト**であり、行動経済学に基づく課題解決エージェントです。
     この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
 
-    【最優先ドメイン用語】: 「着地狩り」「着地」「崖上がり」「崖狩り」「見てから」「撃墜」「読みで」「復帰」「崖際」「復帰阻止」「間合い」「確定反撃」「ライン管理」「ベクトル変更」「暴れ」
+    【最優先ドメイン用語】: 「着地狩り」「崖際」「復帰阻止」「間合い」「確定反撃」「ライン管理」「ベクトル変更」「暴れ」
 
     以下の3つのセクションを、**区切りタグを含めて**順に出力せよ。
 
@@ -201,8 +232,7 @@ def analyze_audio_auto(file_path):
     ---
     **[DETAILED_REPORT_START]**
     会話内で扱われた各トピックについて、以下の**5要素**を用いて詳細に分解・解説せよ。
-    文字数制限は設けない。具体的かつ論理的に記述すること。
-    Markdown形式（見出しや箇条書き）を使用せよ。
+    文字数制限は設けない。具体的かつ論理的に記述すること。Markdown形式を使用せよ。
 
     ### トピック1: [トピック名]
     * **現状**: [具体的な現状]
@@ -225,67 +255,61 @@ def analyze_audio_auto(file_path):
     **[JSON_END]**
     """
 
-    current_model = model_name_initial
-    for attempt in range(2):
+    print(f"🧠 Analyzing with {model_name}...", flush=True)
+    model = genai.GenerativeModel(model_name)
+    audio_file = genai.upload_file(file_path)
+    
+    while audio_file.state.name == "PROCESSING":
+        time.sleep(2)
+        audio_file = genai.get_file(audio_file.name)
+    if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
+    
+    # 出力トークン最大化
+    try:
+        response = model.generate_content(
+            [prompt, audio_file],
+            generation_config=genai.types.GenerationConfig(max_output_tokens=8192)
+        )
+        text = response.text.strip()
+    except Exception as e:
+        print(f"❌ AI Generation Error: {e}")
+        raise e
+    finally:
+        try: genai.delete_file(audio_file.name)
+        except: pass
+
+    # --- Parsing Logic (Fail-safe) ---
+    
+    # 1. Raw Transcript
+    raw_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
+    if raw_match:
+        raw_text = raw_match.group(1).strip()
+    else:
+        # タグがない場合の救済: JSON部分以外を全て文字起こしとみなす
+        raw_text = re.sub(r'\[JSON_START\].*?\[JSON_END\]', '', text, flags=re.DOTALL).strip()
+        if not raw_text: raw_text = "(Transcript generation failed or empty)"
+
+    # 2. Detailed Report
+    report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', text, re.DOTALL)
+    report_text = report_match.group(1).strip() if report_match else "(Detailed report generation failed. Check Transcript.)"
+
+    # 3. JSON Metadata
+    json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', text, re.DOTALL)
+    data = {}
+    if json_match:
         try:
-            print(f"🧠 Analyzing with {current_model}...", flush=True)
-            model = genai.GenerativeModel(current_model)
-            audio_file = genai.upload_file(file_path)
-            
-            while audio_file.state.name == "PROCESSING":
-                time.sleep(2)
-                audio_file = genai.get_file(audio_file.name)
-            if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
-            
-            # Max tokens for Flash (8192)
-            response = model.generate_content(
-                [prompt, audio_file],
-                generation_config=genai.types.GenerationConfig(max_output_tokens=8192)
-            )
-            text = response.text.strip()
-            
-            try: genai.delete_file(audio_file.name)
-            except: pass
-
-            # --- Parsing Logic ---
-            # 1. Raw Transcript
-            raw_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
-            raw_text = raw_match.group(1).strip() if raw_match else "Transcript Error/Truncated"
-
-            # 2. Detailed Report
-            report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', text, re.DOTALL)
-            report_text = report_match.group(1).strip() if report_match else "Report Error/Truncated"
-
-            # 3. JSON Metadata
-            json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', text, re.DOTALL)
-            
-            data = {}
-            if json_match:
-                try:
-                    json_str = json_match.group(1).replace("```json", "").replace("```", "").strip()
-                    data = json.loads(json_str)
-                except:
-                    print("⚠️ JSON parse error. Using fallback.", flush=True)
-                    data = {}
-            
-            if not data:
-                data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "解析失敗/要確認"}
-            
-            if data.get('date') in ['Unknown', 'Today', None]:
-                data['date'] = datetime.now().strftime('%Y-%m-%d')
-                
-            return data, raw_text, report_text
-
-        except ResourceExhausted:
-            if attempt == 0:
-                print("⚠️ Quota Exceeded. Waiting 10s and retrying...", flush=True)
-                time.sleep(10)
-                continue
-            raise
-
-        except Exception as e:
-            print(f"❌ AI Error: {e}", flush=True)
-            raise e
+            json_str = json_match.group(1).replace("```json", "").replace("```", "").strip()
+            data = json.loads(json_str)
+        except: pass
+    
+    # JSON救済
+    if not data:
+        data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Transcript"}
+    
+    if data.get('date') in ['Unknown', 'Today', None]:
+        data['date'] = datetime.now().strftime('%Y-%m-%d')
+        
+    return data, raw_text, report_text
 
 # --- File Cleanup ---
 def cleanup_drive_file(file_id):
@@ -301,13 +325,15 @@ def cleanup_drive_file(file_id):
         print("➡️ File moved to processed folder.", flush=True)
     except: pass
 
-# --- Main Logic ---
+# --- メイン処理 ---
 def main():
-    print("--- VERSION: FINAL ROBUST BUILD (v61.0) ---", flush=True)
+    print("--- VERSION: FINAL COMPLETE v62.0 ---", flush=True)
     
-    if not INBOX_FOLDER_ID: return
+    if not INBOX_FOLDER_ID:
+        print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
+        return
 
-    # 1. Drive Check
+    # 1. Drive Search
     try:
         results = drive_service.files().list(
             q=f"'{INBOX_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
@@ -319,18 +345,19 @@ def main():
     
     files = results.get('files', [])
     if not files:
-        print("ℹ️ No new files found.", flush=True)
+        print("ℹ️ No new files found. Exiting.", flush=True)
         return
 
     # 2. Manual Mode Check
     manual_name = os.getenv("MANUAL_STUDENT_NAME")
     manual_target_id = None
+    manual_official_name = None
     
     if manual_name:
         print(f"✅ Manual Mode: Checking '{manual_name}'...", flush=True)
-        manual_target_id = get_student_target_id(manual_name)
+        manual_target_id, manual_official_name = get_student_target_id(manual_name)
         if not manual_target_id:
-            print(f"❌ Error: '{manual_name}' not found in Control Center. Fallback to Auto.", flush=True)
+            print(f"❌ Error: '{manual_name}' not found in Control Center. Switching to Auto Mode.", flush=True)
             manual_name = None
 
     # 3. Processing Loop
@@ -341,18 +368,17 @@ def main():
         
         try:
             # 3.1 Audio Prep
-            local_audio_paths = [] # ★修正: 変数名の初期化
-            
+            local_audio_paths = []
             path = download_file(file_id, file_name)
             if file_name.lower().endswith('.zip'):
                 local_audio_paths.extend(extract_audio_from_zip(path))
             else:
                 local_audio_paths.append(path)
             
-            if not local_audio_paths: # ★修正: 正しい変数をチェック
-                print("⚠️ No audio tracks found. Skipping.", flush=True)
+            if not local_audio_paths:
+                print("⚠️ No valid audio tracks. Skipping.", flush=True)
                 continue
-                
+            
             mixed_path = mix_audio_files(local_audio_paths)
 
             # 3.2 AI Analysis
@@ -360,31 +386,48 @@ def main():
             
             # 3.3 Destination Logic
             final_target_id = None
-            student_name = json_meta.get('student_name', 'Unknown')
+            student_name_query = json_meta.get('student_name', 'Unknown')
+            display_name = student_name_query
 
             if manual_target_id:
                 final_target_id = manual_target_id
-                student_name = manual_name
-                print(f"📝 Using Manual Target ID for: {student_name}", flush=True)
+                display_name = manual_official_name
+                print(f"📝 Using Manual Target ID for: {display_name}", flush=True)
             else:
-                final_target_id = get_student_target_id(student_name)
+                final_target_id, display_name = get_student_target_id(student_name_query)
             
-            if not final_target_id:
-                print(f"❌ Critical: Destination not found for '{student_name}'. Skipping.", flush=True)
+            # 3.4 Fallback Logic (生徒不明時)
+            destination_id = final_target_id
+            log_title_suffix = ""
+            
+            if not destination_id:
+                print(f"⚠️ Student '{student_name_query}' not found/invalid. Routing to FALLBACK INBOX.", flush=True)
+                destination_id = FALLBACK_DB_ID
+                log_title_suffix = f" (Unknown: {student_name_query})"
+            
+            if not destination_id:
+                print("❌ Critical: No destination available (Fallback ID missing?).", flush=True)
                 continue
 
-            # 3.4 Write to Notion (Merged Page with Chunks)
+            # 3.5 Content Construction & Writing
+            print(f"📝 Writing to DB: {destination_id}...", flush=True)
             
+            # --- Page Properties ---
             props = {
-                "名前": {"title": [{"text": {"content": f"{json_meta['date']} コーチングログ"}}]},
+                "名前": {"title": [{"text": {"content": f"{json_meta['date']} コーチングログ{log_title_suffix}"}}]},
                 "日付": {"date": {"start": json_meta['date']}}
             }
-            
-            # コンテンツ構築
+            if destination_id == FALLBACK_DB_ID:
+                 # Inbox用プロパティ（あれば）
+                 pass
+
+            # --- Page Content Blocks (Full Integration) ---
             children_blocks = []
             
-            # (A) 詳細分析レポート
+            # (A) Summary / Detailed Report
             children_blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "📊 詳細分析レポート"}}]}})
+            
+            # レポート本文（空行除外してブロック化）
             for line in detailed_report.split('\n'):
                 if line.strip():
                     children_blocks.append({
@@ -396,8 +439,9 @@ def main():
             children_blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "🚀 Next Action"}}]}})
             children_blocks.append({"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": json_meta.get('next_action', 'なし')}}]}})
 
-            # (C) 全文文字起こし
+            # (C) Full Transcript (Toggle or Heading)
             children_blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "📝 全文文字起こし"}}]}})
+            
             for line in raw_transcript.split('\n'):
                 if line.strip():
                     children_blocks.append({
@@ -405,11 +449,11 @@ def main():
                         "paragraph": {"rich_text": [{"text": {"content": line[:2000]}}]}
                     })
 
-            # 書き込み実行 (分割対応)
-            notion_create_page_chunked(final_target_id, props, children_blocks)
+            # 3.6 Execute Write (with Chunking)
+            notion_create_page_with_heavy_content(destination_id, props, children_blocks)
             print("✅ Log created successfully.", flush=True)
 
-            # 3.5 Cleanup
+            # 3.7 Cleanup
             cleanup_drive_file(file_id)
 
         except Exception as e:

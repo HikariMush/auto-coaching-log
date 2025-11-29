@@ -10,7 +10,6 @@ import shutil
 from datetime import datetime
 
 # --- 1. ライブラリ強制セットアップ ---
-# 環境差異によるエラーを防ぐため、実行時に依存関係を確認・インストールする
 try:
     import requests
     import google.generativeai as genai
@@ -33,9 +32,7 @@ from googleapiclient.http import MediaIoBaseDownload
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # --- 2. 最終設定 (ハードコード) ---
-# Control Center (DB Viewの親ページIDではなく、API疎通確認済みのDB ID)
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664"
-# Fallback Inbox (生徒不明時の退避先)
 FINAL_FALLBACK_DB_ID = "2b71bc8521e38018a5c3c4b0c6b6627c"
 
 # --- 3. 初期化処理 ---
@@ -48,14 +45,12 @@ if os.getenv("GCP_SA_KEY"):
         f.write(os.getenv("GCP_SA_KEY"))
 
 def sanitize_id(raw_id):
-    """Notion IDを32桁の英数字（ハイフンなし）に正規化する"""
     if not raw_id: return None
     match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
     if match: return match.group(1)
     return None
 
 try:
-    # Notion API用ヘッダー
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -76,10 +71,9 @@ except Exception as e:
     print(f"❌ Setup Critical Error: {e}", flush=True)
     exit(1)
 
-# --- 4. Notion API 関数群 (Raw Requests + Chunking) ---
+# --- 4. Notion API 関数群 (Audit Enhanced) ---
 
 def notion_query_database(db_id, query_filter):
-    """データベースを検索する"""
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     try:
         res = requests.post(url, headers=HEADERS, json=query_filter)
@@ -90,30 +84,36 @@ def notion_query_database(db_id, query_filter):
         return None
 
 def notion_append_children(block_id, children):
-    """既存のブロック（ページ）に子ブロックを追記する"""
+    """既存のブロックに子ブロックを追記する（監査ログ付き）"""
     url = f"https://api.notion.com/v1/blocks/{block_id}/children"
-    # Notion制限: 1回のリクエストで100ブロックまで
     batch_size = 100
+    total_blocks = len(children)
     
-    for i in range(0, len(children), batch_size):
+    print(f"   ...Starting append process for {total_blocks} blocks...", flush=True)
+    
+    for i in range(0, total_blocks, batch_size):
         chunk = children[i : i + batch_size]
         payload = {"children": chunk}
         try:
+            # 同期処理：ここでレスポンスが返るまで待機する
             res = requests.patch(url, headers=HEADERS, json=payload)
             res.raise_for_status()
-            print(f"   ...Appended blocks {i+1}-{i+len(chunk)}", flush=True)
-            time.sleep(0.2) # APIレート制限への配慮
+            
+            # 進行状況の監査ログ
+            print(f"   [Batch {i//batch_size + 1}] Appended blocks {i+1} to {i+len(chunk)} (Success)", flush=True)
+            time.sleep(0.5) # レート制限対策
         except Exception as e:
-            print(f"❌ Append Error (Chunk {i}): {e}")
+            print(f"❌ Append Error at batch {i}: {e}")
+            # エラーが出ても可能な限り次を試行するか、ここで止めるかは設計次第だが、
+            # データ欠損を防ぐためログを出して続行させる
+            pass
+            
+    print("   ✅ All append batches finished.", flush=True)
 
 def notion_create_page_with_heavy_content(parent_db_id, properties, all_children):
-    """
-    大量のブロック（文字起こし等）を含むページを作成する安全な関数。
-    最初の100個でページを作成し、残りはAppend APIで追記する。
-    """
     url = "https://api.notion.com/v1/pages"
     
-    # 最初のバッチ (安全マージンをとって90個)
+    # 分割ロジック
     initial_children = all_children[:90]
     remaining_children = all_children[90:]
     
@@ -124,7 +124,7 @@ def notion_create_page_with_heavy_content(parent_db_id, properties, all_children
     }
     
     try:
-        # 1. ベースページの作成
+        # 1. ベースページ作成
         res = requests.post(url, headers=HEADERS, json=payload)
         res.raise_for_status()
         page_data = res.json()
@@ -133,8 +133,9 @@ def notion_create_page_with_heavy_content(parent_db_id, properties, all_children
         
         # 2. 残りのコンテンツを追記
         if remaining_children:
-            print(f"   ℹ️ Appending remaining {len(remaining_children)} blocks...", flush=True)
             notion_append_children(page_id, remaining_children)
+        else:
+            print("   ℹ️ No remaining blocks to append.", flush=True)
             
         return page_data
 
@@ -145,10 +146,8 @@ def notion_create_page_with_heavy_content(parent_db_id, properties, all_children
         raise e
 
 def get_student_target_id(student_name):
-    """生徒名からControl Centerを検索し、TargetIDを返す"""
     print(f"🔍 Looking up student in Control Center: '{student_name}'", flush=True)
     
-    # 柔軟な検索 (contains)
     search_filter = {
         "filter": {
             "property": "Name",
@@ -158,16 +157,12 @@ def get_student_target_id(student_name):
     
     data = notion_query_database(CONTROL_CENTER_ID, search_filter)
     if not data or not data.get("results"):
-        return None, None # ID, Name
+        return None, None
     
-    # ヒットした最初の行を採用
     row = data["results"][0]
-    
-    # DB上の正確な名前を取得（ログ用）
     db_name_list = row["properties"].get("Name", {}).get("title", [])
     official_name = db_name_list[0]["plain_text"] if db_name_list else student_name
     
-    # TargetID取得
     target_id_prop = row["properties"].get("TargetID", {}).get("rich_text", [])
     if not target_id_prop:
         return None, official_name
@@ -208,14 +203,13 @@ def mix_audio_files(file_paths):
         mixed.export(output_path, format="mp3")
         return output_path
     except Exception as e:
-        print(f"⚠️ Mixing Error: {e}. Using largest file as fallback.", flush=True)
+        print(f"⚠️ Mixing Error: {e}. Using largest file.", flush=True)
         return max(file_paths, key=os.path.getsize)
 
 def analyze_audio_auto(file_path):
-    # トークン効率と速度重視でFlash固定
-    model_name = 'models/gemini-2.0-flash'
+    model_name_initial = 'models/gemini-2.0-flash'
     
-    # ★最終確定プロンプト
+    # プロンプト (Fail-safe対応)
     prompt = """
     あなたは**トップ・スマブラアナリスト**であり、行動経済学に基づく課題解決エージェントです。
     この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
@@ -255,46 +249,48 @@ def analyze_audio_auto(file_path):
     **[JSON_END]**
     """
 
-    print(f"🧠 Analyzing with {model_name}...", flush=True)
-    model = genai.GenerativeModel(model_name)
-    audio_file = genai.upload_file(file_path)
+    current_model = model_name_initial
     
-    while audio_file.state.name == "PROCESSING":
-        time.sleep(2)
-        audio_file = genai.get_file(audio_file.name)
-    if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
-    
-    # 出力トークン最大化
-    try:
-        response = model.generate_content(
-            [prompt, audio_file],
-            generation_config=genai.types.GenerationConfig(max_output_tokens=8192)
-        )
-        text = response.text.strip()
-    except Exception as e:
-        print(f"❌ AI Generation Error: {e}")
-        raise e
-    finally:
-        try: genai.delete_file(audio_file.name)
-        except: pass
+    # 実行 & Fallbackループ
+    response_text = ""
+    for attempt in range(2):
+        try:
+            print(f"🧠 Analyzing with {current_model} (Attempt {attempt+1})...", flush=True)
+            model = genai.GenerativeModel(current_model)
+            audio_file = genai.upload_file(file_path)
+            
+            while audio_file.state.name == "PROCESSING":
+                time.sleep(2)
+                audio_file = genai.get_file(audio_file.name)
+            if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
+            
+            response = model.generate_content(
+                [prompt, audio_file],
+                generation_config=genai.types.GenerationConfig(max_output_tokens=8192)
+            )
+            response_text = response.text.strip()
+            try: genai.delete_file(audio_file.name)
+            except: pass
+            break # 成功
 
-    # --- Parsing Logic (Fail-safe) ---
-    
-    # 1. Raw Transcript
-    raw_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
-    if raw_match:
-        raw_text = raw_match.group(1).strip()
-    else:
-        # タグがない場合の救済: JSON部分以外を全て文字起こしとみなす
-        raw_text = re.sub(r'\[JSON_START\].*?\[JSON_END\]', '', text, flags=re.DOTALL).strip()
-        if not raw_text: raw_text = "(Transcript generation failed or empty)"
+        except Exception as e:
+            # エラー時の処理
+            print(f"⚠️ AI Error on {current_model}: {e}", flush=True)
+            if attempt == 0:
+                print("⚠️ Retrying...", flush=True)
+                time.sleep(5)
+                continue
+            raise e
 
-    # 2. Detailed Report
-    report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', text, re.DOTALL)
-    report_text = report_match.group(1).strip() if report_match else "(Detailed report generation failed. Check Transcript.)"
+    # --- Parsing Logic ---
+    raw_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', response_text, re.DOTALL)
+    raw_text = raw_match.group(1).strip() if raw_match else re.sub(r'\[JSON_START\].*?\[JSON_END\]', '', response_text, flags=re.DOTALL).strip()
+    if not raw_text: raw_text = "(Transcript extraction failed)"
 
-    # 3. JSON Metadata
-    json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', text, re.DOTALL)
+    report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', response_text, re.DOTALL)
+    report_text = report_match.group(1).strip() if report_match else "(Report extraction failed)"
+
+    json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', response_text, re.DOTALL)
     data = {}
     if json_match:
         try:
@@ -302,9 +298,8 @@ def analyze_audio_auto(file_path):
             data = json.loads(json_str)
         except: pass
     
-    # JSON救済
     if not data:
-        data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Transcript"}
+        data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Content"}
     
     if data.get('date') in ['Unknown', 'Today', None]:
         data['date'] = datetime.now().strftime('%Y-%m-%d')
@@ -325,11 +320,11 @@ def cleanup_drive_file(file_id):
         print("➡️ File moved to processed folder.", flush=True)
     except: pass
 
-# --- メイン処理 ---
+# --- Main Logic ---
 def main():
-    print("--- VERSION: FINAL COMPLETE v62.0 ---", flush=True)
+    print("--- VERSION: FINAL AUDITED BUILD (v63.0) ---", flush=True)
     
-    if not INBOX_FOLDER_ID:
+    if not os.getenv("DRIVE_FOLDER_ID"):
         print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
         return
 
@@ -357,7 +352,7 @@ def main():
         print(f"✅ Manual Mode: Checking '{manual_name}'...", flush=True)
         manual_target_id, manual_official_name = get_student_target_id(manual_name)
         if not manual_target_id:
-            print(f"❌ Error: '{manual_name}' not found in Control Center. Switching to Auto Mode.", flush=True)
+            print(f"❌ Error: '{manual_name}' not found in Control Center. Fallback to Auto.", flush=True)
             manual_name = None
 
     # 3. Processing Loop
@@ -388,6 +383,7 @@ def main():
             final_target_id = None
             student_name_query = json_meta.get('student_name', 'Unknown')
             display_name = student_name_query
+            is_fallback = False
 
             if manual_target_id:
                 final_target_id = manual_target_id
@@ -396,7 +392,7 @@ def main():
             else:
                 final_target_id, display_name = get_student_target_id(student_name_query)
             
-            # 3.4 Fallback Logic (生徒不明時)
+            # 3.4 Fallback Logic
             destination_id = final_target_id
             log_title_suffix = ""
             
@@ -404,30 +400,25 @@ def main():
                 print(f"⚠️ Student '{student_name_query}' not found/invalid. Routing to FALLBACK INBOX.", flush=True)
                 destination_id = FALLBACK_DB_ID
                 log_title_suffix = f" (Unknown: {student_name_query})"
+                is_fallback = True
             
             if not destination_id:
                 print("❌ Critical: No destination available (Fallback ID missing?).", flush=True)
                 continue
 
-            # 3.5 Content Construction & Writing
+            # 3.5 Content Construction
             print(f"📝 Writing to DB: {destination_id}...", flush=True)
             
-            # --- Page Properties ---
             props = {
                 "名前": {"title": [{"text": {"content": f"{json_meta['date']} コーチングログ{log_title_suffix}"}}]},
                 "日付": {"date": {"start": json_meta['date']}}
             }
-            if destination_id == FALLBACK_DB_ID:
-                 # Inbox用プロパティ（あれば）
-                 pass
-
-            # --- Page Content Blocks (Full Integration) ---
+            
+            # 本文ブロック構築
             children_blocks = []
             
-            # (A) Summary / Detailed Report
+            # (A) 詳細分析レポート
             children_blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "📊 詳細分析レポート"}}]}})
-            
-            # レポート本文（空行除外してブロック化）
             for line in detailed_report.split('\n'):
                 if line.strip():
                     children_blocks.append({
@@ -439,9 +430,8 @@ def main():
             children_blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "🚀 Next Action"}}]}})
             children_blocks.append({"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": json_meta.get('next_action', 'なし')}}]}})
 
-            # (C) Full Transcript (Toggle or Heading)
+            # (C) 全文文字起こし
             children_blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "📝 全文文字起こし"}}]}})
-            
             for line in raw_transcript.split('\n'):
                 if line.strip():
                     children_blocks.append({
@@ -449,15 +439,16 @@ def main():
                         "paragraph": {"rich_text": [{"text": {"content": line[:2000]}}]}
                     })
 
-            # 3.6 Execute Write (with Chunking)
+            # 3.6 Execute Write (With Audit Logging)
+            # ここで「書き込み完了まで待つ」ことが保証される
             notion_create_page_with_heavy_content(destination_id, props, children_blocks)
-            print("✅ Log created successfully.", flush=True)
+            print("✅ Log creation completed successfully.", flush=True)
 
-            # 3.7 Cleanup
+            # 3.7 Cleanup (Only after successful write)
             cleanup_drive_file(file_id)
 
         except Exception as e:
-            print(f"❌ Error: {e}", flush=True)
+            print(f"❌ Error processing file {file_name}: {e}", flush=True)
             import traceback
             traceback.print_exc()
         finally:

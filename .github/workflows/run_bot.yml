@@ -23,55 +23,27 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 1. 偵察: まずGoogle系ライブラリだけ入れて、ファイルがあるか確認する
-      - name: Check for new files
-        id: check_files
-        env:
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        run: |
-          pip install google-api-python-client google-auth
-          
-          # 簡易スクリプトでファイル有無だけチェック
-          python -c "
-          import os, json
-          from google.oauth2 import service_account
-          from googleapiclient.discovery import build
-          
-          folder_id = os.environ.get('DRIVE_FOLDER_ID')
-          creds_json = os.environ.get('GCP_SA_KEY')
-          
-          if folder_id and creds_json:
-              with open('service_account.json', 'w') as f: f.write(creds_json)
-              creds = service_account.Credentials.from_service_account_file('service_account.json')
-              service = build('drive', 'v3', credentials=creds)
-              
-              q = f'\'{folder_id}\' in parents and mimeType != \'application/vnd.google-apps.folder\' and trashed = false'
-              res = service.files().list(q=q, pageSize=1, fields='files(id)').execute()
-              files = res.get('files', [])
-              
-              if files:
-                  print('::set-output name=has_files::true')
-                  print('✅ New files found. Proceeding to setup.')
-              else:
-                  print('::set-output name=has_files::false')
-                  print('ℹ️ No new files. Skipping heavy installation.')
-          "
+      # キャッシュの利用（これで2回目以降のインストールは爆速になります）
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-      # 2. 重いインストール (ファイルがある場合のみ実行)
+      # FFmpegは毎回入れますが、数秒〜十数秒のコストは許容します（安定性重視）
       - name: Install FFmpeg
-        if: steps.check_files.outputs.has_files == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Install full dependencies
-        if: steps.check_files.outputs.has_files == 'true'
+      # 必要なライブラリを一括インストール
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 3. メイン処理 (ファイルがある場合のみ実行)
+      # スクリプト実行（ファイルがない場合はここで即座に "No new files" で終了します）
       - name: Run script
-        if: steps.check_files.outputs.has_files == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}

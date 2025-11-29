@@ -10,11 +10,11 @@ import shutil
 from datetime import datetime
 
 # --- ライブラリ強制セットアップ ---
-# 依存関係を確実に解消する
 try:
     import requests
     import google.generativeai as genai
     from pydub import AudioSegment
+    from google.api_core.exceptions import ResourceExhausted
 except ImportError:
     print("🔄 Installing core libraries...", flush=True)
     subprocess.check_call([
@@ -25,6 +25,7 @@ except ImportError:
     import requests
     import google.generativeai as genai
     from pydub import AudioSegment
+    from google.api_core.exceptions import ResourceExhausted
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -88,7 +89,7 @@ def notion_create_page_chunked(parent_db_id, properties, children):
     """
     url = "https://api.notion.com/v1/pages"
     
-    # 最初の100個 (安全マージンで90個)
+    # 最初の90個（安全マージン）
     initial_children = children[:90]
     remaining_children = children[90:]
     
@@ -104,7 +105,7 @@ def notion_create_page_chunked(parent_db_id, properties, children):
         res.raise_for_status()
         page_data = res.json()
         page_id = page_data['id']
-        print("   ✅ Base page created. Appending remaining blocks...", flush=True)
+        print("   ✅ Base page created. Appending remaining content...", flush=True)
         
         # 2. 残りのブロックを追記 (Append)
         if remaining_children:
@@ -120,7 +121,7 @@ def notion_create_page_chunked(parent_db_id, properties, children):
                 if append_res.status_code != 200:
                     print(f"   ⚠️ Warning: Failed to append chunk {i}. Status: {append_res.status_code}", flush=True)
                 else:
-                    print(f"   Writing chunk {i}...", flush=True)
+                    print(f"   ...Writing chunk {i} to {i+batch_size}", flush=True)
                 
                 time.sleep(0.5) # APIレート制限対策
                 
@@ -128,12 +129,12 @@ def notion_create_page_chunked(parent_db_id, properties, children):
 
     except requests.exceptions.HTTPError as e:
         print(f"❌ Create Page Error: {e.response.status_code}")
-        print(f"   Detail: {e.response.text}")
+        try: print(f"   Detail: {e.response.text}")
+        except: pass
         raise e
 
 def get_student_target_id(student_name):
     print(f"🔍 Looking up student: '{student_name}'", flush=True)
-    # contains検索で柔軟に対応
     search_filter = {"filter": {"property": "Name", "title": {"contains": student_name}}}
     data = notion_query_database(CONTROL_CENTER_ID, search_filter)
     if not data or not data.get("results"): return None
@@ -171,8 +172,7 @@ def mix_audio_files(file_paths):
     try:
         mixed = AudioSegment.from_file(file_paths[0])
         for path in file_paths[1:]:
-            track = AudioSegment.from_file(path)
-            mixed = mixed.overlay(track)
+            mixed = mixed.overlay(AudioSegment.from_file(path))
         output_path = os.path.join(TEMP_DIR, "mixed_session.mp3")
         mixed.export(output_path, format="mp3")
         return output_path
@@ -182,31 +182,37 @@ def mix_audio_files(file_paths):
 
 def analyze_audio_auto(file_path):
     # Flashモデル固定 (Resource Efficiency)
-    model_name = 'models/gemini-2.0-flash'
+    model_name_initial = 'models/gemini-2.0-flash'
     
+    # ★完全版プロンプト（文字起こし＋詳細レポート＋JSON）
     prompt = """
-    あなたは**トップ・スマブラアナリスト**です。
+    あなたは**トップ・スマブラアナリスト**であり、行動経済学に基づく課題解決エージェントです。
     この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
 
-    【最優先ドメイン用語】: 「着地狩り」「崖際」「復帰阻止」「間合い」「確定反撃」「ライン管理」「ベクトル変更」
+    【最優先ドメイン用語】: 「着地狩り」「着地」「崖上がり」「崖狩り」「見てから」「読みで」「復帰」「崖際」「復帰阻止」「間合い」「確定反撃」「ライン管理」「ベクトル変更」「暴れ」
 
-    以下の3つのセクションを順に出力せよ。
+    以下の3つのセクションを、**区切りタグを含めて**順に出力せよ。
 
     ---
     **[RAW_TRANSCRIPTION_START]**
-    会話全体を、詳細に、逐語訳に近い形で文字起こしせよ。
+    会話全体を、可能な限り詳細に、逐語訳に近い形で文字起こしせよ。
+    （※出力が途切れないよう、フィラー「あー」「えー」などは適宜削除してよいが、重要な内容は省略するな）
     **[RAW_TRANSCRIPTION_END]**
     ---
     **[DETAILED_REPORT_START]**
     会話内で扱われた各トピックについて、以下の**5要素**を用いて詳細に分解・解説せよ。
+    文字数制限は設けない。具体的かつ論理的に記述すること。
     Markdown形式（見出しや箇条書き）を使用せよ。
 
-    ### トピック: [トピック名]
+    ### トピック1: [トピック名]
     * **現状**: [具体的な現状]
     * **課題**: [発見された課題]
     * **原因**: [根本原因、認知バイアスなど]
     * **改善案**: [提示された解決策]
     * **やること**: [具体的なアクション]
+
+    ### トピック2: [トピック名]
+    ...（以降、トピックがある限り繰り返す）
     **[DETAILED_REPORT_END]**
     ---
     **[JSON_START]**
@@ -219,89 +225,89 @@ def analyze_audio_auto(file_path):
     **[JSON_END]**
     """
 
-    try:
-        print(f"🧠 Analyzing with {model_name}...", flush=True)
-        model = genai.GenerativeModel(model_name)
-        audio_file = genai.upload_file(file_path)
-        
-        while audio_file.state.name == "PROCESSING":
-            time.sleep(2)
-            audio_file = genai.get_file(audio_file.name)
-        if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
-        
-        # Max tokens for Flash
-        response = model.generate_content(
-            [prompt, audio_file],
-            generation_config=genai.types.GenerationConfig(max_output_tokens=8192)
-        )
-        text = response.text.strip()
-        
-        try: genai.delete_file(audio_file.name)
-        except: pass
-
-        # --- Parsing Logic (Robust) ---
-        raw_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
-        raw_text = raw_match.group(1).strip() if raw_match else "Transcript Error/Truncated"
-
-        report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', text, re.DOTALL)
-        report_text = report_match.group(1).strip() if report_match else "Report Error/Truncated"
-
-        json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', text, re.DOTALL)
-        
-        data = {}
-        if json_match:
-            try:
-                json_str = json_match.group(1).replace("```json", "").replace("```", "").strip()
-                data = json.loads(json_str)
-            except:
-                data = {}
-        
-        # Fallback if JSON missing
-        if not data:
-            print("⚠️ JSON Metadata missing. Using fallback data.", flush=True)
-            data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "解析失敗/要確認"}
-        
-        # Date normalization
-        if data.get('date') in ['Unknown', 'Today', None]:
-            data['date'] = datetime.now().strftime('%Y-%m-%d')
+    current_model = model_name_initial
+    for attempt in range(2):
+        try:
+            print(f"🧠 Analyzing with {current_model}...", flush=True)
+            model = genai.GenerativeModel(current_model)
+            audio_file = genai.upload_file(file_path)
             
-        return data, raw_text, report_text
+            while audio_file.state.name == "PROCESSING":
+                time.sleep(2)
+                audio_file = genai.get_file(audio_file.name)
+            if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
+            
+            # Max tokens for Flash (8192)
+            response = model.generate_content(
+                [prompt, audio_file],
+                generation_config=genai.types.GenerationConfig(max_output_tokens=8192)
+            )
+            text = response.text.strip()
+            
+            try: genai.delete_file(audio_file.name)
+            except: pass
 
-    except Exception as e:
-        print(f"❌ AI Error: {e}", flush=True)
-        raise e
+            # --- Parsing Logic ---
+            # 1. Raw Transcript
+            raw_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
+            raw_text = raw_match.group(1).strip() if raw_match else "Transcript Error/Truncated"
+
+            # 2. Detailed Report
+            report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', text, re.DOTALL)
+            report_text = report_match.group(1).strip() if report_match else "Report Error/Truncated"
+
+            # 3. JSON Metadata
+            json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', text, re.DOTALL)
+            
+            data = {}
+            if json_match:
+                try:
+                    json_str = json_match.group(1).replace("```json", "").replace("```", "").strip()
+                    data = json.loads(json_str)
+                except:
+                    print("⚠️ JSON parse error. Using fallback.", flush=True)
+                    data = {}
+            
+            if not data:
+                data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "解析失敗/要確認"}
+            
+            if data.get('date') in ['Unknown', 'Today', None]:
+                data['date'] = datetime.now().strftime('%Y-%m-%d')
+                
+            return data, raw_text, report_text
+
+        except ResourceExhausted:
+            if attempt == 0:
+                print("⚠️ Quota Exceeded. Waiting 10s and retrying...", flush=True)
+                time.sleep(10)
+                continue
+            raise
+
+        except Exception as e:
+            print(f"❌ AI Error: {e}", flush=True)
+            raise e
 
 # --- File Cleanup ---
-def get_or_create_processed_folder():
+def cleanup_drive_file(file_id):
     folder_name = "processed_coaching_logs"
-    query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
-    response = drive_service.files().list(q=query, fields='files(id)').execute()
-    files = response.get('files', [])
-    if files: return files[0]['id']
-    else:
-        file_metadata = {'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]}
-        folder = drive_service.files().create(body=file_metadata, fields='id').execute()
-        return folder.get('id')
-
-def move_files_to_processed(file_ids, target_folder_id):
-    for file_id in file_ids:
-        try:
-            file = drive_service.files().get(fileId=file_id, fields='parents').execute()
-            previous_parents = ",".join(file.get('parents'))
-            drive_service.files().update(fileId=file_id, addParents=target_folder_id, removeParents=previous_parents, fields='id, parents').execute()
-            print(f"➡️ Moved file {file_id} to processed folder.", flush=True)
-        except Exception as e:
-            print(f"❌ Failed to move file {file_id}: {e}", flush=True)
+    try:
+        q = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
+        res = drive_service.files().list(q=q, fields='files(id)').execute()
+        files = res.get('files', [])
+        target_id = files[0]['id'] if files else drive_service.files().create(body={'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]}, fields='id').execute().get('id')
+        
+        file = drive_service.files().get(fileId=file_id, fields='parents').execute()
+        drive_service.files().update(fileId=file_id, addParents=target_id, removeParents=",".join(file.get('parents')), fields='id, parents').execute()
+        print("➡️ File moved to processed folder.", flush=True)
+    except: pass
 
 # --- Main Logic ---
 def main():
-    print("--- VERSION: FINAL ROBUST BUILD (v60.0) ---", flush=True)
+    print("--- VERSION: FINAL ROBUST BUILD (v61.0) ---", flush=True)
     
-    if not INBOX_FOLDER_ID:
-        print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
-        return
+    if not INBOX_FOLDER_ID: return
 
-    # 1. Drive Search
+    # 1. Drive Check
     try:
         results = drive_service.files().list(
             q=f"'{INBOX_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
@@ -324,25 +330,30 @@ def main():
         print(f"✅ Manual Mode: Checking '{manual_name}'...", flush=True)
         manual_target_id = get_student_target_id(manual_name)
         if not manual_target_id:
-            print(f"❌ Error: '{manual_name}' not found. Fallback to Auto.", flush=True)
+            print(f"❌ Error: '{manual_name}' not found in Control Center. Fallback to Auto.", flush=True)
             manual_name = None
 
     # 3. Processing Loop
     for file in files:
         file_id = file['id']
         file_name = file['name']
+        print(f"\nProcessing File: {file_name}", flush=True)
         
         try:
-            print(f"\nProcessing File: {file_name}", flush=True)
-            
             # 3.1 Audio Prep
-            local_paths = []
-            path = download_file(file_id, file_name)
-            if file_name.lower().endswith('.zip'): local_paths.extend(extract_audio_from_zip(path))
-            else: local_paths.append(path)
+            local_audio_paths = [] # ★修正: 変数名の初期化
             
-            if not local_audio_paths: continue
-            mixed_path = mix_audio_files(local_paths)
+            path = download_file(file_id, file_name)
+            if file_name.lower().endswith('.zip'):
+                local_audio_paths.extend(extract_audio_from_zip(path))
+            else:
+                local_audio_paths.append(path)
+            
+            if not local_audio_paths: # ★修正: 正しい変数をチェック
+                print("⚠️ No audio tracks found. Skipping.", flush=True)
+                continue
+                
+            mixed_path = mix_audio_files(local_audio_paths)
 
             # 3.2 AI Analysis
             json_meta, raw_transcript, detailed_report = analyze_audio_auto(mixed_path)

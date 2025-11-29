@@ -190,28 +190,34 @@ def mix_audio_files(file_paths):
         return max(file_paths, key=os.path.getsize)
 
 def analyze_audio_auto(file_path):
-    # Flashモデル固定
-    model_name = 'models/gemini-2.0-flash'
+    model_name_initial = 'models/gemini-2.0-flash'
     
-    # ★指定されたプロンプト構造を反映
+    # ★修正：90分を完走させるための「高密度ログ」プロンプト
     prompt = """
     あなたは**トップ・スマブラアナリスト**です。
-    この音声は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
+    この音声（約90分）は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
 
-    【最優先ドメイン用語】: 「着地狩り」「崖際」「復帰阻止」「間合い」「確定反撃」「ライン管理」「ベクトル変更」「暴れ」
+    【物理的制約と戦略】
+    音声が長いため、一言一句の文字起こしを行うと出力制限で途切れてしまいます。
+    したがって、**「意味を変えずに文字数を圧縮した、超高密度な時系列ログ」**を作成してください。
+    
+    * フィラー（あー、えー）や重複は完全に削除する。
+    * 「誰が」「何について」「どう発言したか」は正確に記録する。
+    * 専門用語（着地狩り、復帰阻止など）は省略せず記載する。
 
     以下の3つのセクションを、**区切りタグを含めて**順に出力せよ。
-    JSON部分は必ず閉じること。
 
     ---
     **[RAW_TRANSCRIPTION_START]**
-    会話全体を、可能な限り詳細に、逐語訳に近い形で文字起こしせよ。
-    （※出力が途切れないよう、フィラー「あー」「えー」などは適宜削除してよいが、内容は省略するな）
+    （ここに、90分間の流れがわかる詳細な時系列ログを記述）
+    ・[00:00~] 導入：...
+    ・[10:00~] トピックA：...
+    ...
     **[RAW_TRANSCRIPTION_END]**
     ---
     **[DETAILED_REPORT_START]**
     会話内で扱われた各トピックについて、以下の**5要素**を用いて詳細に分解・解説せよ。
-    文字数制限は設けない。具体的かつ論理的に記述すること。Markdown形式（見出しや箇条書き）を使用せよ。
+    Markdown形式（見出しや箇条書き）を使用せよ。
 
     ### トピック1: [トピック名]
     * **現状**: [具体的な現状]
@@ -221,7 +227,7 @@ def analyze_audio_auto(file_path):
     * **やること**: [具体的なアクション]
 
     ### トピック2: [トピック名]
-    ...（以降、トピックがある限り繰り返す）
+    ...（以降、主要トピックを網羅する）
     **[DETAILED_REPORT_END]**
     ---
     **[JSON_START]**
@@ -234,11 +240,15 @@ def analyze_audio_auto(file_path):
     **[JSON_END]**
     """
 
-    print(f"🧠 Analyzing with {model_name}...", flush=True)
+    # ... (以下、実行ロジックは変更なし) ...
     
+    current_model = model_name_initial
+    response_text = ""
+
     for attempt in range(2):
         try:
-            model = genai.GenerativeModel(model_name)
+            print(f"🧠 Analyzing with {current_model} (Attempt {attempt+1})...", flush=True)
+            model = genai.GenerativeModel(current_model)
             audio_file = genai.upload_file(file_path)
             
             while audio_file.state.name == "PROCESSING":
@@ -246,43 +256,43 @@ def analyze_audio_auto(file_path):
                 audio_file = genai.get_file(audio_file.name)
             if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
             
-            # 出力トークン最大化
             response = model.generate_content(
                 [prompt, audio_file],
                 generation_config=genai.types.GenerationConfig(max_output_tokens=8192)
             )
-            text = response.text.strip()
+            response_text = response.text.strip()
             
             try: genai.delete_file(audio_file.name)
             except: pass
-            
-            # 解析成功ならループを抜ける
-            break
+            break 
 
-        except Exception as e:
-            print(f"⚠️ AI Error (Attempt {attempt+1}): {e}", flush=True)
+        except ResourceExhausted:
             if attempt == 0:
-                time.sleep(5)
+                print("⚠️ Quota Exceeded. Waiting 10s and retrying...", flush=True)
+                time.sleep(10)
                 continue
+            raise
+        except Exception as e:
+            print(f"❌ AI Error: {e}", flush=True)
             raise e
-
-    # --- Parsing Logic (Strict Tags with Fallback) ---
-    
+            
+    # ... (以下、パースロジックは変更なし) ...
     # 1. Raw Transcript
-    raw_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', text, re.DOTALL)
+    raw_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', response_text, re.DOTALL)
     if raw_match:
         raw_text = raw_match.group(1).strip()
     else:
-        # 救済策: JSONタグ以前をすべて文字起こしとみなす
-        raw_text = re.split(r'\[JSON_START\]', text)[0].replace("[RAW_TRANSCRIPTION_START]", "").strip()
-        if not raw_text: raw_text = "(Transcript extraction failed)"
+        # タグがない場合の救済: JSONタグ以外を全て文字起こしとして扱う
+        print("⚠️ Transcript tag missing. Using fallback extraction.", flush=True)
+        raw_text = re.sub(r'\[JSON_START\].*?\[JSON_END\]', '', response_text, flags=re.DOTALL).strip()
+        if not raw_text: raw_text = "音声解析に失敗しました（生成テキストなし）。"
 
     # 2. Detailed Report
-    report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', text, re.DOTALL)
-    report_text = report_match.group(1).strip() if report_match else "(Detailed report extraction failed)"
+    report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', response_text, re.DOTALL)
+    report_text = report_match.group(1).strip() if report_match else "（詳細レポートのタグ抽出に失敗しました。全文文字起こしを参照してください）"
 
     # 3. JSON Metadata
-    json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', text, re.DOTALL)
+    json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', response_text, re.DOTALL)
     data = {}
     
     if json_match:
@@ -293,7 +303,7 @@ def analyze_audio_auto(file_path):
     
     # JSON救済
     if not data:
-        data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Report"}
+        data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "解析失敗/要確認"}
     
     if data.get('date') in ['Unknown', 'Today', None]:
         data['date'] = datetime.now().strftime('%Y-%m-%d')

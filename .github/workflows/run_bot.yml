@@ -1,7 +1,8 @@
 name: Auto Coaching Log
+
 on:
   schedule:
-    - cron: '*/30 0-15 * * *'  # 自動実行パス (JST 9:00 - 24:00)
+    - cron: '*/30 0-15 * * *'
   workflow_dispatch:
     inputs:
       target_student:
@@ -22,11 +23,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg
+      # ★高速化の要: ライブラリのキャッシュ
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        id: pip-cache
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install FFmpeg (System Requirement)
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
+      # キャッシュがあれば高速、なければインストール
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -36,6 +48,5 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-          # ★手動入力値の引き渡し: Pythonスクリプトのos.getenvで読み込まれます
           MANUAL_STUDENT_NAME: ${{ github.event.inputs.target_student }} 
         run: python main.py

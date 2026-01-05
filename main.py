@@ -1,50 +1,66 @@
 import os
 import sys
-import subprocess
 import time
 import json
-import logging
-import re
-import zipfile
 import shutil
+import subprocess
+import glob
+import re
 from datetime import datetime
 
-# --- 1. ライブラリ強制セットアップ ---
-try:
-    import requests
-    import google.generativeai as genai
-    from pydub import AudioSegment
-except ImportError:
-    print("🔄 Installing core libraries...", flush=True)
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install", "--upgrade", 
-        "requests", "google-generativeai>=0.8.3", "pydub",
-        "google-api-python-client", "google-auth"
-    ])
-    import requests
-    import google.generativeai as genai
-    from pydub import AudioSegment
-
+# --- Libraries ---
+import requests
+import google.generativeai as genai
+from groq import Groq
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+import zipfile
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-
-# --- 2. 最終設定 (ハードコード) ---
+# --- Configuration ---
 # Control Center (通知Bot実績ID)
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664"
 # Fallback Inbox (生徒不明時の退避先)
 FINAL_FALLBACK_DB_ID = "2b71bc8521e38018a5c3c4b0c6b6627c"
 
-# --- 3. 初期化処理 ---
-TEMP_DIR = "downloads"
-if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
-os.makedirs(TEMP_DIR)
+TEMP_DIR = "temp_workspace"
+CHUNK_LENGTH = 900  # 15分 (秒) - Whisper API制限回避用
 
-if os.getenv("GCP_SA_KEY"):
-    with open("service_account.json", "w") as f:
-        f.write(os.getenv("GCP_SA_KEY"))
+# --- Setup & Init ---
+def setup_env():
+    if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
+    os.makedirs(TEMP_DIR)
+    
+    # Generate SA Key for Google Drive
+    if os.getenv("GCP_SA_KEY"):
+        with open("service_account.json", "w") as f:
+            f.write(os.getenv("GCP_SA_KEY"))
+
+setup_env()
+
+try:
+    # Initialize Clients
+    groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    
+    NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+    HEADERS = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28"
+    }
+    
+    SCOPES = ['https://www.googleapis.com/auth/drive']
+    creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
+    drive_service = build('drive', 'v3', credentials=creds)
+
+    # Validate IDs
+    INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+    if not INBOX_FOLDER_ID: raise ValueError("DRIVE_FOLDER_ID is missing.")
+
+except Exception as e:
+    print(f"❌ Init Critical Error: {e}")
+    sys.exit(1)
 
 def sanitize_id(raw_id):
     if not raw_id: return None
@@ -52,107 +68,204 @@ def sanitize_id(raw_id):
     if match: return match.group(1)
     return None
 
-try:
-    NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-    HEADERS = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28" 
-    }
-    
-    CONTROL_CENTER_ID = sanitize_id(FINAL_CONTROL_DB_ID)
-    FALLBACK_DB_ID = sanitize_id(FINAL_FALLBACK_DB_ID)
-    INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-    
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    SCOPES = ['https://www.googleapis.com/auth/drive']
-    creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=SCOPES)
-    drive_service = build('drive', 'v3', credentials=creds)
-    
-except Exception as e:
-    print(f"❌ Setup Critical Error: {e}", flush=True)
-    exit(1)
+# --- Layer 1: FFmpeg Audio Processing (Memory Safe) ---
 
-# --- 4. Notion API 関数群 (長文対応) ---
-
-def notion_query_database(db_id, query_filter):
-    url = f"https://api.notion.com/v1/databases/{db_id}/query"
+def run_ffmpeg(cmd):
+    """Run FFmpeg command securely"""
     try:
-        res = requests.post(url, headers=HEADERS, json=query_filter)
-        res.raise_for_status()
-        return res.json()
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ FFmpeg Error: {e}")
+        raise
+
+def mix_audio_ffmpeg(file_paths):
+    """Mix multiple audio files into one lightweight MP3 using FFmpeg stream"""
+    if not file_paths: return None
+    print(f"🎛️ Mixing {len(file_paths)} tracks...", flush=True)
+    
+    output_path = os.path.join(TEMP_DIR, "mixed_full.mp3")
+    
+    inputs = []
+    for f in file_paths: inputs.extend(['-i', f])
+    
+    # amix filter for mixing, output as 64k mono mp3 (sufficient for speech)
+    if len(file_paths) > 1:
+        filter_cmd = f"amix=inputs={len(file_paths)}:duration=longest"
+        cmd = ['ffmpeg', '-y'] + inputs + ['-filter_complex', filter_cmd, '-ac', '1', '-b:a', '64k', output_path]
+    else:
+        cmd = ['ffmpeg', '-y', '-i', file_paths[0], '-ac', '1', '-b:a', '64k', output_path]
+    
+    run_ffmpeg(cmd)
+    return output_path
+
+def split_audio_ffmpeg(input_path):
+    """Split large audio into small chunks to bypass API limits"""
+    print("🔪 Splitting audio into chunks...", flush=True)
+    output_pattern = os.path.join(TEMP_DIR, "chunk_%03d.mp3")
+    
+    # Split without re-encoding (-c copy) for speed
+    cmd = [
+        'ffmpeg', '-y', '-i', input_path, 
+        '-f', 'segment', '-segment_time', str(CHUNK_LENGTH), 
+        '-c', 'copy', output_pattern
+    ]
+    run_ffmpeg(cmd)
+    chunks = sorted(glob.glob(os.path.join(TEMP_DIR, "chunk_*.mp3")))
+    print(f"➡️ Created {len(chunks)} chunks.")
+    return chunks
+
+# --- Layer 2: Groq Transcription (Speed) ---
+
+def transcribe_with_groq(chunk_paths):
+    """Use Groq (Whisper Large V3) for lightning fast transcription"""
+    full_transcript = ""
+    print("🚀 Starting Groq Transcription...", flush=True)
+    
+    for i, chunk in enumerate(chunk_paths):
+        print(f"   Processing chunk {i+1}/{len(chunk_paths)}...", flush=True)
+        try:
+            with open(chunk, "rb") as file:
+                transcription = groq_client.audio.transcriptions.create(
+                    file=(chunk, os.path.basename(chunk)),
+                    model="whisper-large-v3",
+                    language="ja",
+                    response_format="text"
+                )
+                full_transcript += transcription + "\n"
+        except Exception as e:
+            print(f"⚠️ Groq Error on chunk {i+1}: {e}")
+            full_transcript += f"\n[Error processing chunk {i+1}]\n"
+            
+    return full_transcript
+
+# --- Layer 3: Gemini Analysis (Intelligence) ---
+
+def analyze_text_with_gemini(transcript_text):
+    """Analyze the raw text using Gemini 1.5 Flash"""
+    print("🧠 Analyzing text with Gemini 1.5 Flash...", flush=True)
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    # Prompt adapted from v62.0 but optimized for TEXT input
+    prompt = f"""
+    あなたは**トップ・スマブラアナリスト**です。
+    以下は、コーチ(Hikari)とクライアントの対話ログ（文字起こし済みテキスト）です。
+
+    【指令】
+    このテキストを分析し、以下の2つのセクションを出力してください。
+    
+    1. **詳細分析レポート**: 
+       会話内で扱われた主要トピック（着地狩り、復帰阻止、メンタル等）を特定し、
+       それぞれの「現状」「課題」「改善案」「やること」をMarkdown形式で詳述せよ。
+    
+    2. **JSONメタデータ**:
+       生徒の名前、日付、次回の最重要アクションを抽出せよ。
+
+    ---
+    **[DETAILED_REPORT_START]**
+    （ここに詳細レポートをMarkdownで見やすく記述）
+    **[DETAILED_REPORT_END]**
+    ---
+    **[JSON_START]**
+    {{
+      "student_name": "生徒名（不明ならUnknown）",
+      "date": "YYYY-MM-DD (不明ならToday)",
+      "next_action": "最も重要な次回アクション"
+    }}
+    **[JSON_END]**
+    ---
+
+    【入力テキスト】
+    {transcript_text[:1000000]}
+    """
+    
+    response = model.generate_content(prompt, generation_config={"temperature": 0.2})
+    text = response.text.strip()
+    
+    # Parse Logic
+    report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', text, re.DOTALL)
+    report_text = report_match.group(1).strip() if report_match else "分析レポート生成失敗"
+    
+    json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', text, re.DOTALL)
+    data = {}
+    if json_match:
+        try:
+            json_str = json_match.group(1).replace("```json", "").replace("```", "").strip()
+            data = json.loads(json_str)
+        except: pass
+        
+    if not data:
+        data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
+    if data.get('date') in ['Unknown', 'Today', None]:
+        data['date'] = datetime.now().strftime('%Y-%m-%d')
+        
+    return data, report_text
+
+# --- Layer 4: Notion Database (Storage) ---
+
+def notion_query_student(student_name):
+    """Search for student ID in Control Center"""
+    print(f"🔍 Looking up student: '{student_name}'", flush=True)
+    if not FINAL_CONTROL_DB_ID: return None, student_name
+    
+    url = f"https://api.notion.com/v1/databases/{sanitize_id(FINAL_CONTROL_DB_ID)}/query"
+    payload = {"filter": {"property": "Name", "title": {"contains": student_name}}}
+    
+    try:
+        res = requests.post(url, headers=HEADERS, json=payload)
+        data = res.json()
+        if data.get("results"):
+            row = data["results"][0]
+            title_list = row["properties"].get("Name", {}).get("title", [])
+            official_name = title_list[0]["plain_text"] if title_list else student_name
+            target_id = row["properties"].get("TargetID", {}).get("rich_text", [])
+            if target_id:
+                return sanitize_id(target_id[0]["plain_text"]), official_name
     except Exception as e:
         print(f"⚠️ Notion Query Error: {e}")
-        return None
+        
+    return None, student_name
 
 def notion_append_children(block_id, children):
-    """ページ作成後に残りのブロックを追記する"""
     url = f"https://api.notion.com/v1/blocks/{block_id}/children"
-    batch_size = 100 # Notion制限
-    
-    for i in range(0, len(children), batch_size):
-        chunk = children[i : i + batch_size]
-        payload = {"children": chunk}
+    # Chunk blocks into groups of 100
+    for i in range(0, len(children), 100):
+        chunk = children[i : i + 100]
         try:
-            res = requests.patch(url, headers=HEADERS, json=payload)
-            res.raise_for_status()
-            print(f"   ...Appended blocks {i+1}-{i+len(chunk)}", flush=True)
-            time.sleep(0.2)
+            requests.patch(url, headers=HEADERS, json={"children": chunk})
+            time.sleep(0.2) # Rate limit safety
         except Exception as e:
-            print(f"❌ Append Error: {e}")
+            print(f"⚠️ Append Error: {e}")
 
-def notion_create_page_heavy(parent_db_id, properties, all_children):
-    """大量のブロックを持つページを作成する安全な関数"""
+def notion_create_page_heavy(db_id, props, all_children):
+    """Create page and append massive content safely"""
     url = "https://api.notion.com/v1/pages"
     
-    # 最初の100個まで
-    initial_children = all_children[:90] 
-    remaining_children = all_children[90:]
+    # First 100 blocks
+    initial_children = all_children[:100]
+    remaining_children = all_children[100:]
     
     payload = {
-        "parent": {"database_id": parent_db_id},
-        "properties": properties,
+        "parent": {"database_id": db_id},
+        "properties": props,
         "children": initial_children
     }
     
     try:
         res = requests.post(url, headers=HEADERS, json=payload)
         res.raise_for_status()
-        page_data = res.json()
-        page_id = page_data['id']
-        print(f"   ✅ Base Page Created (ID: {page_id})", flush=True)
+        page_id = res.json()['id']
+        print(f"✅ Page Created (ID: {page_id})", flush=True)
         
         if remaining_children:
+            print(f"   Appending {len(remaining_children)} remaining blocks...", flush=True)
             notion_append_children(page_id, remaining_children)
             
-        return page_data
-
-    except requests.exceptions.HTTPError as e:
-        print(f"❌ Create Page Error: {e.response.status_code}")
-        try: print(f"   Detail: {e.response.text}")
+    except Exception as e:
+        print(f"❌ Notion Write Error: {e}")
+        try: print(res.text)
         except: pass
-        raise e
 
-def get_student_target_id(student_name):
-    print(f"🔍 Looking up student: '{student_name}'", flush=True)
-    search_filter = {"filter": {"property": "Name", "title": {"contains": student_name}}}
-    data = notion_query_database(CONTROL_CENTER_ID, search_filter)
-    
-    if not data or not data.get("results"):
-        return None, None
-    
-    row = data["results"][0]
-    # 正式名称を取得
-    title_list = row["properties"].get("Name", {}).get("title", [])
-    official_name = title_list[0]["plain_text"] if title_list else student_name
-    
-    target_id_prop = row["properties"].get("TargetID", {}).get("rich_text", [])
-    if not target_id_prop:
-        return None, official_name
-    
-    return sanitize_id(target_id_prop[0]["plain_text"]), official_name
-
-# --- 5. Drive & Gemini Helpers ---
+# --- Drive Utilities ---
 
 def download_file(file_id, file_name):
     request = drive_service.files().get_media(fileId=file_id)
@@ -160,298 +273,156 @@ def download_file(file_id, file_name):
     with open(file_path, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request)
         done = False
-        while done is False:
-            status, done = downloader.next_chunk()
+        while not done: _, done = downloader.next_chunk()
     return file_path
 
-def extract_audio_from_zip(zip_path):
-    extracted_files = []
-    extract_dir = os.path.join(TEMP_DIR, "extracted_" + os.path.basename(zip_path))
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_dir)
-    for root, dirs, files in os.walk(extract_dir):
-        for file in files:
-            if file.lower().endswith(('.flac', '.mp3', '.aac', '.wav', '.m4a')):
-                extracted_files.append(os.path.join(root, file))
-    return extracted_files
-
-def mix_audio_files(file_paths):
-    if not file_paths: return None
-    print(f"🎛️ Mixing {len(file_paths)} tracks...", flush=True)
-    try:
-        mixed = AudioSegment.from_file(file_paths[0])
-        for path in file_paths[1:]:
-            mixed = mixed.overlay(AudioSegment.from_file(path))
-        output_path = os.path.join(TEMP_DIR, "mixed_session.mp3")
-        mixed.export(output_path, format="mp3")
-        return output_path
-    except Exception as e:
-        print(f"⚠️ Mixing Error: {e}. Using largest file.", flush=True)
-        return max(file_paths, key=os.path.getsize)
-
-def analyze_audio_auto(file_path):
-    model_name_initial = 'models/gemini-2.0-flash'
-    
-    # ★修正：90分を完走させるための「高密度ログ」プロンプト
-    prompt = """
-    あなたは**トップ・スマブラアナリスト**です。
-    この音声（約90分）は、**コーチ (Hikari)** と **クライアント (生徒)** の対話ログです。
-
-    【物理的制約と戦略】
-    音声が長いため、一言一句の文字起こしを行うと出力制限で途切れてしまいます。
-    したがって、**「意味を変えずに文字数を圧縮した、超高密度な時系列ログ」**を作成してください。
-    
-    * フィラー（あー、えー）や重複は完全に削除する。
-    * 「誰が」「何について」「どう発言したか」は正確に記録する。
-    * 専門用語（着地狩り、復帰阻止など）は省略せず記載する。
-
-    以下の3つのセクションを、**区切りタグを含めて**順に出力せよ。
-
-    ---
-    **[RAW_TRANSCRIPTION_START]**
-    （ここに、90分間の流れがわかる詳細な時系列ログを記述）
-    ・[00:00~] 導入：...
-    ・[10:00~] トピックA：...
-    ...
-    **[RAW_TRANSCRIPTION_END]**
-    ---
-    **[DETAILED_REPORT_START]**
-    会話内で扱われた各トピックについて、以下の**5要素**を用いて詳細に分解・解説せよ。
-    Markdown形式（見出しや箇条書き）を使用せよ。
-
-    ### トピック1: [トピック名]
-    * **現状**: [具体的な現状]
-    * **課題**: [発見された課題]
-    * **原因**: [根本原因、認知バイアスなど]
-    * **改善案**: [提示された解決策]
-    * **やること**: [具体的なアクション]
-
-    ### トピック2: [トピック名]
-    ...（以降、主要トピックを網羅する）
-    **[DETAILED_REPORT_END]**
-    ---
-    **[JSON_START]**
-    以下のJSONデータのみを記述せよ。
-    {
-      "student_name": "生徒の名前（例: らぎぴ, トロピウス, Unknown）",
-      "date": "YYYY-MM-DD (不明ならToday)",
-      "next_action": "最も重要な次回のアクション（1行）"
-    }
-    **[JSON_END]**
-    """
-
-    # ... (以下、実行ロジックは変更なし) ...
-    
-    current_model = model_name_initial
-    response_text = ""
-
-    for attempt in range(2):
-        try:
-            print(f"🧠 Analyzing with {current_model} (Attempt {attempt+1})...", flush=True)
-            model = genai.GenerativeModel(current_model)
-            audio_file = genai.upload_file(file_path)
-            
-            while audio_file.state.name == "PROCESSING":
-                time.sleep(2)
-                audio_file = genai.get_file(audio_file.name)
-            if audio_file.state.name == "FAILED": raise ValueError("Audio Failed")
-            
-            response = model.generate_content(
-                [prompt, audio_file],
-                generation_config=genai.types.GenerationConfig(max_output_tokens=8192)
-            )
-            response_text = response.text.strip()
-            
-            try: genai.delete_file(audio_file.name)
-            except: pass
-            break 
-
-        except ResourceExhausted:
-            if attempt == 0:
-                print("⚠️ Quota Exceeded. Waiting 10s and retrying...", flush=True)
-                time.sleep(10)
-                continue
-            raise
-        except Exception as e:
-            print(f"❌ AI Error: {e}", flush=True)
-            raise e
-            
-    # ... (以下、パースロジックは変更なし) ...
-    # 1. Raw Transcript
-    raw_match = re.search(r'\[RAW_TRANSCRIPTION_START\](.*?)\[RAW_TRANSCRIPTION_END\]', response_text, re.DOTALL)
-    if raw_match:
-        raw_text = raw_match.group(1).strip()
-    else:
-        # タグがない場合の救済: JSONタグ以外を全て文字起こしとして扱う
-        print("⚠️ Transcript tag missing. Using fallback extraction.", flush=True)
-        raw_text = re.sub(r'\[JSON_START\].*?\[JSON_END\]', '', response_text, flags=re.DOTALL).strip()
-        if not raw_text: raw_text = "音声解析に失敗しました（生成テキストなし）。"
-
-    # 2. Detailed Report
-    report_match = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', response_text, re.DOTALL)
-    report_text = report_match.group(1).strip() if report_match else "（詳細レポートのタグ抽出に失敗しました。全文文字起こしを参照してください）"
-
-    # 3. JSON Metadata
-    json_match = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', response_text, re.DOTALL)
-    data = {}
-    
-    if json_match:
-        try:
-            json_str = json_match.group(1).replace("```json", "").replace("```", "").strip()
-            data = json.loads(json_str)
-        except: pass
-    
-    # JSON救済
-    if not data:
-        data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "解析失敗/要確認"}
-    
-    if data.get('date') in ['Unknown', 'Today', None]:
-        data['date'] = datetime.now().strftime('%Y-%m-%d')
-        
-    return data, raw_text, report_text
-
-# --- File Cleanup ---
 def cleanup_drive_file(file_id):
     folder_name = "processed_coaching_logs"
     try:
+        # Check/Create folder
         q = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
-        res = drive_service.files().list(q=q, fields='files(id)').execute()
-        files = res.get('files', [])
-        target_id = files[0]['id'] if files else drive_service.files().create(body={'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]}, fields='id').execute().get('id')
+        files = drive_service.files().list(q=q).execute().get('files', [])
+        target_id = files[0]['id'] if files else drive_service.files().create(
+            body={'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]},
+            fields='id'
+        ).execute().get('id')
         
+        # Move file
         file = drive_service.files().get(fileId=file_id, fields='parents').execute()
-        drive_service.files().update(fileId=file_id, addParents=target_id, removeParents=",".join(file.get('parents')), fields='id, parents').execute()
+        drive_service.files().update(
+            fileId=file_id,
+            addParents=target_id,
+            removeParents=",".join(file.get('parents')),
+            fields='id, parents'
+        ).execute()
         print("➡️ File moved to processed folder.", flush=True)
     except: pass
 
 # --- Main Logic ---
-def main():
-    print("--- VERSION: FINAL INTEGRATED BUILD (v62.0) ---", flush=True)
-    
-    if not os.getenv("DRIVE_FOLDER_ID"):
-        print("❌ Error: DRIVE_FOLDER_ID is missing!", flush=True)
-        return
 
-    # 1. Drive Search
+def main():
+    print("--- SZ AUTO LOGGER: ULTIMATE EDITION (v70.0) ---", flush=True)
+    
+    # 1. Drive Scan
     try:
         results = drive_service.files().list(
             q=f"'{INBOX_FOLDER_ID}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
             fields="files(id, name)", orderBy="createdTime desc"
         ).execute()
+        files = results.get('files', [])
     except Exception as e:
-        print(f"❌ Drive Search Error: {e}", flush=True)
-        return
-    
-    files = results.get('files', [])
-    if not files:
-        print("ℹ️ No new files found.", flush=True)
+        print(f"❌ Drive Error: {e}")
         return
 
-    # 2. Manual Mode Check
+    if not files:
+        print("ℹ️ No new files.", flush=True)
+        return
+
+    # 2. Manual Override Check
     manual_name = os.getenv("MANUAL_STUDENT_NAME")
     manual_target_id = None
     manual_official_name = None
-    
     if manual_name:
-        print(f"✅ Manual Mode: Checking '{manual_name}'...", flush=True)
-        manual_target_id, manual_official_name = get_student_target_id(manual_name)
-        if not manual_target_id:
-            print(f"❌ Error: '{manual_name}' not found in Control Center. Fallback to Auto.", flush=True)
-            manual_name = None
+        print(f"🔧 Manual Mode: {manual_name}")
+        manual_target_id, manual_official_name = notion_query_student(manual_name)
 
     # 3. Processing Loop
     for file in files:
-        file_id = file['id']
-        file_name = file['name']
-        print(f"\nProcessing File: {file_name}", flush=True)
+        print(f"\n📂 Processing: {file['name']}", flush=True)
         
         try:
-            # 3.1 Audio Prep
-            local_audio_paths = []
-            path = download_file(file_id, file_name)
-            if file_name.lower().endswith('.zip'):
-                local_audio_paths.extend(extract_audio_from_zip(path))
+            # Step A: Download & Extract
+            file_path = download_file(file['id'], file['name'])
+            audio_paths = []
+            if file['name'].endswith('.zip'):
+                with zipfile.ZipFile(file_path, 'r') as z:
+                    z.extractall(TEMP_DIR)
+                    for root, _, fs in os.walk(TEMP_DIR):
+                        for f in fs:
+                            if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')):
+                                audio_paths.append(os.path.join(root, f))
             else:
-                local_audio_paths.append(path)
-            
-            if not local_audio_paths:
-                print("⚠️ No valid audio tracks. Skipping.", flush=True)
+                audio_paths.append(file_path)
+
+            if not audio_paths:
+                print("⚠️ No audio found in file.")
                 continue
-            
-            mixed_path = mix_audio_files(local_audio_paths)
 
-            # 3.2 AI Analysis (Returns 3 parts)
-            json_meta, raw_transcript, detailed_report = analyze_audio_auto(mixed_path)
+            # Step B: FFmpeg Mix & Split (The "Heavy Lifting")
+            mixed_file = mix_audio_ffmpeg(audio_paths)
+            chunks = split_audio_ffmpeg(mixed_file)
             
-            # 3.3 Destination Logic
-            final_target_id = None
-            student_name_query = json_meta.get('student_name', 'Unknown')
-            display_name = student_name_query
-            is_fallback = False
+            # Step C: Groq Transcription (The "Speedster")
+            full_raw_text = transcribe_with_groq(chunks)
+            if not full_raw_text.strip():
+                print("❌ Transcription failed (Empty result).")
+                continue
 
+            # Step D: Gemini Analysis (The "Brain")
+            meta_data, report_text = analyze_text_with_gemini(full_raw_text)
+            
+            # Step E: Target Resolution
+            destination_id = FINAL_FALLBACK_DB_ID
+            display_name = meta_data['student_name']
+            log_suffix = f" (Unknown: {display_name})"
+            
+            # Priority: Manual > Auto-detected
             if manual_target_id:
-                final_target_id = manual_target_id
+                destination_id = manual_target_id
                 display_name = manual_official_name
-                print(f"📝 Using Manual Target ID for: {display_name}", flush=True)
+                log_suffix = ""
+                print(f"🎯 Using Manual Target: {display_name}")
             else:
-                final_target_id, display_name = get_student_target_id(student_name_query)
+                auto_id, auto_name = notion_query_student(display_name)
+                if auto_id:
+                    destination_id = auto_id
+                    display_name = auto_name
+                    log_suffix = ""
+                    print(f"🎯 Auto-detected Target: {display_name}")
             
-            # 3.4 Fallback Logic
-            destination_id = final_target_id
-            log_title_suffix = ""
-            
-            if not destination_id:
-                print(f"⚠️ Student '{student_name_query}' not found/invalid. Routing to FALLBACK INBOX.", flush=True)
-                destination_id = FALLBACK_DB_ID
-                log_title_suffix = f" (Unknown: {student_name_query})"
-                is_fallback = True
-            
-            if not destination_id:
-                print("❌ Critical: No destination available.", flush=True)
-                continue
-
-            # 3.5 Content Construction
-            print(f"📝 Writing to DB: {destination_id}...", flush=True)
-            
+            # Step F: Construct Notion Blocks
             props = {
-                "名前": {"title": [{"text": {"content": f"{json_meta['date']} コーチングログ{log_title_suffix}"}}]},
-                "日付": {"date": {"start": json_meta['date']}}
+                "名前": {"title": [{"text": {"content": f"{meta_data['date']} コーチングログ{log_suffix}"}}]},
+                "日付": {"date": {"start": meta_data['date']}}
             }
             
-            # 本文ブロック構築
-            children_blocks = []
+            children = []
+            # Report Section
+            children.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "📊 分析レポート"}}]}})
+            for line in report_text.split('\n'):
+                if line.strip():
+                    children.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:2000]}}]}})
             
-            # (A) 詳細分析レポート
-            children_blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "📊 詳細分析レポート"}}]}})
-            for line in detailed_report.split('\n'):
-                if line.strip():
-                    children_blocks.append({
-                        "object": "block", "type": "paragraph", 
-                        "paragraph": {"rich_text": [{"text": {"content": line[:2000]}}]}
-                    })
+            # Next Action Section
+            children.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "🚀 Next Action"}}]}})
+            children.append({"object": "block", "type": "callout", "callout": {
+                "rich_text": [{"text": {"content": meta_data.get('next_action', '-')}}],
+                "icon": {"emoji": "🔥"}
+            }})
+            
+            # Raw Transcript Section (Chunks of 2000 chars)
+            children.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "📝 全文文字起こし"}}]}})
+            
+            # テキストをブロックごとに安全に分割
+            transcript_lines = full_raw_text.split('\n')
+            current_chunk = ""
+            for line in transcript_lines:
+                if len(current_chunk) + len(line) < 1900:
+                    current_chunk += line + "\n"
+                else:
+                    children.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": current_chunk}}]}})
+                    current_chunk = line + "\n"
+            if current_chunk:
+                children.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": current_chunk}}]}})
 
-            # (B) Next Action
-            children_blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "🚀 Next Action"}}]}})
-            children_blocks.append({"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": json_meta.get('next_action', 'なし')}}]}})
-
-            # (C) 全文文字起こし
-            children_blocks.append({"object": "block", "type": "heading_2", "heading_2": {"rich_text": [{"text": {"content": "📝 全文文字起こし"}}]}})
-            for line in raw_transcript.split('\n'):
-                if line.strip():
-                    children_blocks.append({
-                        "object": "block", "type": "paragraph",
-                        "paragraph": {"rich_text": [{"text": {"content": line[:2000]}}]}
-                    })
-
-            # 3.6 Execute Write (With Chunking)
-            notion_create_page_heavy(destination_id, props, children_blocks)
-            print("✅ Log created successfully.", flush=True)
-
-            # 3.7 Cleanup
-            cleanup_drive_file(file_id)
-
+            # Step G: Write to Notion
+            notion_create_page_heavy(sanitize_id(destination_id), props, children)
+            
+            # Step H: Cleanup
+            cleanup_drive_file(file['id'])
+            
         except Exception as e:
-            print(f"❌ Error processing file {file_name}: {e}", flush=True)
+            print(f"❌ Processing Failed for {file_name}: {e}")
             import traceback
             traceback.print_exc()
         finally:

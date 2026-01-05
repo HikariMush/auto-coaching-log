@@ -8,25 +8,19 @@ import glob
 import re
 from datetime import datetime
 
-# --- 0. 環境の強制正規化 (Environment Force Update) ---
-# 実行時にライブラリを強制更新し、環境差異をなくす
+# --- 0. 環境強制アップデート ---
 try:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "google-generativeai>=0.7.2"])
-except Exception as e:
-    print(f"⚠️ Pip install warning: {e}")
+except: pass
 
 # --- Libraries ---
 import requests
-# ライブラリロード
 import google.generativeai as genai
 from groq import Groq
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import zipfile
-
-# ★バージョン確認（ログで事実確認するため）
-print(f"📦 Google Generative AI Version: {genai.__version__}", flush=True)
 
 # --- Configuration ---
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664"
@@ -47,15 +41,24 @@ setup_env()
 try:
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     
-    # ★【根本対策】通信方式を gRPC から REST に変更
-    # これにより GitHub Actions 環境特有の通信遮断(404誤認)を回避する
+    # ★【唯一の技術的変更点】通信方式を REST に固定 (404/SSLエラー対策)
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"), transport="rest")
     
+    # 接続確認
+    print("🩺 Connectivity Test (REST Mode)...", flush=True)
+    try:
+        model_check = genai.GenerativeModel('gemini-1.5-flash')
+        test_resp = model_check.generate_content("Hello")
+        print(f"✅ Connection OK: {test_resp.text.strip()}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Connection Warning: {e}")
+        
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=['https://www.googleapis.com/auth/drive'])
     drive_service = build('drive', 'v3', credentials=creds)
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+    
 except Exception as e:
     print(f"❌ Init Error: {e}"); sys.exit(1)
 
@@ -64,14 +67,13 @@ def sanitize_id(raw_id):
     match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
     return match.group(1) if match else None
 
-# --- 2. 音声パイプライン (Audio Pipeline) ---
+# --- 2. 音声パイプライン ---
 
 def mix_audio_ffmpeg(file_paths):
     print(f"🎛️ Mixing {len(file_paths)} tracks...", flush=True)
     output_path = os.path.abspath(os.path.join(TEMP_DIR, "final_mix.mp3"))
     inputs = []
     for f in file_paths: inputs.extend(['-i', f])
-    
     filter_part = ['-filter_complex', f'amix=inputs={len(file_paths)}:duration=longest'] if len(file_paths) > 1 else []
     cmd = ['ffmpeg', '-y'] + inputs + filter_part + ['-ac', '1', '-b:a', '64k', output_path]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -85,17 +87,11 @@ def split_audio_ffmpeg(input_path):
     return sorted(glob.glob(os.path.join(TEMP_DIR, "chunk_*.mp3")))
 
 def transcribe_with_groq(chunk_paths):
-    """
-    【無料枠・完全耐久仕様】
-    Rate Limitが来たら、解除されるまで最大50回（計50分以上）粘り強くリトライする。
-    """
     full_transcript = ""
     for chunk in chunk_paths:
         if not chunk.endswith(".mp3"): continue
         print(f"🚀 Groq Transcribing: {os.path.basename(chunk)}", flush=True)
-        
         max_retries = 50
-        
         for attempt in range(max_retries):
             try:
                 with open(chunk, "rb") as file:
@@ -109,23 +105,20 @@ def transcribe_with_groq(chunk_paths):
                 err_str = str(e).lower()
                 if "429" in err_str or "rate limit" in err_str:
                     wait = 70
-                    print(f"⏳ Rate Limit Hit. Waiting {wait}s... (Attempt {attempt+1}/{max_retries})", flush=True)
+                    print(f"⏳ Rate Limit. Waiting {wait}s... ({attempt+1}/{max_retries})", flush=True)
                     time.sleep(wait)
-                else:
-                    raise e
-        else:
-            raise Exception("❌ Rate Limit persists after 50 retries. Aborting.")
-
+                else: raise e
+        else: raise Exception("❌ Rate Limit persists. Aborting.")
     return full_transcript
 
-# --- 3. 知能分析 (Analysis Phase) ---
+# --- 3. 知能分析 (Analysis) ---
 
 def analyze_text_with_gemini(transcript_text):
     print("🧠 Gemini Analyzing (SZ Method)...", flush=True)
     
-    # 安定版モデルを指定。transport="rest" が効いていればこれで通るはず
     model = genai.GenerativeModel('gemini-1.5-flash')
     
+    # ★【根幹復旧】SZメソッドの詳細プロンプトを完全に戻しました
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的かつ冷徹なコーチング記録官です。
     渡された対話ログを精読し、以下の3つのセクションを厳密なフォーマットで出力してください。
@@ -166,17 +159,15 @@ def analyze_text_with_gemini(transcript_text):
     ---
 
     【入力テキスト】
-    {transcript_text[:950000]}
+    {transcript_text}
     """
     
-    # エラー時のデバッグ情報を強化
     try:
         response = model.generate_content(prompt)
         text = response.text.strip()
     except Exception as e:
         print(f"⚠️ Gemini Analysis Failed: {e}")
-        # transport="rest"でも失敗した場合の最終手段としてログを残す
-        return {"student_name": "AnalysisFailed", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Failed: {e}", transcript_text[:2000]
+        return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
     
     def extract(s, e, src):
         m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
@@ -187,10 +178,10 @@ def analyze_text_with_gemini(transcript_text):
     json_str = extract("[JSON_START]", "[JSON_END]", text)
     
     try: data = json.loads(json_str)
-    except: data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Review Logs"}
+    except: data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
     return data, report, time_log
 
-# --- 4. 資産化 (Notion & Drive) ---
+# --- 4. 資産化 ---
 
 def notion_query_student(name):
     db_id = sanitize_id(FINAL_CONTROL_DB_ID)
@@ -220,16 +211,11 @@ def cleanup_drive_file(file_id, rename_to):
     drive_service.files().update(fileId=file_id, addParents=fid, removeParents=prev, body={'name': rename_to}).execute()
     print(f"✅ Drive updated: {rename_to}")
 
-# --- Main Logic ---
-
+# --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v80.0 - REST Mode) ---", flush=True)
-    
+    print("--- SZ AUTO LOGGER ULTIMATE (v83.0 - REST + Core Prompt) ---", flush=True)
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
-    
-    if not files:
-        print("ℹ️ No files found.")
-        return
+    if not files: print("ℹ️ No files."); return
 
     for file in files:
         try:
@@ -250,13 +236,11 @@ def main():
             
             if not srcs: continue
             
-            # Process
             mixed = mix_audio_ffmpeg(srcs)
             chunks = split_audio_ffmpeg(mixed)
             full_text = transcribe_with_groq(chunks)
             meta, report, logs = analyze_text_with_gemini(full_text)
             
-            # Notion
             did, oname = notion_query_student(meta['student_name'])
             if not did: did = FINAL_FALLBACK_DB_ID
             
@@ -269,7 +253,6 @@ def main():
             
             notion_create_page_heavy(sanitize_id(did), props, blocks)
             
-            # Cleanup
             ext = os.path.splitext(file['name'])[1] or ".zip"
             cleanup_drive_file(file['id'], f"{meta['date']}_{oname}{ext}")
 
@@ -278,9 +261,7 @@ def main():
             import traceback; traceback.print_exc()
             print("⛔ システムを緊急停止します。")
             sys.exit(1)
-            
         finally:
             if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

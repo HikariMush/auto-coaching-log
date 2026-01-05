@@ -8,11 +8,10 @@ import glob
 import re
 from datetime import datetime
 
-# --- 0. SDK & 解凍ツールの導入 ---
+# --- 0. SDK & Tools ---
 try:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "google-genai"])
     subprocess.check_call([sys.executable, "-m", "pip", "install", "groq"])
-    # ★【新兵器】万能解凍ライブラリ
     subprocess.check_call([sys.executable, "-m", "pip", "install", "patool"])
 except: pass
 
@@ -24,7 +23,7 @@ from groq import Groq
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import patoolib # ★ここがカギ
+import patoolib
 
 # --- Configuration ---
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664"
@@ -35,7 +34,7 @@ CHUNK_LENGTH = 900  # 15分
 # グローバル変数
 RESOLVED_MODEL_ID = None
 
-# --- 1. 初期化 & モデル選定 (Setup) ---
+# --- 1. 初期化 (Setup) ---
 def setup_env():
     global RESOLVED_MODEL_ID
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
@@ -51,14 +50,7 @@ try:
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
     print("💎 Detecting Best Available Model (Targeting 2.5)...", flush=True)
-    
-    PRIORITY_TARGETS = [
-        "gemini-2.5-flash", 
-        "gemini-2.5-pro",
-        "gemini-2.0-flash", 
-        "gemini-2.0-flash-lite",
-    ]
-    
+    PRIORITY_TARGETS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
     for target in PRIORITY_TARGETS:
         print(f"👉 Testing: [{target}]...", flush=True)
         try:
@@ -66,8 +58,7 @@ try:
             print(f"✅ SUCCESS! Using Model: [{target}]", flush=True)
             RESOLVED_MODEL_ID = target
             break
-        except Exception:
-            continue
+        except Exception: continue
                 
     if not RESOLVED_MODEL_ID:
         RESOLVED_MODEL_ID = "gemini-2.0-flash-lite"
@@ -135,7 +126,6 @@ def transcribe_with_groq(chunk_paths):
 
 def analyze_text_with_gemini(transcript_text):
     print(f"🧠 Gemini Analyzing using [{RESOLVED_MODEL_ID}]...", flush=True)
-    
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的かつ冷徹なコーチング記録官です。
     渡された対話ログを精読し、以下の3つのセクションを厳密なフォーマットで出力してください。
@@ -178,7 +168,6 @@ def analyze_text_with_gemini(transcript_text):
     【入力テキスト】
     {transcript_text}
     """
-    
     max_retries = 10
     for attempt in range(max_retries):
         try:
@@ -192,10 +181,8 @@ def analyze_text_with_gemini(transcript_text):
                 print(f"⏳ Gemini Busy. Waiting {wait}s...", flush=True)
                 time.sleep(wait)
             else:
-                print(f"⚠️ Gemini Failed: {e}")
                 return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
-    else:
-        return {"student_name": "QuotaError", "date": datetime.now().strftime('%Y-%m-%d')}, "Quota Limit Exceeded", transcript_text[:2000]
+    else: return {"student_name": "QuotaError", "date": datetime.now().strftime('%Y-%m-%d')}, "Quota Limit Exceeded", transcript_text[:2000]
     
     def extract(s, e, src):
         m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
@@ -204,44 +191,55 @@ def analyze_text_with_gemini(transcript_text):
     report = extract("[DETAILED_REPORT_START]", "[DETAILED_REPORT_END]", text)
     time_log = extract("[RAW_LOG_START]", "[RAW_LOG_END]", text)
     json_str = extract("[JSON_START]", "[JSON_END]", text)
-    
     try: data = json.loads(json_str)
     except: data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
     return data, report, time_log
 
-# --- 4. 資産化 ---
+# --- 4. 資産化 (Notion Debug Mode) ---
 
 def notion_query_student(name):
     db_id = sanitize_id(FINAL_CONTROL_DB_ID)
     if not db_id: return None, name
     res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=HEADERS, json={"filter": {"property": "Name", "title": {"contains": name}}})
-    d = res.json()
-    if d.get("results"):
-        row = d["results"][0]
+    if res.status_code == 200 and res.json().get("results"):
+        row = res.json()["results"][0]
         n = row["properties"]["Name"]["title"][0]["plain_text"]
         tid = row["properties"]["TargetID"]["rich_text"]
         return (sanitize_id(tid[0]["plain_text"]), n) if tid else (None, n)
     return None, name
 
 def notion_create_page_heavy(db_id, props, children):
+    # ★【修正】エラーを厳密にチェックしてログに出す
+    print(f"📤 Posting to Notion DB: {db_id}...", flush=True)
     res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": props, "children": children[:100]})
-    pid = res.json().get('id')
+    
+    if res.status_code != 200:
+        print(f"❌ NOTION CREATE FAILED: {res.status_code}", flush=True)
+        print(f"   Reason: {res.text}", flush=True)
+        raise Exception(f"Notion Error: {res.text}") # ★ここで処理を中断させる
+        
+    response_data = res.json()
+    pid = response_data.get('id')
+    page_url = response_data.get('url')
+    print(f"🔗 Notion Page Created Successfully: {page_url}", flush=True)
+
     if pid and len(children) > 100:
         for i in range(100, len(children), 100):
-            requests.patch(f"https://api.notion.com/v1/blocks/{pid}/children", headers=HEADERS, json={"children": children[i:i+100]})
+            r2 = requests.patch(f"https://api.notion.com/v1/blocks/{pid}/children", headers=HEADERS, json={"children": children[i:i+100]})
+            if r2.status_code != 200:
+                print(f"⚠️ Partial Content Upload Failed: {r2.text}", flush=True)
 
 def cleanup_drive_file(file_id, rename_to):
     q = f"name='processed_coaching_logs' and '{INBOX_FOLDER_ID}' in parents"
     folders = drive_service.files().list(q=q).execute().get('files', [])
     fid = folders[0]['id'] if folders else drive_service.files().create(body={'name': 'processed_coaching_logs', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]}, fields='id').execute().get('id')
-    
     prev = ",".join(drive_service.files().get(fileId=file_id, fields='parents').execute().get('parents', []))
     drive_service.files().update(fileId=file_id, addParents=fid, removeParents=prev, body={'name': rename_to}).execute()
     print(f"✅ Drive updated: {rename_to}")
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v93.0 - Universal Extractor) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v94.0 - Notion Debug) ---", flush=True)
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     if not files: print("ℹ️ No files."); return
 
@@ -253,26 +251,18 @@ def main():
                 MediaIoBaseDownload(f, drive_service.files().get_media(fileId=file['id'])).next_chunk()
             
             srcs = []
-            if file['name'].endswith('.zip'): # 拡張子がzipの場合
+            if file['name'].endswith('.zip'):
                 try:
-                    # ★【ここが変更点】万能解凍機 patool を使う
-                    # 拡張子が嘘でも、rarでも7zでも自動判別して開ける
                     patoolib.extract_archive(fpath, outdir=TEMP_DIR)
-                    
                     for r, _, fs in os.walk(TEMP_DIR):
                         for af in fs:
                             if af.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')) and 'final_mix' not in af and 'chunk' not in af:
                                 srcs.append(os.path.join(r, af))
-                                
                 except Exception as e:
-                    # さすがに万能ツールでも開けない場合はスキップ
-                    print(f"⚠️ Corrupted Archive (patool failed): {file['name']} - Skipping. ({e})")
-                    continue
+                    print(f"⚠️ Archive Error: {e}"); continue
             else: srcs.append(fpath)
             
-            if not srcs: 
-                print("ℹ️ No audio files found. Skipping.")
-                continue
+            if not srcs: print("ℹ️ No audio files."); continue
             
             mixed = mix_audio_ffmpeg(srcs)
             chunks = split_audio_ffmpeg(mixed)
@@ -280,7 +270,9 @@ def main():
             meta, report, logs = analyze_text_with_gemini(full_text)
             
             did, oname = notion_query_student(meta['student_name'])
-            if not did: did = FINAL_FALLBACK_DB_ID
+            if not did: 
+                print("ℹ️ Student not found in Control DB. Using Fallback DB.")
+                did = FINAL_FALLBACK_DB_ID
             
             props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {oname} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
             content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
@@ -289,8 +281,10 @@ def main():
                 if line.strip():
                     blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
             
+            # ★ここでエラーなら止まる
             notion_create_page_heavy(sanitize_id(did), props, blocks)
             
+            # 成功した場合のみここに来る
             ext = os.path.splitext(file['name'])[1] or ".zip"
             cleanup_drive_file(file['id'], f"{meta['date']}_{oname}{ext}")
 
@@ -298,7 +292,6 @@ def main():
             print(f"❌ Error processing {file['name']}: {e}")
             import traceback; traceback.print_exc()
             continue
-            
         finally:
             if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
 

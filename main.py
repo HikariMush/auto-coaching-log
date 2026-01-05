@@ -307,4 +307,36 @@ def main():
                         for af in fs:
                             if af.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')) and 'final_mix' not in af and 'chunk' not in af:
                                 srcs.append(os.path.join(r, af))
-            else
+            else: srcs.append(fpath)
+            
+            if not srcs: continue
+            
+            mixed = mix_audio_ffmpeg(srcs)
+            chunks = split_audio_ffmpeg(mixed)
+            full_text = transcribe_with_groq(chunks)
+            meta, report, logs = analyze_text_with_gemini(full_text)
+            
+            did, oname = notion_query_student(meta['student_name'])
+            if not did: did = FINAL_FALLBACK_DB_ID
+            
+            props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {oname} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
+            content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
+            blocks = []
+            for line in content.split('\n'):
+                if line.strip():
+                    blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
+            
+            notion_create_page_heavy(sanitize_id(did), props, blocks)
+            
+            ext = os.path.splitext(file['name'])[1] or ".zip"
+            cleanup_drive_file(file['id'], f"{meta['date']}_{oname}{ext}")
+
+        except Exception as e:
+            print(f"❌ CRITICAL ERROR on {file['name']}: {e}")
+            import traceback; traceback.print_exc()
+            print("⛔ システムを緊急停止します。")
+            sys.exit(1)
+        finally:
+            if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
+
+if __name__ == "__main__": main()

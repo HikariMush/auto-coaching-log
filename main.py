@@ -130,7 +130,7 @@ def analyze_text_with_gemini(transcript_text):
     """
     print("🧠 Gemini Analyzing (SZ Method - 5 Elements)...", flush=True)
     # モデル名を明示的なバージョンに変更
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    model = genai.GenerativeModel('gemini-1.5-flash')
     
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的かつ冷徹なコーチング記録官です。

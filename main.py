@@ -33,8 +33,9 @@ CHUNK_LENGTH = 900  # 15分
 # グローバル変数
 RESOLVED_MODEL_ID = None
 
-# --- 1. 初期化 & 徹底診断 (Setup & Deep Scan) ---
+# --- 1. 初期化 & モデル選定 (Setup & Select) ---
 def setup_env():
+    global RESOLVED_MODEL_ID
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
     if os.getenv("GCP_SA_KEY"):
@@ -47,67 +48,40 @@ try:
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
-    print("📋 Listing ALL available models for your API Key...", flush=True)
+    print("💎 Detecting Best Available Model (Targeting 2.5)...", flush=True)
     
-    # ★【現実直視】APIキーで見えている全モデルをリストアップする
-    try:
-        all_models = list(gemini_client.models.list())
-        model_names = [m.name for m in all_models]
-        # models/ を除去して見やすく
-        clean_names = [n.replace('models/', '') for n in model_names]
-        print(f"👀 Your Key sees: {clean_names}", flush=True)
-        
-        # 優先順位リスト (1.5 Flash -> 1.5 Pro -> 1.0 Pro)
-        PRIORITY_LIST = [
-            "gemini-1.5-flash", 
-            "gemini-1.5-flash-001",
-            "gemini-1.5-flash-002",
-            "gemini-1.5-flash-latest",
-            "gemini-1.5-pro",
-            "gemini-1.5-pro-001",
-            "gemini-1.0-pro", # 最終手段
-            "gemini-pro"
-        ]
-        
-        target = None
-        for p in PRIORITY_LIST:
-            # リストの中に部分一致するものがあるか探す
-            if any(p in available for available in clean_names):
-                target = p
-                print(f"✅ Best Match Found: [{target}]", flush=True)
-                break
-        
-        if target:
+    # ★【最強構成】2.5系を最優先にする
+    # Quota制限にかかった場合のみ、2.0 -> Lite へとダウングレードする
+    PRIORITY_TARGETS = [
+        "gemini-2.5-flash",       # 本命: 最新鋭・最高性能
+        "gemini-2.5-pro",         # 対抗: 賢いが遅い/制限きついかも
+        "gemini-2.0-flash",       # 安定: 2.5がダメだった場合の保険
+        "gemini-2.0-flash-lite",  # 軽量: 最終防衛ライン
+    ]
+    
+    # 疎通確認ループ
+    for target in PRIORITY_TARGETS:
+        print(f"👉 Testing: [{target}]...", flush=True)
+        try:
+            gemini_client.models.generate_content(
+                model=target,
+                contents="Hello"
+            )
+            print(f"✅ SUCCESS! Using Model: [{target}]", flush=True)
             RESOLVED_MODEL_ID = target
-        else:
-            # リスト取得に失敗したり空だった場合のバックアップ（2.0系など）
-            print("⚠️ No standard models found in list. Trying direct connection...", flush=True)
-            RESOLVED_MODEL_ID = "gemini-1.5-flash" # 強行突破
-            
-    except Exception as e:
-        print(f"⚠️ Failed to list models: {e}")
-        print("👉 Defaulting to 'gemini-1.5-flash' and praying...")
-        RESOLVED_MODEL_ID = "gemini-1.5-flash"
-
-    # 確定したモデルで接続テスト
-    print(f"🩺 Final Connectivity Test: [{RESOLVED_MODEL_ID}]", flush=True)
-    try:
-        gemini_client.models.generate_content(
-            model=RESOLVED_MODEL_ID,
-            contents="Hello"
-        )
-        print("✅ Connection Confirmed.", flush=True)
-    except Exception as e:
-        err = str(e).lower()
-        if "429" in err or "quota" in err:
-            print("❌ Quota Exceeded (Free Tier limit).")
-            # 429でもモデル自体は合ってるので続行させる（待機ロジックへ）
-        elif "404" in err:
-             print("❌ 404 Not Found. This Project CANNOT use this model.")
-             print("💡 ACTION: Create a NEW API Key in a NEW Project at Google AI Studio.")
-             sys.exit(1)
-        else:
-            print(f"⚠️ Warning: {e}")
+            break
+        except Exception as e:
+            err = str(e).lower()
+            if "429" in err or "quota" in err or "resource_exhausted" in err:
+                print(f"   ⚠️ Quota Limit (429) on [{target}]. Skipping...", flush=True)
+            elif "404" in err:
+                print(f"   ❌ Not Found ({target}). Skipping...", flush=True)
+            else:
+                print(f"   ❌ Error ({target}): {str(e)[:50]}...", flush=True)
+                
+    if not RESOLVED_MODEL_ID:
+        print("💀 All priority models failed. Forcing fallback to 'gemini-2.0-flash-lite'...")
+        RESOLVED_MODEL_ID = "gemini-2.0-flash-lite"
 
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
@@ -215,7 +189,7 @@ def analyze_text_with_gemini(transcript_text):
     {transcript_text}
     """
     
-    max_retries = 15 # 待機回数を増量
+    max_retries = 10
     for attempt in range(max_retries):
         try:
             response = gemini_client.models.generate_content(
@@ -227,16 +201,11 @@ def analyze_text_with_gemini(transcript_text):
             
         except Exception as e:
             err_str = str(e).lower()
-            # 429/Quotaエラーなら待機
-            if "429" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
+            # 429/Quota/Overloaded なら待機
+            if "429" in err_str or "quota" in err_str or "resource_exhausted" in err_str or "overloaded" in err_str:
                 wait = 60 * (attempt + 1)
-                print(f"⏳ Gemini Quota Limit ({RESOLVED_MODEL_ID}). Waiting {wait}s... ({attempt+1}/{max_retries})", flush=True)
+                print(f"⏳ Gemini Busy ({RESOLVED_MODEL_ID}). Waiting {wait}s... ({attempt+1}/{max_retries})", flush=True)
                 time.sleep(wait)
-            # 503 Service Unavailable も一時的なので待機
-            elif "503" in err_str or "service unavailable" in err_str:
-                 wait = 30
-                 print(f"⏳ Service Busy (503). Waiting {wait}s...", flush=True)
-                 time.sleep(wait)
             else:
                 print(f"⚠️ Gemini Analysis Failed: {e}")
                 return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
@@ -288,7 +257,7 @@ def cleanup_drive_file(file_id, rename_to):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v89.0 - Reality Check) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v91.0 - God Speed) ---", flush=True)
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     if not files: print("ℹ️ No files."); return
 

@@ -2,7 +2,7 @@ name: Auto Coaching Log
 
 on:
   schedule:
-    - cron: '*/30 0-15 * * *'
+    - cron: '*/30 0-15 * * *' # 日本時間 9:00 - 24:00 の間、30分ごとにチェック
   workflow_dispatch:
     inputs:
       target_student:
@@ -13,7 +13,8 @@ on:
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 20 # 念のため制限時間を設定
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -23,7 +24,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # キャッシュの利用（これで2回目以降のインストールは爆速になります）
+      # キャッシュ設定（高速化）
       - name: Cache pip packages
         uses: actions/cache@v3
         with:
@@ -32,19 +33,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # FFmpegは毎回入れますが、数秒〜十数秒のコストは許容します（安定性重視）
+      # FFmpegのインストール（音声分割に必須）
       - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      # 必要なライブラリを一括インストール
+      # ライブラリのインストール
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # スクリプト実行（ファイルがない場合はここで即座に "No new files" で終了します）
+      # スクリプト実行
       - name: Run script
         env:
+          # ★ここが重要：Groqのキーを追加しました
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }} 
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}

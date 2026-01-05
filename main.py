@@ -30,10 +30,10 @@ FINAL_FALLBACK_DB_ID = "2b71bc8521e38018a5c3c4b0c6b6627c"
 TEMP_DIR = "temp_workspace"
 CHUNK_LENGTH = 900  # 15分
 
-# グローバル変数: 確定したモデルID
+# グローバル変数
 RESOLVED_MODEL_ID = None
 
-# --- 1. 初期化 & モデルハンティング (Setup & Hunt) ---
+# --- 1. 初期化 & 徹底診断 (Setup & Deep Scan) ---
 def setup_env():
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
@@ -47,43 +47,67 @@ try:
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
-    print("🔫 Starting Model Hunter (Target: Flash variants)...", flush=True)
+    print("📋 Listing ALL available models for your API Key...", flush=True)
     
-    # ★【戦略的修正】Flash系のあらゆる別名を総当たりで試す
-    # ProはQuota(無料枠)が即死するため除外。Flashのみを狙う。
-    CANDIDATES = [
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-001",
-        "gemini-1.5-flash-002",
-        "gemini-1.5-flash-latest",
-        "models/gemini-1.5-flash",
-        "gemini-2.0-flash-exp", # 最新の実験版（無料枠が別カウントの可能性あり）
-    ]
-    
-    found_model = None
-    
-    for candidate in CANDIDATES:
-        print(f"👉 Testing candidate: [{candidate}]...", flush=True)
-        try:
-            # 軽い挨拶で導通確認
-            gemini_client.models.generate_content(
-                model=candidate,
-                contents="Hello"
-            )
-            print(f"✅ HIT! Model found and working: [{candidate}]", flush=True)
-            found_model = candidate
-            break
-        except Exception as e:
-            err_str = str(e)
-            # 404なら「名前違い」なので次へ。Quotaエラーなら「枠切れ」なので次へ。
-            print(f"   ❌ Failed ({candidate}): {err_str[:100]}...", flush=True)
-            continue
+    # ★【現実直視】APIキーで見えている全モデルをリストアップする
+    try:
+        all_models = list(gemini_client.models.list())
+        model_names = [m.name for m in all_models]
+        # models/ を除去して見やすく
+        clean_names = [n.replace('models/', '') for n in model_names]
+        print(f"👀 Your Key sees: {clean_names}", flush=True)
+        
+        # 優先順位リスト (1.5 Flash -> 1.5 Pro -> 1.0 Pro)
+        PRIORITY_LIST = [
+            "gemini-1.5-flash", 
+            "gemini-1.5-flash-001",
+            "gemini-1.5-flash-002",
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-pro",
+            "gemini-1.5-pro-001",
+            "gemini-1.0-pro", # 最終手段
+            "gemini-pro"
+        ]
+        
+        target = None
+        for p in PRIORITY_LIST:
+            # リストの中に部分一致するものがあるか探す
+            if any(p in available for available in clean_names):
+                target = p
+                print(f"✅ Best Match Found: [{target}]", flush=True)
+                break
+        
+        if target:
+            RESOLVED_MODEL_ID = target
+        else:
+            # リスト取得に失敗したり空だった場合のバックアップ（2.0系など）
+            print("⚠️ No standard models found in list. Trying direct connection...", flush=True)
+            RESOLVED_MODEL_ID = "gemini-1.5-flash" # 強行突破
             
-    if found_model:
-        RESOLVED_MODEL_ID = found_model
-    else:
-        print("💀 All Flash candidates failed. Cannot proceed without Free Tier model.")
-        sys.exit(1)
+    except Exception as e:
+        print(f"⚠️ Failed to list models: {e}")
+        print("👉 Defaulting to 'gemini-1.5-flash' and praying...")
+        RESOLVED_MODEL_ID = "gemini-1.5-flash"
+
+    # 確定したモデルで接続テスト
+    print(f"🩺 Final Connectivity Test: [{RESOLVED_MODEL_ID}]", flush=True)
+    try:
+        gemini_client.models.generate_content(
+            model=RESOLVED_MODEL_ID,
+            contents="Hello"
+        )
+        print("✅ Connection Confirmed.", flush=True)
+    except Exception as e:
+        err = str(e).lower()
+        if "429" in err or "quota" in err:
+            print("❌ Quota Exceeded (Free Tier limit).")
+            # 429でもモデル自体は合ってるので続行させる（待機ロジックへ）
+        elif "404" in err:
+             print("❌ 404 Not Found. This Project CANNOT use this model.")
+             print("💡 ACTION: Create a NEW API Key in a NEW Project at Google AI Studio.")
+             sys.exit(1)
+        else:
+            print(f"⚠️ Warning: {e}")
 
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
@@ -137,13 +161,13 @@ def transcribe_with_groq(chunk_paths):
                 err_str = str(e).lower()
                 if "429" in err_str or "rate limit" in err_str:
                     wait = 70
-                    print(f"⏳ Rate Limit. Waiting {wait}s... ({attempt+1}/{max_retries})", flush=True)
+                    print(f"⏳ Groq Limit. Waiting {wait}s... ({attempt+1}/{max_retries})", flush=True)
                     time.sleep(wait)
                 else: raise e
         else: raise Exception("❌ Rate Limit persists. Aborting.")
     return full_transcript
 
-# --- 3. 知能分析 (Analysis - Dynamic) ---
+# --- 3. 知能分析 (Analysis) ---
 
 def analyze_text_with_gemini(transcript_text):
     print(f"🧠 Gemini Analyzing using [{RESOLVED_MODEL_ID}]...", flush=True)
@@ -191,16 +215,34 @@ def analyze_text_with_gemini(transcript_text):
     {transcript_text}
     """
     
-    try:
-        response = gemini_client.models.generate_content(
-            model=RESOLVED_MODEL_ID,
-            contents=prompt
-        )
-        text = response.text.strip()
-        
-    except Exception as e:
-        print(f"⚠️ Gemini Analysis Failed: {e}")
-        return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
+    max_retries = 15 # 待機回数を増量
+    for attempt in range(max_retries):
+        try:
+            response = gemini_client.models.generate_content(
+                model=RESOLVED_MODEL_ID,
+                contents=prompt
+            )
+            text = response.text.strip()
+            break 
+            
+        except Exception as e:
+            err_str = str(e).lower()
+            # 429/Quotaエラーなら待機
+            if "429" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
+                wait = 60 * (attempt + 1)
+                print(f"⏳ Gemini Quota Limit ({RESOLVED_MODEL_ID}). Waiting {wait}s... ({attempt+1}/{max_retries})", flush=True)
+                time.sleep(wait)
+            # 503 Service Unavailable も一時的なので待機
+            elif "503" in err_str or "service unavailable" in err_str:
+                 wait = 30
+                 print(f"⏳ Service Busy (503). Waiting {wait}s...", flush=True)
+                 time.sleep(wait)
+            else:
+                print(f"⚠️ Gemini Analysis Failed: {e}")
+                return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
+    else:
+        print("❌ Gemini Quota: Gave up after retries.")
+        return {"student_name": "QuotaError", "date": datetime.now().strftime('%Y-%m-%d')}, "Quota Limit Exceeded", transcript_text[:2000]
     
     def extract(s, e, src):
         m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
@@ -246,7 +288,7 @@ def cleanup_drive_file(file_id, rename_to):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v87.0 - Model Hunter) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v89.0 - Reality Check) ---", flush=True)
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     if not files: print("ℹ️ No files."); return
 
@@ -265,36 +307,4 @@ def main():
                         for af in fs:
                             if af.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')) and 'final_mix' not in af and 'chunk' not in af:
                                 srcs.append(os.path.join(r, af))
-            else: srcs.append(fpath)
-            
-            if not srcs: continue
-            
-            mixed = mix_audio_ffmpeg(srcs)
-            chunks = split_audio_ffmpeg(mixed)
-            full_text = transcribe_with_groq(chunks)
-            meta, report, logs = analyze_text_with_gemini(full_text)
-            
-            did, oname = notion_query_student(meta['student_name'])
-            if not did: did = FINAL_FALLBACK_DB_ID
-            
-            props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {oname} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
-            content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
-            blocks = []
-            for line in content.split('\n'):
-                if line.strip():
-                    blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
-            
-            notion_create_page_heavy(sanitize_id(did), props, blocks)
-            
-            ext = os.path.splitext(file['name'])[1] or ".zip"
-            cleanup_drive_file(file['id'], f"{meta['date']}_{oname}{ext}")
-
-        except Exception as e:
-            print(f"❌ CRITICAL ERROR on {file['name']}: {e}")
-            import traceback; traceback.print_exc()
-            print("⛔ システムを緊急停止します。")
-            sys.exit(1)
-        finally:
-            if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
-
-if __name__ == "__main__": main()
+            else

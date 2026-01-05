@@ -64,13 +64,12 @@ def run_ffmpeg(cmd):
         raise
 
 def mix_audio_ffmpeg(file_paths):
-    """FLAC等のファイルを統合・軽量MP3化する"""
+    """FLAC等のファイルを統合し、確実にMP3(64k)へ変換する"""
     print(f"🎛️ Mixing/Converting {len(file_paths)} tracks...", flush=True)
     output_path = os.path.join(TEMP_DIR, "mixed_full.mp3")
     inputs = []
     for f in file_paths: inputs.extend(['-i', f])
     
-    # 複数ならamix、1つなら単一変換。出力は必ずmp3(64k)に固定
     if len(file_paths) > 1:
         filter_cmd = f"amix=inputs={len(file_paths)}:duration=longest"
         cmd = ['ffmpeg', '-y'] + inputs + ['-filter_complex', filter_cmd, '-ac', '1', '-b:a', '64k', output_path]
@@ -81,10 +80,9 @@ def mix_audio_ffmpeg(file_paths):
     return output_path
 
 def split_audio_ffmpeg(input_path):
-    """API制限回避のため15分(900秒)ごとに分割。ここでもmp3を維持"""
+    """API制限回避のため15分ごとに分割。mp3形式を保証"""
     print("🔪 Splitting into MP3 chunks...", flush=True)
     output_pattern = os.path.join(TEMP_DIR, "chunk_%03d.mp3")
-    # -c copyを使わず再エンコードすることでmp3形式を保証
     cmd = ['ffmpeg', '-y', '-i', input_path, '-f', 'segment', '-segment_time', str(CHUNK_LENGTH), '-ac', '1', '-b:a', '64k', output_pattern]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return sorted(glob.glob(os.path.join(TEMP_DIR, "chunk_*.mp3")))
@@ -107,7 +105,7 @@ def analyze_text_with_gemini(transcript_text):
     print("🧠 Analyzing text with Gemini...", flush=True)
     model = genai.GenerativeModel('gemini-1.5-flash')
     prompt = f"""
-   あなたは**トップ・スマブラアナリスト**です。
+    あなたは**トップ・スマブラアナリスト**です。
     以下は、コーチ(Hikari)とクライアントの対話ログ（文字起こし済みテキスト）です。
 
     【指令】
@@ -164,25 +162,30 @@ def notion_create_page_heavy(db_id, props, all_children):
         for i in range(100, len(all_children), 100):
             requests.patch(f"https://api.notion.com/v1/blocks/{page_id}/children", headers=HEADERS, json={"children": all_children[i:i+100]})
 
-# --- Drive Integration (リネーム機能強化) ---
+# --- Drive Integration ---
 def cleanup_drive_file(file_id, rename_to=None):
     folder_name = "processed_coaching_logs"
-    q = f"name='{folder_name}' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
-    folders = drive_service.files().list(q=q).execute().get('files', [])
-    target_folder_id = folders[0]['id'] if folders else drive_service.files().create(body={'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]}, fields='id').execute().get('id')
-    
-    file = drive_service.files().get(fileId=file_id, fields='parents').execute()
-    prev_parents = ",".join(file.get('parents', []))
-   def cleanup_drive_file(file_id, rename_to=None):
-    # (中略: フォルダ取得ロジック)
-    body = {'name': rename_to} if rename_to else {}
-    drive_service.files().update(
-        fileId=file_id, 
-        addParents=target_folder_id, 
-        removeParents=prev_parents, 
-        body=body
-    ).execute()
-    print(f"➡️ File moved and renamed to: {rename_to}", flush=True)
+    try:
+        q = f"name='{folder_name}' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
+        folders = drive_service.files().list(q=q).execute().get('files', [])
+        target_folder_id = folders[0]['id'] if folders else drive_service.files().create(
+            body={'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]},
+            fields='id'
+        ).execute().get('id')
+        
+        file_meta = drive_service.files().get(fileId=file_id, fields='parents').execute()
+        prev_parents = ",".join(file_meta.get('parents', []))
+        
+        update_body = {'name': rename_to} if rename_to else {}
+        drive_service.files().update(
+            fileId=file_id, 
+            addParents=target_folder_id, 
+            removeParents=prev_parents, 
+            body=update_body
+        ).execute()
+        print(f"➡️ File moved and renamed to: {rename_to}", flush=True)
+    except Exception as e:
+        print(f"⚠️ Drive Cleanup Error: {e}")
 
 # --- Main Logic ---
 def main():
@@ -214,40 +217,36 @@ def main():
 
             if not audios: continue
             
-            # Pipeline
             mixed = mix_audio_ffmpeg(audios)
             chunks = split_audio_ffmpeg(mixed)
             full_text = transcribe_with_groq(chunks)
             meta, report = analyze_text_with_gemini(full_text)
             
-            # Target ID & Name Resolution
             dest_id, official_name = notion_query_student(meta['student_name'])
             if not dest_id: 
                 dest_id = FINAL_FALLBACK_DB_ID
                 print(f"⚠️ Student not found. Using Fallback.")
             
-            # Notion Write
             props = {
                 "名前": {"title": [{"text": {"content": f"{meta['date']} {official_name} ログ"}}]}, 
                 "日付": {"date": {"start": meta['date']}}
             }
             blocks = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:2000]}}]}} for line in (report + "\n" + full_text).split('\n') if line.strip()]
             notion_create_page_heavy(sanitize_id(dest_id), props, blocks)
-            
-            # Step: Driveリネーム用の名前を作成
+
+            # Driveリネーム用の名前を作成 (日付_正式生徒名.zip)
             ext = os.path.splitext(file['name'])[1] or ".zip"
-            # meta['date'] と official_name を組み合わせてファイル名を決定
-            new_name = f"{meta['date']}_{official_name}{ext}"
+            target_filename = f"{meta['date']}_{official_name}{ext}"
             
-            # 既存のcleanup_drive_file(file['id']) を以下に変更
-            cleanup_drive_file(file['id'], rename_to=new_name)
+            # リネームと移動を実行
+            cleanup_drive_file(file['id'], rename_to=target_filename)
             
         except Exception as e:
             print(f"❌ Error on {file['name']}: {e}")
             import traceback
             traceback.print_exc()
         finally:
-            if os.path.exists(TEMP_DIR): 
+            if os.path.exists(TEMP_DIR):
                 shutil.rmtree(TEMP_DIR)
                 os.makedirs(TEMP_DIR)
 

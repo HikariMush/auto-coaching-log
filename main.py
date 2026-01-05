@@ -64,22 +64,29 @@ def run_ffmpeg(cmd):
         raise
 
 def mix_audio_ffmpeg(file_paths):
-    print(f"🎛️ Mixing {len(file_paths)} tracks...", flush=True)
+    """FLAC等のファイルを統合・軽量MP3化する"""
+    print(f"🎛️ Mixing/Converting {len(file_paths)} tracks...", flush=True)
     output_path = os.path.join(TEMP_DIR, "mixed_full.mp3")
     inputs = []
     for f in file_paths: inputs.extend(['-i', f])
+    
+    # 複数ならamix、1つなら単一変換。出力は必ずmp3(64k)に固定
     if len(file_paths) > 1:
         filter_cmd = f"amix=inputs={len(file_paths)}:duration=longest"
         cmd = ['ffmpeg', '-y'] + inputs + ['-filter_complex', filter_cmd, '-ac', '1', '-b:a', '64k', output_path]
     else:
         cmd = ['ffmpeg', '-y', '-i', file_paths[0], '-ac', '1', '-b:a', '64k', output_path]
-    run_ffmpeg(cmd)
+    
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return output_path
 
 def split_audio_ffmpeg(input_path):
+    """API制限回避のため15分(900秒)ごとに分割。ここでもmp3を維持"""
+    print("🔪 Splitting into MP3 chunks...", flush=True)
     output_pattern = os.path.join(TEMP_DIR, "chunk_%03d.mp3")
-    cmd = ['ffmpeg', '-y', '-i', input_path, '-f', 'segment', '-segment_time', str(CHUNK_LENGTH), '-c', 'copy', output_pattern]
-    run_ffmpeg(cmd)
+    # -c copyを使わず再エンコードすることでmp3形式を保証
+    cmd = ['ffmpeg', '-y', '-i', input_path, '-f', 'segment', '-segment_time', str(CHUNK_LENGTH), '-ac', '1', '-b:a', '64k', output_pattern]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return sorted(glob.glob(os.path.join(TEMP_DIR, "chunk_*.mp3")))
 
 # --- Transcription ---
@@ -166,8 +173,15 @@ def cleanup_drive_file(file_id, rename_to=None):
     
     file = drive_service.files().get(fileId=file_id, fields='parents').execute()
     prev_parents = ",".join(file.get('parents', []))
+   def cleanup_drive_file(file_id, rename_to=None):
+    # (中略: フォルダ取得ロジック)
     body = {'name': rename_to} if rename_to else {}
-    drive_service.files().update(fileId=file_id, addParents=target_folder_id, removeParents=prev_parents, body=body).execute()
+    drive_service.files().update(
+        fileId=file_id, 
+        addParents=target_folder_id, 
+        removeParents=prev_parents, 
+        body=body
+    ).execute()
     print(f"➡️ File moved and renamed to: {rename_to}", flush=True)
 
 # --- Main Logic ---
@@ -220,9 +234,12 @@ def main():
             blocks = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:2000]}}]}} for line in (report + "\n" + full_text).split('\n') if line.strip()]
             notion_create_page_heavy(sanitize_id(dest_id), props, blocks)
             
-            # Drive リネーム & 移動
+            # Step: Driveリネーム用の名前を作成
             ext = os.path.splitext(file['name'])[1] or ".zip"
+            # meta['date'] と official_name を組み合わせてファイル名を決定
             new_name = f"{meta['date']}_{official_name}{ext}"
+            
+            # 既存のcleanup_drive_file(file['id']) を以下に変更
             cleanup_drive_file(file['id'], rename_to=new_name)
             
         except Exception as e:

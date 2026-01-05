@@ -336,16 +336,17 @@ def main():
             new_name = f"{meta.get('date', 'Unknown')}_{off_name}{ext}"
             cleanup_drive_file(file['id'], rename_to=new_name)
 
-        except Exception as e:
-            print(f"❌ Error: {e}")
+except Exception as e:
+            print(f"❌ Critical Error on {file['name']}: {e}")
             import traceback
             traceback.print_exc()
             
+            print("⛔ システムエラーが発生したため、処理を緊急停止します。")
+            sys.exit(1)  # <--- これを追加！Pythonプロセスごと強制終了させます
+            
         finally:
-            # [原子性] 毎回フォルダを消して次のループへ
             if os.path.exists(TEMP_DIR):
                 shutil.rmtree(TEMP_DIR)
-                os.makedirs(TEMP_DIR)
-
+                # os.makedirs(TEMP_DIR) # 停止するなら再作成も不要ですが、あっても害はない
 if __name__ == "__main__":
     main()

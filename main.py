@@ -9,20 +9,24 @@ import re
 from datetime import datetime
 
 # --- 0. 環境の強制正規化 (Environment Force Update) ---
-# GitHub Actionsのキャッシュ汚染対策として、実行時に最新ライブラリを強制インストール
+# 実行時にライブラリを強制更新し、環境差異をなくす
 try:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "google-generativeai>=0.7.2"])
-except:
-    pass
+except Exception as e:
+    print(f"⚠️ Pip install warning: {e}")
 
 # --- Libraries ---
 import requests
+# ライブラリロード
 import google.generativeai as genai
 from groq import Groq
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 import zipfile
+
+# ★バージョン確認（ログで事実確認するため）
+print(f"📦 Google Generative AI Version: {genai.__version__}", flush=True)
 
 # --- Configuration ---
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664"
@@ -42,7 +46,11 @@ setup_env()
 
 try:
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    
+    # ★【根本対策】通信方式を gRPC から REST に変更
+    # これにより GitHub Actions 環境特有の通信遮断(404誤認)を回避する
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"), transport="rest")
+    
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=['https://www.googleapis.com/auth/drive'])
@@ -86,7 +94,6 @@ def transcribe_with_groq(chunk_paths):
         if not chunk.endswith(".mp3"): continue
         print(f"🚀 Groq Transcribing: {os.path.basename(chunk)}", flush=True)
         
-        # 修正: 回数を大幅増量
         max_retries = 50
         
         for attempt in range(max_retries):
@@ -101,14 +108,12 @@ def transcribe_with_groq(chunk_paths):
             except Exception as e:
                 err_str = str(e).lower()
                 if "429" in err_str or "rate limit" in err_str:
-                    # 修正: 待機時間を「一律60秒 + α」に変更して、長時間待機を安定させる
-                    wait = 70 
+                    wait = 70
                     print(f"⏳ Rate Limit Hit. Waiting {wait}s... (Attempt {attempt+1}/{max_retries})", flush=True)
                     time.sleep(wait)
                 else:
                     raise e
         else:
-            # 50回(約1時間)待ってもダメなら流石に諦める
             raise Exception("❌ Rate Limit persists after 50 retries. Aborting.")
 
     return full_transcript
@@ -117,10 +122,10 @@ def transcribe_with_groq(chunk_paths):
 
 def analyze_text_with_gemini(transcript_text):
     print("🧠 Gemini Analyzing (SZ Method)...", flush=True)
-    # バージョン問題解決済みのモデル名を指定
+    
+    # 安定版モデルを指定。transport="rest" が効いていればこれで通るはず
     model = genai.GenerativeModel('gemini-1.5-flash')
     
-    # 【重要】要約せず、SZメソッドの全容を記述したプロンプト
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的かつ冷徹なコーチング記録官です。
     渡された対話ログを精読し、以下の3つのセクションを厳密なフォーマットで出力してください。
@@ -164,8 +169,14 @@ def analyze_text_with_gemini(transcript_text):
     {transcript_text[:950000]}
     """
     
-    response = model.generate_content(prompt)
-    text = response.text.strip()
+    # エラー時のデバッグ情報を強化
+    try:
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+    except Exception as e:
+        print(f"⚠️ Gemini Analysis Failed: {e}")
+        # transport="rest"でも失敗した場合の最終手段としてログを残す
+        return {"student_name": "AnalysisFailed", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Failed: {e}", transcript_text[:2000]
     
     def extract(s, e, src):
         m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
@@ -212,7 +223,7 @@ def cleanup_drive_file(file_id, rename_to):
 # --- Main Logic ---
 
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v79.0) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v80.0 - REST Mode) ---", flush=True)
     
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     
@@ -227,7 +238,6 @@ def main():
             with open(fpath, "wb") as f:
                 MediaIoBaseDownload(f, drive_service.files().get_media(fileId=file['id'])).next_chunk()
             
-            # Source Filter
             srcs = []
             if file['name'].endswith('.zip'):
                 with zipfile.ZipFile(fpath, 'r') as z:
@@ -240,7 +250,7 @@ def main():
             
             if not srcs: continue
             
-            # Process with Smart Retry
+            # Process
             mixed = mix_audio_ffmpeg(srcs)
             chunks = split_audio_ffmpeg(mixed)
             full_text = transcribe_with_groq(chunks)
@@ -264,7 +274,6 @@ def main():
             cleanup_drive_file(file['id'], f"{meta['date']}_{oname}{ext}")
 
         except Exception as e:
-            # 【緊急停止】致命的なエラー時のみ発動
             print(f"❌ CRITICAL ERROR on {file['name']}: {e}")
             import traceback; traceback.print_exc()
             print("⛔ システムを緊急停止します。")

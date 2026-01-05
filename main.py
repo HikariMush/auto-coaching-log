@@ -17,6 +17,7 @@ except: pass
 # --- Libraries ---
 import requests
 from google import genai 
+from google.genai import types
 from groq import Groq
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -29,10 +30,10 @@ FINAL_FALLBACK_DB_ID = "2b71bc8521e38018a5c3c4b0c6b6627c"
 TEMP_DIR = "temp_workspace"
 CHUNK_LENGTH = 900  # 15分
 
-# グローバル変数: 自動特定したモデルIDを格納
-RESOLVED_MODEL_ID = None 
+# グローバル変数: 確定したモデルID
+RESOLVED_MODEL_ID = None
 
-# --- 1. 初期化 & モデル自動特定 (Setup & Auto-Discovery) ---
+# --- 1. 初期化 & モデルハンティング (Setup & Hunt) ---
 def setup_env():
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
@@ -44,50 +45,46 @@ setup_env()
 
 try:
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    
-    # Gemini Client
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
-    print("🔍 Auto-Discovering Available Gemini Models...", flush=True)
+    print("🔫 Starting Model Hunter (Target: Flash variants)...", flush=True)
     
-    # ★【新機能】利用可能なモデルを動的に検索して決定する
-    try:
-        # モデル一覧を取得
-        models_pager = gemini_client.models.list()
-        available_models = [m.name for m in models_pager]
-        
-        print(f"📋 Available Models Found: {available_models}", flush=True)
-        
-        # 優先順位: 1.5-flash -> 1.5-pro -> 1.0-pro -> その他
-        target_model = None
-        
-        # 検索ロジック (名前の一部が一致するものを探す)
-        for candidate in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro', 'gemini-1.0-pro']:
-            # 完全一致または models/xxxxx 形式での一致を探す
-            match = next((m for m in available_models if candidate in m), None)
-            if match:
-                target_model = match
-                # models/ プレフィックスがついている場合、SDKによってはそれを嫌うことがあるので除去版も考慮
-                if target_model.startswith('models/'):
-                    target_model = target_model.replace('models/', '')
-                break
-        
-        if target_model:
-            RESOLVED_MODEL_ID = target_model
-            print(f"✅ Model Auto-Selected: [{RESOLVED_MODEL_ID}]", flush=True)
+    # ★【戦略的修正】Flash系のあらゆる別名を総当たりで試す
+    # ProはQuota(無料枠)が即死するため除外。Flashのみを狙う。
+    CANDIDATES = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-001",
+        "gemini-1.5-flash-002",
+        "gemini-1.5-flash-latest",
+        "models/gemini-1.5-flash",
+        "gemini-2.0-flash-exp", # 最新の実験版（無料枠が別カウントの可能性あり）
+    ]
+    
+    found_model = None
+    
+    for candidate in CANDIDATES:
+        print(f"👉 Testing candidate: [{candidate}]...", flush=True)
+        try:
+            # 軽い挨拶で導通確認
+            gemini_client.models.generate_content(
+                model=candidate,
+                contents="Hello"
+            )
+            print(f"✅ HIT! Model found and working: [{candidate}]", flush=True)
+            found_model = candidate
+            break
+        except Exception as e:
+            err_str = str(e)
+            # 404なら「名前違い」なので次へ。Quotaエラーなら「枠切れ」なので次へ。
+            print(f"   ❌ Failed ({candidate}): {err_str[:100]}...", flush=True)
+            continue
             
-            # 確定したモデルで接続テスト
-            gemini_client.models.generate_content(model=RESOLVED_MODEL_ID, contents='Hello')
-            print("✅ Connectivity Check Passed.", flush=True)
-            
-        else:
-            raise Exception("No suitable Gemini model found in your account list.")
+    if found_model:
+        RESOLVED_MODEL_ID = found_model
+    else:
+        print("💀 All Flash candidates failed. Cannot proceed without Free Tier model.")
+        sys.exit(1)
 
-    except Exception as e:
-        print(f"❌ Model Discovery Failed: {e}")
-        print("💡 ヒント: APIキーが有効でないか、Generative AI APIがプロジェクトで有効化されていません。")
-        sys.exit(1) # ここで死ぬことで無駄な処理を防ぐ
-        
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=['https://www.googleapis.com/auth/drive'])
@@ -146,10 +143,9 @@ def transcribe_with_groq(chunk_paths):
         else: raise Exception("❌ Rate Limit persists. Aborting.")
     return full_transcript
 
-# --- 3. 知能分析 (Analysis - Dynamic Model) ---
+# --- 3. 知能分析 (Analysis - Dynamic) ---
 
 def analyze_text_with_gemini(transcript_text):
-    # 自動特定されたモデルIDを使用
     print(f"🧠 Gemini Analyzing using [{RESOLVED_MODEL_ID}]...", flush=True)
     
     prompt = f"""
@@ -250,7 +246,7 @@ def cleanup_drive_file(file_id, rename_to):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v85.0 - Auto Discovery) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v87.0 - Model Hunter) ---", flush=True)
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     if not files: print("ℹ️ No files."); return
 

@@ -55,7 +55,7 @@ def sanitize_id(raw_id):
     match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
     return match.group(1) if match else None
 
-# --- Layer 1: FFmpeg ---
+# --- Audio Pipeline ---
 def run_ffmpeg(cmd):
     try:
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -82,7 +82,7 @@ def split_audio_ffmpeg(input_path):
     run_ffmpeg(cmd)
     return sorted(glob.glob(os.path.join(TEMP_DIR, "chunk_*.mp3")))
 
-# --- Layer 2: Groq ---
+# --- Transcription ---
 def transcribe_with_groq(chunk_paths):
     full_transcript = ""
     for i, chunk in enumerate(chunk_paths):
@@ -95,7 +95,7 @@ def transcribe_with_groq(chunk_paths):
             full_transcript += transcription + "\n"
     return full_transcript
 
-# --- Layer 3: Gemini ---
+# --- Analysis ---
 def analyze_text_with_gemini(transcript_text):
     print("🧠 Analyzing text with Gemini...", flush=True)
     model = genai.GenerativeModel('gemini-1.5-flash')
@@ -105,17 +105,19 @@ def analyze_text_with_gemini(transcript_text):
     [JSON_START] {{"student_name": "名前", "date": "YYYY-MM-DD", "next_action": "次やること"}} [JSON_END]
     テキスト: {transcript_text[:900000]}
     """
-    response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"} if False else None)
+    response = model.generate_content(prompt)
     text = response.text.strip()
     report = re.search(r'\[DETAILED_REPORT_START\](.*?)\[DETAILED_REPORT_END\]', text, re.DOTALL)
     report_text = report.group(1).strip() if report else "分析失敗"
     js = re.search(r'\[JSON_START\](.*?)\[JSON_END\]', text, re.DOTALL)
-    data = json.loads(js.group(1)) if js else {{"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "None"}}
+    data = json.loads(js.group(1)) if js else {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "None"}
     return data, report_text
 
-# --- Layer 4: Notion ---
+# --- Notion Integration ---
 def notion_query_student(student_name):
-    url = f"https://api.notion.com/v1/databases/{sanitize_id(FINAL_CONTROL_DB_ID)}/query"
+    db_id = sanitize_id(FINAL_CONTROL_DB_ID)
+    if not db_id: return None, student_name
+    url = f"https://api.notion.com/v1/databases/{db_id}/query"
     res = requests.post(url, headers=HEADERS, json={"filter": {"property": "Name", "title": {"contains": student_name}}})
     data = res.json()
     if data.get("results"):
@@ -132,7 +134,7 @@ def notion_create_page_heavy(db_id, props, all_children):
         for i in range(100, len(all_children), 100):
             requests.patch(f"https://api.notion.com/v1/blocks/{page_id}/children", headers=HEADERS, json={"children": all_children[i:i+100]})
 
-# --- Layer 5: Drive Cleanup ---
+# --- Drive Integration (リネーム機能強化) ---
 def cleanup_drive_file(file_id, rename_to=None):
     folder_name = "processed_coaching_logs"
     q = f"name='{folder_name}' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
@@ -143,17 +145,19 @@ def cleanup_drive_file(file_id, rename_to=None):
     prev_parents = ",".join(file.get('parents', []))
     body = {'name': rename_to} if rename_to else {}
     drive_service.files().update(fileId=file_id, addParents=target_folder_id, removeParents=prev_parents, body=body).execute()
-    print(f"➡️ File moved and renamed to {rename_to}", flush=True)
+    print(f"➡️ File moved and renamed to: {rename_to}", flush=True)
 
-# --- Main ---
+# --- Main Logic ---
 def main():
     results = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute()
     files = results.get('files', [])
-    if not files: return
+    if not files:
+        print("ℹ️ No files to process.")
+        return
 
     for file in files:
         try:
-            print(f"\n📂 {file['name']} 処理中...")
+            print(f"\n📂 Processing: {file['name']}")
             request = drive_service.files().get_media(fileId=file['id'])
             fpath = os.path.join(TEMP_DIR, file['name'])
             with open(fpath, "wb") as f:
@@ -167,35 +171,45 @@ def main():
                     z.extractall(TEMP_DIR)
                     for root, _, fs in os.walk(TEMP_DIR):
                         for af in fs:
-                            if af.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')): audios.append(os.path.join(root, af))
+                            if af.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')): 
+                                audios.append(os.path.join(root, af))
             else: audios.append(fpath)
 
             if not audios: continue
             
-            # Process Pipeline
+            # Pipeline
             mixed = mix_audio_ffmpeg(audios)
             chunks = split_audio_ffmpeg(mixed)
             full_text = transcribe_with_groq(chunks)
             meta, report = analyze_text_with_gemini(full_text)
             
-            # Destination
+            # Target ID & Name Resolution
             dest_id, official_name = notion_query_student(meta['student_name'])
-            if not dest_id: dest_id = FINAL_FALLBACK_DB_ID
+            if not dest_id: 
+                dest_id = FINAL_FALLBACK_DB_ID
+                print(f"⚠️ Student not found. Using Fallback.")
             
             # Notion Write
-            props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {official_name} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
+            props = {
+                "名前": {"title": [{"text": {"content": f"{meta['date']} {official_name} ログ"}}]}, 
+                "日付": {"date": {"start": meta['date']}}
+            }
             blocks = [{"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:2000]}}]}} for line in (report + "\n" + full_text).split('\n') if line.strip()]
             notion_create_page_heavy(sanitize_id(dest_id), props, blocks)
             
-            # Drive Cleanup (リネーム付)
+            # Drive リネーム & 移動
             ext = os.path.splitext(file['name'])[1] or ".zip"
             new_name = f"{meta['date']}_{official_name}{ext}"
             cleanup_drive_file(file['id'], rename_to=new_name)
             
         except Exception as e:
             print(f"❌ Error on {file['name']}: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
-            if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
+            if os.path.exists(TEMP_DIR): 
+                shutil.rmtree(TEMP_DIR)
+                os.makedirs(TEMP_DIR)
 
 if __name__ == "__main__":
     main()

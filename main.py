@@ -8,10 +8,12 @@ import glob
 import re
 from datetime import datetime
 
-# --- 0. SDK更新 ---
+# --- 0. SDK & 解凍ツールの導入 ---
 try:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "google-genai"])
     subprocess.check_call([sys.executable, "-m", "pip", "install", "groq"])
+    # ★【新兵器】万能解凍ライブラリ
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "patool"])
 except: pass
 
 # --- Libraries ---
@@ -22,7 +24,7 @@ from groq import Groq
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-import zipfile
+import patoolib # ★ここがカギ
 
 # --- Configuration ---
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664"
@@ -33,7 +35,7 @@ CHUNK_LENGTH = 900  # 15分
 # グローバル変数
 RESOLVED_MODEL_ID = None
 
-# --- 1. 初期化 & モデル選定 (Setup & Select) ---
+# --- 1. 初期化 & モデル選定 (Setup) ---
 def setup_env():
     global RESOLVED_MODEL_ID
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
@@ -50,38 +52,26 @@ try:
     
     print("💎 Detecting Best Available Model (Targeting 2.5)...", flush=True)
     
-    # ★【最強構成】2.5系を最優先にする
-    # Quota制限にかかった場合のみ、2.0 -> Lite へとダウングレードする
     PRIORITY_TARGETS = [
-        "gemini-2.5-flash",       # 本命: 最新鋭・最高性能
-        "gemini-2.5-pro",         # 対抗: 賢いが遅い/制限きついかも
-        "gemini-2.0-flash",       # 安定: 2.5がダメだった場合の保険
-        "gemini-2.0-flash-lite",  # 軽量: 最終防衛ライン
+        "gemini-2.5-flash", 
+        "gemini-2.5-pro",
+        "gemini-2.0-flash", 
+        "gemini-2.0-flash-lite",
     ]
     
-    # 疎通確認ループ
     for target in PRIORITY_TARGETS:
         print(f"👉 Testing: [{target}]...", flush=True)
         try:
-            gemini_client.models.generate_content(
-                model=target,
-                contents="Hello"
-            )
+            gemini_client.models.generate_content(model=target, contents="Hello")
             print(f"✅ SUCCESS! Using Model: [{target}]", flush=True)
             RESOLVED_MODEL_ID = target
             break
-        except Exception as e:
-            err = str(e).lower()
-            if "429" in err or "quota" in err or "resource_exhausted" in err:
-                print(f"   ⚠️ Quota Limit (429) on [{target}]. Skipping...", flush=True)
-            elif "404" in err:
-                print(f"   ❌ Not Found ({target}). Skipping...", flush=True)
-            else:
-                print(f"   ❌ Error ({target}): {str(e)[:50]}...", flush=True)
+        except Exception:
+            continue
                 
     if not RESOLVED_MODEL_ID:
-        print("💀 All priority models failed. Forcing fallback to 'gemini-2.0-flash-lite'...")
         RESOLVED_MODEL_ID = "gemini-2.0-flash-lite"
+        print(f"⚠️ Fallback to: {RESOLVED_MODEL_ID}")
 
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
@@ -192,25 +182,19 @@ def analyze_text_with_gemini(transcript_text):
     max_retries = 10
     for attempt in range(max_retries):
         try:
-            response = gemini_client.models.generate_content(
-                model=RESOLVED_MODEL_ID,
-                contents=prompt
-            )
+            response = gemini_client.models.generate_content(model=RESOLVED_MODEL_ID, contents=prompt)
             text = response.text.strip()
             break 
-            
         except Exception as e:
             err_str = str(e).lower()
-            # 429/Quota/Overloaded なら待機
-            if "429" in err_str or "quota" in err_str or "resource_exhausted" in err_str or "overloaded" in err_str:
+            if "429" in err_str or "quota" in err_str:
                 wait = 60 * (attempt + 1)
-                print(f"⏳ Gemini Busy ({RESOLVED_MODEL_ID}). Waiting {wait}s... ({attempt+1}/{max_retries})", flush=True)
+                print(f"⏳ Gemini Busy. Waiting {wait}s...", flush=True)
                 time.sleep(wait)
             else:
-                print(f"⚠️ Gemini Analysis Failed: {e}")
+                print(f"⚠️ Gemini Failed: {e}")
                 return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
     else:
-        print("❌ Gemini Quota: Gave up after retries.")
         return {"student_name": "QuotaError", "date": datetime.now().strftime('%Y-%m-%d')}, "Quota Limit Exceeded", transcript_text[:2000]
     
     def extract(s, e, src):
@@ -257,7 +241,7 @@ def cleanup_drive_file(file_id, rename_to):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v91.0 - God Speed) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v93.0 - Universal Extractor) ---", flush=True)
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     if not files: print("ℹ️ No files."); return
 
@@ -269,16 +253,26 @@ def main():
                 MediaIoBaseDownload(f, drive_service.files().get_media(fileId=file['id'])).next_chunk()
             
             srcs = []
-            if file['name'].endswith('.zip'):
-                with zipfile.ZipFile(fpath, 'r') as z:
-                    z.extractall(TEMP_DIR)
+            if file['name'].endswith('.zip'): # 拡張子がzipの場合
+                try:
+                    # ★【ここが変更点】万能解凍機 patool を使う
+                    # 拡張子が嘘でも、rarでも7zでも自動判別して開ける
+                    patoolib.extract_archive(fpath, outdir=TEMP_DIR)
+                    
                     for r, _, fs in os.walk(TEMP_DIR):
                         for af in fs:
                             if af.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')) and 'final_mix' not in af and 'chunk' not in af:
                                 srcs.append(os.path.join(r, af))
+                                
+                except Exception as e:
+                    # さすがに万能ツールでも開けない場合はスキップ
+                    print(f"⚠️ Corrupted Archive (patool failed): {file['name']} - Skipping. ({e})")
+                    continue
             else: srcs.append(fpath)
             
-            if not srcs: continue
+            if not srcs: 
+                print("ℹ️ No audio files found. Skipping.")
+                continue
             
             mixed = mix_audio_ffmpeg(srcs)
             chunks = split_audio_ffmpeg(mixed)
@@ -301,10 +295,10 @@ def main():
             cleanup_drive_file(file['id'], f"{meta['date']}_{oname}{ext}")
 
         except Exception as e:
-            print(f"❌ CRITICAL ERROR on {file['name']}: {e}")
+            print(f"❌ Error processing {file['name']}: {e}")
             import traceback; traceback.print_exc()
-            print("⛔ システムを緊急停止します。")
-            sys.exit(1)
+            continue
+            
         finally:
             if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
 

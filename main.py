@@ -78,15 +78,17 @@ def split_audio_ffmpeg(input_path):
 
 def transcribe_with_groq(chunk_paths):
     """
-    [Smart Retry搭載]
-    Rate Limit (429) が発生した場合、エラーで止めずに自動待機してリトライする。
+    【無料枠・完全耐久仕様】
+    Rate Limitが来たら、解除されるまで最大50回（計50分以上）粘り強くリトライする。
     """
     full_transcript = ""
     for chunk in chunk_paths:
         if not chunk.endswith(".mp3"): continue
         print(f"🚀 Groq Transcribing: {os.path.basename(chunk)}", flush=True)
         
-        max_retries = 5
+        # 修正: 回数を大幅増量
+        max_retries = 50
+        
         for attempt in range(max_retries):
             try:
                 with open(chunk, "rb") as file:
@@ -95,17 +97,19 @@ def transcribe_with_groq(chunk_paths):
                         model="whisper-large-v3", language="ja", response_format="text"
                     )
                 full_transcript += res + "\n"
-                break # 成功したらループを抜ける
+                break 
             except Exception as e:
                 err_str = str(e).lower()
                 if "429" in err_str or "rate limit" in err_str:
-                    wait = 20 * (2 ** attempt) # 20s, 40s, 80s, 160s, 320s
+                    # 修正: 待機時間を「一律60秒 + α」に変更して、長時間待機を安定させる
+                    wait = 70 
                     print(f"⏳ Rate Limit Hit. Waiting {wait}s... (Attempt {attempt+1}/{max_retries})", flush=True)
                     time.sleep(wait)
                 else:
-                    raise e # 429以外は即座にエラーとして投げる
+                    raise e
         else:
-            raise Exception("❌ Max retries exceeded for Rate Limit.")
+            # 50回(約1時間)待ってもダメなら流石に諦める
+            raise Exception("❌ Rate Limit persists after 50 retries. Aborting.")
 
     return full_transcript
 

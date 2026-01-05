@@ -100,9 +100,32 @@ def analyze_text_with_gemini(transcript_text):
     print("🧠 Analyzing text with Gemini...", flush=True)
     model = genai.GenerativeModel('gemini-1.5-flash')
     prompt = f"""
-    あなたはスマブラコーチアシスタントです。対話ログを分析し以下を出力せよ。
-    [DETAILED_REPORT_START] (現状・課題・改善案・やること) [DETAILED_REPORT_END]
-    [JSON_START] {{"student_name": "名前", "date": "YYYY-MM-DD", "next_action": "次やること"}} [JSON_END]
+   あなたは**トップ・スマブラアナリスト**です。
+    以下は、コーチ(Hikari)とクライアントの対話ログ（文字起こし済みテキスト）です。
+
+    【指令】
+    このテキストを分析し、以下の2つのセクションを出力してください。
+    
+    1. **詳細分析レポート**: 
+       会話内で扱われた主要トピック（着地狩り、復帰阻止、メンタル等）を特定し、
+       それぞれの「現状」「課題」「改善案」「やること」をMarkdown形式で詳述せよ。
+    
+    2. **JSONメタデータ**:
+       生徒の名前、日付、次回の最重要アクションを抽出せよ。
+
+    ---
+    **[DETAILED_REPORT_START]**
+    （ここに詳細レポートをMarkdownで見やすく記述）
+    **[DETAILED_REPORT_END]**
+    ---
+    **[JSON_START]**
+    {{
+      "student_name": "生徒名（不明ならUnknown）",
+      "date": "YYYY-MM-DD (不明ならToday)",
+      "next_action": "最も重要な次回アクション"
+    }}
+    **[JSON_END]**
+    ---
     テキスト: {transcript_text[:900000]}
     """
     response = model.generate_content(prompt)

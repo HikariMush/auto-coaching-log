@@ -102,22 +102,50 @@ def split_audio_ffmpeg(input_path):
 
 
 def transcribe_with_groq(chunk_paths):
-    """[高速テキスト化] 分割MP3を順次Whisperにかける"""
+    """
+    [高速テキスト化] 分割MP3を順次Whisperにかける。
+    RateLimitError(429)発生時は、自動で待機してリトライする。
+    """
     full_transcript = ""
+    
     for chunk in chunk_paths:
         if not chunk.endswith(".mp3"): continue
         
         print(f"🚀 Groq Transcribing: {os.path.basename(chunk)}", flush=True)
-        with open(chunk, "rb") as file:
-            transcription = groq_client.audio.transcriptions.create(
-                file=(os.path.basename(chunk), file),
-                model="whisper-large-v3",
-                language="ja",
-                response_format="text"
-            )
-            full_transcript += transcription + "\n"
-    return full_transcript
+        
+        # リトライループ (最大5回試行)
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with open(chunk, "rb") as file:
+                    transcription = groq_client.audio.transcriptions.create(
+                        file=(os.path.basename(chunk), file),
+                        model="whisper-large-v3",
+                        language="ja",
+                        response_format="text"
+                    )
+                full_transcript += transcription + "\n"
+                break # 成功したらループを抜ける
 
+            except Exception as e:
+                # エラーメッセージに "rate_limit" や "429" が含まれていたら待機
+                error_str = str(e).lower()
+                if "429" in error_str or "rate limit" in error_str:
+                    # デフォルトで待つ時間 (指数関数的に増やす: 20s, 40s, 80s...)
+                    wait_time = 20 * (2 ** attempt)
+                    
+                    # エラーメッセージから具体的な待機時間を抽出できればベターだが、
+                    # 簡易的に安全マージンをとって待機する
+                    print(f"⏳ Rate Limit Hit. Waiting for {wait_time} seconds... (Attempt {attempt+1}/{max_retries})", flush=True)
+                    time.sleep(wait_time)
+                else:
+                    # その他の致命的なエラーは即座に投げる
+                    raise e
+        else:
+            # リトライ回数を使い果たした場合
+            raise Exception(f"❌ Failed to transcribe {chunk} after {max_retries} retries due to Rate Limits.")
+
+    return full_transcript
 
 # ==========================================
 # Phase 2: 知能分析と構造化 (The Brain)

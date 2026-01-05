@@ -8,14 +8,17 @@ import glob
 import re
 from datetime import datetime
 
-# --- 0. 環境強制アップデート ---
+# --- 0. 新SDKの強制導入 (Migration) ---
+# 旧ライブラリ(google-generativeai)を捨て、新公式SDK(google-genai)を導入
 try:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "google-generativeai>=0.7.2"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "google-genai"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "groq"]) # 念のため
 except: pass
 
 # --- Libraries ---
 import requests
-import google.generativeai as genai
+# ★ 新しいSDKのインポート
+from google import genai 
 from groq import Groq
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -28,7 +31,7 @@ FINAL_FALLBACK_DB_ID = "2b71bc8521e38018a5c3c4b0c6b6627c"
 TEMP_DIR = "temp_workspace"
 CHUNK_LENGTH = 900  # 15分
 
-# --- 1. 初期化 (Setup) ---
+# --- 1. 初期化 & 接続テスト (Setup) ---
 def setup_env():
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
@@ -39,19 +42,24 @@ def setup_env():
 setup_env()
 
 try:
+    # Groq Client
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     
-    # ★【唯一の技術的変更点】通信方式を REST に固定 (404/SSLエラー対策)
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"), transport="rest")
+    # ★ Gemini Client (新SDK仕様)
+    # REST/gRPCの管理は新SDKが最適化しているため、デフォルト設定で初期化する
+    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
-    # 接続確認
-    print("🩺 Connectivity Test (REST Mode)...", flush=True)
+    print("🩺 Connectivity Test (New SDK)...", flush=True)
     try:
-        model_check = genai.GenerativeModel('gemini-1.5-flash')
-        test_resp = model_check.generate_content("Hello")
-        print(f"✅ Connection OK: {test_resp.text.strip()}", flush=True)
+        # 新SDKでの疎通確認
+        test_resp = gemini_client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents='Hello'
+        )
+        print(f"✅ Connection OK: {test_resp.text[:20]}...", flush=True)
     except Exception as e:
         print(f"⚠️ Connection Warning: {e}")
+        # 新SDKでもコケる場合は、APIキー自体の権限設定を疑う必要があるが、まずは進める
         
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
@@ -111,14 +119,12 @@ def transcribe_with_groq(chunk_paths):
         else: raise Exception("❌ Rate Limit persists. Aborting.")
     return full_transcript
 
-# --- 3. 知能分析 (Analysis) ---
+# --- 3. 知能分析 (Analysis - New SDK) ---
 
 def analyze_text_with_gemini(transcript_text):
-    print("🧠 Gemini Analyzing (SZ Method)...", flush=True)
+    print("🧠 Gemini Analyzing (New SDK + Core Prompt)...", flush=True)
     
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    # ★【根幹復旧】SZメソッドの詳細プロンプトを完全に戻しました
+    # SZメソッドの詳細プロンプト (完全維持)
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的かつ冷徹なコーチング記録官です。
     渡された対話ログを精読し、以下の3つのセクションを厳密なフォーマットで出力してください。
@@ -163,8 +169,13 @@ def analyze_text_with_gemini(transcript_text):
     """
     
     try:
-        response = model.generate_content(prompt)
+        # ★ 新SDKの呼び出し構文
+        response = gemini_client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=prompt
+        )
         text = response.text.strip()
+        
     except Exception as e:
         print(f"⚠️ Gemini Analysis Failed: {e}")
         return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
@@ -213,7 +224,7 @@ def cleanup_drive_file(file_id, rename_to):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v83.0 - REST + Core Prompt) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v84.0 - New SDK Migration) ---", flush=True)
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     if not files: print("ℹ️ No files."); return
 
@@ -236,32 +247,4 @@ def main():
             
             if not srcs: continue
             
-            mixed = mix_audio_ffmpeg(srcs)
-            chunks = split_audio_ffmpeg(mixed)
-            full_text = transcribe_with_groq(chunks)
-            meta, report, logs = analyze_text_with_gemini(full_text)
-            
-            did, oname = notion_query_student(meta['student_name'])
-            if not did: did = FINAL_FALLBACK_DB_ID
-            
-            props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {oname} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
-            content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
-            blocks = []
-            for line in content.split('\n'):
-                if line.strip():
-                    blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
-            
-            notion_create_page_heavy(sanitize_id(did), props, blocks)
-            
-            ext = os.path.splitext(file['name'])[1] or ".zip"
-            cleanup_drive_file(file['id'], f"{meta['date']}_{oname}{ext}")
-
-        except Exception as e:
-            print(f"❌ CRITICAL ERROR on {file['name']}: {e}")
-            import traceback; traceback.print_exc()
-            print("⛔ システムを緊急停止します。")
-            sys.exit(1)
-        finally:
-            if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
-
-if __name__ == "__main__": main()
+            mixed =

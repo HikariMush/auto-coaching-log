@@ -276,27 +276,40 @@ def download_file(file_id, file_name):
         while not done: _, done = downloader.next_chunk()
     return file_path
 
-def cleanup_drive_file(file_id):
+def cleanup_drive_file(file_id, rename_to=None):
+    """処理済みファイルを移動し、必要ならリネームする"""
     folder_name = "processed_coaching_logs"
     try:
-        # Check/Create folder
+        # 1. 移動先フォルダの確保
         q = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder' and '{INBOX_FOLDER_ID}' in parents and trashed=false"
         files = drive_service.files().list(q=q).execute().get('files', [])
-        target_id = files[0]['id'] if files else drive_service.files().create(
+        target_folder_id = files[0]['id'] if files else drive_service.files().create(
             body={'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]},
             fields='id'
         ).execute().get('id')
         
-        # Move file
+        # 2. 現在の親フォルダを取得
         file = drive_service.files().get(fileId=file_id, fields='parents').execute()
+        previous_parents = ",".join(file.get('parents')) if file.get('parents') else ""
+
+        # 3. 移動 & リネーム実行
+        body = {}
+        if rename_to:
+            body['name'] = rename_to  # 新しいファイル名を設定
+            
         drive_service.files().update(
             fileId=file_id,
-            addParents=target_id,
-            removeParents=",".join(file.get('parents')),
-            fields='id, parents'
+            addParents=target_folder_id,
+            removeParents=previous_parents,
+            body=body,
+            fields='id, parents, name'
         ).execute()
-        print("➡️ File moved to processed folder.", flush=True)
-    except: pass
+        
+        log_msg = f" (Renamed to: {rename_to})" if rename_to else ""
+        print(f"➡️ File moved to processed folder{log_msg}.", flush=True)
+
+    except Exception as e:
+        print(f"⚠️ Drive Cleanup Error: {e}", flush=True)
 
 # --- Main Logic ---
 
@@ -419,7 +432,18 @@ def main():
             notion_create_page_heavy(sanitize_id(destination_id), props, children)
             
             # Step H: Cleanup
-            cleanup_drive_file(file['id'])
+           # 元の拡張子 (.zip など) を維持する
+            original_ext = os.path.splitext(file['name'])[1]
+            if not original_ext: original_ext = ".zip" # 万が一拡張子がない場合の保険
+            
+            # 新しい名前: "2025-12-23_らぎぴ.zip" のような形式
+            new_filename = f"{meta_data['date']}_{display_name}{original_ext}"
+            
+            # 移動と同時にリネームを実行
+            cleanup_drive_file(file['id'], rename_to=new_filename)
+            
+        except Exception as e:
+            # ... (エラー処理はそのまま)
             
         except Exception as e:
             print(f"❌ Processing Failed for {file_name}: {e}")

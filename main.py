@@ -129,7 +129,8 @@ def analyze_text_with_gemini(transcript_text):
     5要素(Status, Problem, Root Cause, Solution, Next Action)を厳格に抽出。
     """
     print("🧠 Gemini Analyzing (SZ Method - 5 Elements)...", flush=True)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # モデル名を明示的なバージョンに変更
+    model = genai.GenerativeModel('gemini-1.5-flash-latest')
     
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的かつ冷徹なコーチング記録官です。

@@ -8,16 +8,14 @@ import glob
 import re
 from datetime import datetime
 
-# --- 0. 新SDKの強制導入 (Migration) ---
-# 旧ライブラリ(google-generativeai)を捨て、新公式SDK(google-genai)を導入
+# --- 0. SDK更新 ---
 try:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "google-genai"])
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "groq"]) # 念のため
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "groq"])
 except: pass
 
 # --- Libraries ---
 import requests
-# ★ 新しいSDKのインポート
 from google import genai 
 from groq import Groq
 from google.oauth2 import service_account
@@ -31,7 +29,10 @@ FINAL_FALLBACK_DB_ID = "2b71bc8521e38018a5c3c4b0c6b6627c"
 TEMP_DIR = "temp_workspace"
 CHUNK_LENGTH = 900  # 15分
 
-# --- 1. 初期化 & 接続テスト (Setup) ---
+# グローバル変数: 自動特定したモデルIDを格納
+RESOLVED_MODEL_ID = None 
+
+# --- 1. 初期化 & モデル自動特定 (Setup & Auto-Discovery) ---
 def setup_env():
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
@@ -42,24 +43,50 @@ def setup_env():
 setup_env()
 
 try:
-    # Groq Client
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     
-    # ★ Gemini Client (新SDK仕様)
-    # REST/gRPCの管理は新SDKが最適化しているため、デフォルト設定で初期化する
+    # Gemini Client
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
-    print("🩺 Connectivity Test (New SDK)...", flush=True)
+    print("🔍 Auto-Discovering Available Gemini Models...", flush=True)
+    
+    # ★【新機能】利用可能なモデルを動的に検索して決定する
     try:
-        # 新SDKでの疎通確認
-        test_resp = gemini_client.models.generate_content(
-            model='gemini-1.5-flash',
-            contents='Hello'
-        )
-        print(f"✅ Connection OK: {test_resp.text[:20]}...", flush=True)
+        # モデル一覧を取得
+        models_pager = gemini_client.models.list()
+        available_models = [m.name for m in models_pager]
+        
+        print(f"📋 Available Models Found: {available_models}", flush=True)
+        
+        # 優先順位: 1.5-flash -> 1.5-pro -> 1.0-pro -> その他
+        target_model = None
+        
+        # 検索ロジック (名前の一部が一致するものを探す)
+        for candidate in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro', 'gemini-1.0-pro']:
+            # 完全一致または models/xxxxx 形式での一致を探す
+            match = next((m for m in available_models if candidate in m), None)
+            if match:
+                target_model = match
+                # models/ プレフィックスがついている場合、SDKによってはそれを嫌うことがあるので除去版も考慮
+                if target_model.startswith('models/'):
+                    target_model = target_model.replace('models/', '')
+                break
+        
+        if target_model:
+            RESOLVED_MODEL_ID = target_model
+            print(f"✅ Model Auto-Selected: [{RESOLVED_MODEL_ID}]", flush=True)
+            
+            # 確定したモデルで接続テスト
+            gemini_client.models.generate_content(model=RESOLVED_MODEL_ID, contents='Hello')
+            print("✅ Connectivity Check Passed.", flush=True)
+            
+        else:
+            raise Exception("No suitable Gemini model found in your account list.")
+
     except Exception as e:
-        print(f"⚠️ Connection Warning: {e}")
-        # 新SDKでもコケる場合は、APIキー自体の権限設定を疑う必要があるが、まずは進める
+        print(f"❌ Model Discovery Failed: {e}")
+        print("💡 ヒント: APIキーが有効でないか、Generative AI APIがプロジェクトで有効化されていません。")
+        sys.exit(1) # ここで死ぬことで無駄な処理を防ぐ
         
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
@@ -119,12 +146,12 @@ def transcribe_with_groq(chunk_paths):
         else: raise Exception("❌ Rate Limit persists. Aborting.")
     return full_transcript
 
-# --- 3. 知能分析 (Analysis - New SDK) ---
+# --- 3. 知能分析 (Analysis - Dynamic Model) ---
 
 def analyze_text_with_gemini(transcript_text):
-    print("🧠 Gemini Analyzing (New SDK + Core Prompt)...", flush=True)
+    # 自動特定されたモデルIDを使用
+    print(f"🧠 Gemini Analyzing using [{RESOLVED_MODEL_ID}]...", flush=True)
     
-    # SZメソッドの詳細プロンプト (完全維持)
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的かつ冷徹なコーチング記録官です。
     渡された対話ログを精読し、以下の3つのセクションを厳密なフォーマットで出力してください。
@@ -169,9 +196,8 @@ def analyze_text_with_gemini(transcript_text):
     """
     
     try:
-        # ★ 新SDKの呼び出し構文
         response = gemini_client.models.generate_content(
-            model='gemini-1.5-flash',
+            model=RESOLVED_MODEL_ID,
             contents=prompt
         )
         text = response.text.strip()
@@ -224,7 +250,7 @@ def cleanup_drive_file(file_id, rename_to):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v84.0 - New SDK Migration) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v85.0 - Auto Discovery) ---", flush=True)
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     if not files: print("ℹ️ No files."); return
 

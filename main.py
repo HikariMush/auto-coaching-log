@@ -7,7 +7,6 @@ import shutil
 import glob
 import re
 import traceback
-import random
 from datetime import datetime
 
 # --- 0. SDK & Tools ---
@@ -32,15 +31,13 @@ import patoolib
 
 # --- Configuration ---
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664"
-
-# ★【変更】新しいフォールバック用DBのID
 FINAL_FALLBACK_DB_ID = "2e01bc8521e380ffaf28c2ab9376b00d"
-
 TEMP_DIR = "temp_workspace"
 CHUNK_LENGTH = 900  # 15 min
 
 # Global Variables
 RESOLVED_MODEL_ID = None
+BOT_EMAIL = None # ★追加
 
 # --- Helper: Verbose Error Printer ---
 def log_error(context, error_obj):
@@ -50,7 +47,7 @@ def log_error(context, error_obj):
 
 # --- 1. Initialization (Setup) ---
 def setup_env():
-    global RESOLVED_MODEL_ID
+    global RESOLVED_MODEL_ID, BOT_EMAIL
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
     
@@ -58,6 +55,17 @@ def setup_env():
     if sa_key:
         with open("service_account.json", "w") as f:
             f.write(sa_key)
+        
+        # ★【新機能】自己紹介機能
+        try:
+            key_data = json.loads(sa_key)
+            BOT_EMAIL = key_data.get("client_email", "Unknown")
+            print(f"\n==========================================")
+            print(f"🤖 BOT EMAIL: {BOT_EMAIL}")
+            print(f"👉 Please add this email as 'Editor' to your Drive Folder!")
+            print(f"==========================================\n", flush=True)
+        except:
+            print("⚠️ Could not parse Service Account Email.")
     else:
         print("❌ ENV Error: GCP_SA_KEY is missing.")
         sys.exit(1)
@@ -229,7 +237,7 @@ def analyze_text_with_gemini(transcript_text):
     except: data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
     return data, report, time_log
 
-# --- 4. Asset Management (Robust Notion & Drive) ---
+# --- 4. Asset Management ---
 
 def notion_query_student(name):
     db_id = sanitize_id(FINAL_CONTROL_DB_ID)
@@ -246,44 +254,25 @@ def notion_query_student(name):
 
 def notion_create_page_heavy(db_id, props, children):
     print(f"📤 Posting to Notion DB: {db_id}...", flush=True)
-    
-    # 1st Attempt: Full Properties
     res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": props, "children": children[:100]})
-    
-    # 失敗時のフォールバックロジック (スキーマ不一致対策)
     if res.status_code != 200:
-        print(f"⚠️ Initial Notion Post Failed ({res.status_code}). Retrying with SAFE MODE (Title Only)...", flush=True)
-        print(f"   Reason: {res.text}", flush=True)
-        
-        # 安全策: プロパティを「名前(タイトル)」だけにする。
+        print(f"⚠️ Initial Post Failed ({res.status_code}). Retrying with SAFE MODE...", flush=True)
         safe_props = {}
         for key, val in props.items():
-            if "title" in val:
-                safe_props[key] = val
-                break
-        
+            if "title" in val: safe_props[key] = val; break
         if not safe_props:
-             # 強制的に "Name" を使う
              content_text = props.get("名前", {}).get("title", [{}])[0].get("text", {}).get("content", "Log")
              safe_props = {"Name": {"title": [{"text": {"content": content_text}}]}}
-
-        # 日付等は本文へ
         date_info = props.get("日付", {}).get("date", {}).get("start", "Unknown Date")
-        error_note = {"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": f"⚠️ Date Property Missing in DB. Date: {date_info}"}}]}}
+        error_note = {"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": f"⚠️ Date Property Missing. Date: {date_info}"}}]}}
         children.insert(0, error_note)
-
-        # Retry
         res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": safe_props, "children": children[:100]})
-        
         if res.status_code != 200:
-            print(f"❌ NOTION SAFE MODE FAILED: {res.status_code}", flush=True)
-            print(f"   Reason: {res.text}", flush=True)
-            return 
-
+            print(f"❌ NOTION SAFE MODE FAILED: {res.status_code}\n{res.text}", flush=True)
+            return
     response_data = res.json()
     pid = response_data.get('id')
     print(f"🔗 Notion Page Created: {response_data.get('url')}", flush=True)
-
     if pid and len(children) > 100:
         for i in range(100, len(children), 100):
             requests.patch(f"https://api.notion.com/v1/blocks/{pid}/children", headers=HEADERS, json={"children": children[i:i+100]})
@@ -295,7 +284,9 @@ def ensure_processed_folder():
         if folders: return folders[0]['id']
         folder = drive_service.files().create(body={'name': 'processed_coaching_logs', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]}, fields='id').execute()
         return folder.get('id')
-    except Exception: return INBOX_FOLDER_ID
+    except Exception as e:
+        log_error("Failed to Get/Create Processed Folder", e)
+        return INBOX_FOLDER_ID
 
 def upload_mix_to_drive(local_path, folder_id, rename_to):
     print(f"📤 Uploading MP3: {rename_to}...", flush=True)
@@ -307,15 +298,21 @@ def upload_mix_to_drive(local_path, folder_id, rename_to):
         log_error("Audio Upload Failed", e)
 
 def move_original_file(file_id, folder_id):
+    if folder_id == INBOX_FOLDER_ID:
+        print("⚠️ Skipping Move: Destination is Inbox.", flush=True)
+        return
     try:
-        prev = ",".join(drive_service.files().get(fileId=file_id, fields='parents').execute().get('parents', []))
-        drive_service.files().update(fileId=file_id, addParents=folder_id, removeParents=prev).execute()
-        print(f"📦 Archived original file.", flush=True)
-    except Exception: pass
+        prev_parents = drive_service.files().get(fileId=file_id, fields='parents').execute().get('parents', [])
+        prev_str = ",".join(prev_parents)
+        drive_service.files().update(fileId=file_id, addParents=folder_id, removeParents=prev_str).execute()
+        print(f"📦 Archived original file to folder [{folder_id}].", flush=True)
+    except Exception as e:
+        log_error(f"Move Original File Failed (ID: {file_id})", e)
+        print(f"👉 TIP: Add this email to folder permissions: {BOT_EMAIL}", flush=True)
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v99.0 - New Target) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v101.0 - Identity Reveal) ---", flush=True)
     try:
         files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     except Exception: return
@@ -327,7 +324,6 @@ def main():
             print(f"\n📂 Processing: {file['name']}")
             fpath = os.path.join(TEMP_DIR, file['name'])
             
-            # 堅牢なダウンロードループ
             max_dl_retries = 3
             for dl_attempt in range(max_dl_retries):
                 try:
@@ -341,10 +337,10 @@ def main():
                     print("\n✅ Download Complete.")
                     break 
                 except Exception as e:
-                    print(f"\n⚠️ Download Interrupted: {e}. Retrying ({dl_attempt+1}/{max_dl_retries})...")
+                    print(f"\n⚠️ Download Interrupted: {e}. Retrying...", flush=True)
                     time.sleep(5)
             else:
-                print("❌ Download Failed after retries. Skipping file.")
+                print("❌ Download Failed. Skipping.")
                 continue
 
             srcs = []

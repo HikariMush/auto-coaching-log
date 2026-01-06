@@ -209,14 +209,13 @@ def notion_query_student(name):
     return None, name
 
 def notion_create_page_heavy(db_id, props, children):
-    # ★【修正】エラーを厳密にチェックしてログに出す
     print(f"📤 Posting to Notion DB: {db_id}...", flush=True)
     res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": props, "children": children[:100]})
     
     if res.status_code != 200:
         print(f"❌ NOTION CREATE FAILED: {res.status_code}", flush=True)
         print(f"   Reason: {res.text}", flush=True)
-        raise Exception(f"Notion Error: {res.text}") # ★ここで処理を中断させる
+        raise Exception(f"Notion Error: {res.text}")
         
     response_data = res.json()
     pid = response_data.get('id')
@@ -239,7 +238,7 @@ def cleanup_drive_file(file_id, rename_to):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v94.0 - Notion Debug) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v95.0 - Chunk Loop Fix) ---", flush=True)
     files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     if not files: print("ℹ️ No files."); return
 
@@ -247,8 +246,15 @@ def main():
         try:
             print(f"\n📂 Processing: {file['name']}")
             fpath = os.path.join(TEMP_DIR, file['name'])
+            
+            # ★【修正点】100MBの壁を超えるダウンロードループ
             with open(fpath, "wb") as f:
-                MediaIoBaseDownload(f, drive_service.files().get_media(fileId=file['id'])).next_chunk()
+                request = drive_service.files().get_media(fileId=file['id'])
+                downloader = MediaIoBaseDownload(f, request)
+                done = False
+                while done is False:
+                    status, done = downloader.next_chunk()
+                    # print(f"   ⬇️ Downloading {int(status.progress() * 100)}%...", flush=True) # ログがうるさくなるのでOFF
             
             srcs = []
             if file['name'].endswith('.zip'):
@@ -270,9 +276,7 @@ def main():
             meta, report, logs = analyze_text_with_gemini(full_text)
             
             did, oname = notion_query_student(meta['student_name'])
-            if not did: 
-                print("ℹ️ Student not found in Control DB. Using Fallback DB.")
-                did = FINAL_FALLBACK_DB_ID
+            if not did: did = FINAL_FALLBACK_DB_ID
             
             props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {oname} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
             content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
@@ -281,10 +285,7 @@ def main():
                 if line.strip():
                     blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
             
-            # ★ここでエラーなら止まる
             notion_create_page_heavy(sanitize_id(did), props, blocks)
-            
-            # 成功した場合のみここに来る
             ext = os.path.splitext(file['name'])[1] or ".zip"
             cleanup_drive_file(file['id'], f"{meta['date']}_{oname}{ext}")
 
@@ -296,3 +297,4 @@ def main():
             if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
 
 if __name__ == "__main__": main()
+    

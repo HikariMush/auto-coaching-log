@@ -6,14 +6,19 @@ import json
 import shutil
 import glob
 import re
+import traceback
+import random
 from datetime import datetime
 
 # --- 0. SDK & Tools ---
-try:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "google-genai"])
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "groq"])
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "patool"])
-except: pass
+def install_package(package):
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+    except: pass
+
+install_package("google-genai")
+install_package("groq")
+install_package("patool")
 
 # --- Libraries ---
 import requests
@@ -22,26 +27,40 @@ from google.genai import types
 from groq import Groq
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 import patoolib
 
 # --- Configuration ---
 FINAL_CONTROL_DB_ID = "2b71bc8521e380868094ec506b41f664"
-FINAL_FALLBACK_DB_ID = "2b71bc8521e38018a5c3c4b0c6b6627c"
-TEMP_DIR = "temp_workspace"
-CHUNK_LENGTH = 900  # 15分
 
-# グローバル変数
+# ★【変更】新しいフォールバック用DBのID
+FINAL_FALLBACK_DB_ID = "2e01bc8521e380ffaf28c2ab9376b00d"
+
+TEMP_DIR = "temp_workspace"
+CHUNK_LENGTH = 900  # 15 min
+
+# Global Variables
 RESOLVED_MODEL_ID = None
 
-# --- 1. 初期化 (Setup) ---
+# --- Helper: Verbose Error Printer ---
+def log_error(context, error_obj):
+    print(f"\n❌ [ERROR] {context}", flush=True)
+    print(f"   Details: {str(error_obj)}", flush=True)
+    print("-" * 30, flush=True)
+
+# --- 1. Initialization (Setup) ---
 def setup_env():
     global RESOLVED_MODEL_ID
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
-    if os.getenv("GCP_SA_KEY"):
+    
+    sa_key = os.getenv("GCP_SA_KEY")
+    if sa_key:
         with open("service_account.json", "w") as f:
-            f.write(os.getenv("GCP_SA_KEY"))
+            f.write(sa_key)
+    else:
+        print("❌ ENV Error: GCP_SA_KEY is missing.")
+        sys.exit(1)
 
 setup_env()
 
@@ -49,7 +68,7 @@ try:
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
-    print("💎 Detecting Best Available Model (Targeting 2.5)...", flush=True)
+    print("💎 Detecting Best Available Model...", flush=True)
     PRIORITY_TARGETS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
     for target in PRIORITY_TARGETS:
         print(f"👉 Testing: [{target}]...", flush=True)
@@ -65,20 +84,32 @@ try:
         print(f"⚠️ Fallback to: {RESOLVED_MODEL_ID}")
 
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+    if not NOTION_TOKEN: raise Exception("NOTION_TOKEN missing")
+    
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=['https://www.googleapis.com/auth/drive'])
     drive_service = build('drive', 'v3', credentials=creds)
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+    if not INBOX_FOLDER_ID: raise Exception("DRIVE_FOLDER_ID missing")
     
 except Exception as e:
-    print(f"❌ Init Error: {e}"); sys.exit(1)
+    log_error("Initialization Failed", e)
+    sys.exit(1)
 
 def sanitize_id(raw_id):
     if not raw_id: return None
     match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
     return match.group(1) if match else None
 
-# --- 2. 音声パイプライン ---
+# --- 2. Audio Pipeline ---
+
+def run_ffmpeg_command(cmd, task_name):
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        print(f"\n❌ FFmpeg Error during '{task_name}':\n{e.stderr}", flush=True)
+        raise e
 
 def mix_audio_ffmpeg(file_paths):
     print(f"🎛️ Mixing {len(file_paths)} tracks...", flush=True)
@@ -87,14 +118,14 @@ def mix_audio_ffmpeg(file_paths):
     for f in file_paths: inputs.extend(['-i', f])
     filter_part = ['-filter_complex', f'amix=inputs={len(file_paths)}:duration=longest'] if len(file_paths) > 1 else []
     cmd = ['ffmpeg', '-y'] + inputs + filter_part + ['-ac', '1', '-b:a', '64k', output_path]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_ffmpeg_command(cmd, "Mixing Audio")
     return output_path
 
 def split_audio_ffmpeg(input_path):
     print("🔪 Splitting...", flush=True)
     output_pattern = os.path.join(TEMP_DIR, "chunk_%03d.mp3")
     cmd = ['ffmpeg', '-y', '-i', input_path, '-f', 'segment', '-segment_time', str(CHUNK_LENGTH), '-ac', '1', '-b:a', '64k', output_pattern]
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_ffmpeg_command(cmd, "Splitting Audio")
     return sorted(glob.glob(os.path.join(TEMP_DIR, "chunk_*.mp3")))
 
 def transcribe_with_groq(chunk_paths):
@@ -118,11 +149,13 @@ def transcribe_with_groq(chunk_paths):
                     wait = 70
                     print(f"⏳ Groq Limit. Waiting {wait}s... ({attempt+1}/{max_retries})", flush=True)
                     time.sleep(wait)
-                else: raise e
-        else: raise Exception("❌ Rate Limit persists. Aborting.")
+                else: 
+                    log_error("Groq Transcription Failed", e)
+                    raise e
+        else: raise Exception("❌ Groq Rate Limit persists. Aborting.")
     return full_transcript
 
-# --- 3. 知能分析 (Analysis) ---
+# --- 3. Intelligence Analysis ---
 
 def analyze_text_with_gemini(transcript_text):
     print(f"🧠 Gemini Analyzing using [{RESOLVED_MODEL_ID}]...", flush=True)
@@ -181,6 +214,7 @@ def analyze_text_with_gemini(transcript_text):
                 print(f"⏳ Gemini Busy. Waiting {wait}s...", flush=True)
                 time.sleep(wait)
             else:
+                log_error("Gemini Analysis Failed", e)
                 return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
     else: return {"student_name": "QuotaError", "date": datetime.now().strftime('%Y-%m-%d')}, "Quota Limit Exceeded", transcript_text[:2000]
     
@@ -195,51 +229,97 @@ def analyze_text_with_gemini(transcript_text):
     except: data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
     return data, report, time_log
 
-# --- 4. 資産化 (Notion Debug Mode) ---
+# --- 4. Asset Management (Robust Notion & Drive) ---
 
 def notion_query_student(name):
     db_id = sanitize_id(FINAL_CONTROL_DB_ID)
     if not db_id: return None, name
-    res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=HEADERS, json={"filter": {"property": "Name", "title": {"contains": name}}})
-    if res.status_code == 200 and res.json().get("results"):
-        row = res.json()["results"][0]
-        n = row["properties"]["Name"]["title"][0]["plain_text"]
-        tid = row["properties"]["TargetID"]["rich_text"]
-        return (sanitize_id(tid[0]["plain_text"]), n) if tid else (None, n)
+    try:
+        res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=HEADERS, json={"filter": {"property": "Name", "title": {"contains": name}}})
+        if res.status_code == 200 and res.json().get("results"):
+            row = res.json()["results"][0]
+            n = row["properties"]["Name"]["title"][0]["plain_text"]
+            tid = row["properties"]["TargetID"]["rich_text"]
+            return (sanitize_id(tid[0]["plain_text"]), n) if tid else (None, n)
+    except Exception: pass
     return None, name
 
 def notion_create_page_heavy(db_id, props, children):
     print(f"📤 Posting to Notion DB: {db_id}...", flush=True)
+    
+    # 1st Attempt: Full Properties
     res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": props, "children": children[:100]})
     
+    # 失敗時のフォールバックロジック (スキーマ不一致対策)
     if res.status_code != 200:
-        print(f"❌ NOTION CREATE FAILED: {res.status_code}", flush=True)
+        print(f"⚠️ Initial Notion Post Failed ({res.status_code}). Retrying with SAFE MODE (Title Only)...", flush=True)
         print(f"   Reason: {res.text}", flush=True)
-        raise Exception(f"Notion Error: {res.text}")
         
+        # 安全策: プロパティを「名前(タイトル)」だけにする。
+        safe_props = {}
+        for key, val in props.items():
+            if "title" in val:
+                safe_props[key] = val
+                break
+        
+        if not safe_props:
+             # 強制的に "Name" を使う
+             content_text = props.get("名前", {}).get("title", [{}])[0].get("text", {}).get("content", "Log")
+             safe_props = {"Name": {"title": [{"text": {"content": content_text}}]}}
+
+        # 日付等は本文へ
+        date_info = props.get("日付", {}).get("date", {}).get("start", "Unknown Date")
+        error_note = {"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": f"⚠️ Date Property Missing in DB. Date: {date_info}"}}]}}
+        children.insert(0, error_note)
+
+        # Retry
+        res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": safe_props, "children": children[:100]})
+        
+        if res.status_code != 200:
+            print(f"❌ NOTION SAFE MODE FAILED: {res.status_code}", flush=True)
+            print(f"   Reason: {res.text}", flush=True)
+            return 
+
     response_data = res.json()
     pid = response_data.get('id')
-    page_url = response_data.get('url')
-    print(f"🔗 Notion Page Created Successfully: {page_url}", flush=True)
+    print(f"🔗 Notion Page Created: {response_data.get('url')}", flush=True)
 
     if pid and len(children) > 100:
         for i in range(100, len(children), 100):
-            r2 = requests.patch(f"https://api.notion.com/v1/blocks/{pid}/children", headers=HEADERS, json={"children": children[i:i+100]})
-            if r2.status_code != 200:
-                print(f"⚠️ Partial Content Upload Failed: {r2.text}", flush=True)
+            requests.patch(f"https://api.notion.com/v1/blocks/{pid}/children", headers=HEADERS, json={"children": children[i:i+100]})
 
-def cleanup_drive_file(file_id, rename_to):
-    q = f"name='processed_coaching_logs' and '{INBOX_FOLDER_ID}' in parents"
-    folders = drive_service.files().list(q=q).execute().get('files', [])
-    fid = folders[0]['id'] if folders else drive_service.files().create(body={'name': 'processed_coaching_logs', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]}, fields='id').execute().get('id')
-    prev = ",".join(drive_service.files().get(fileId=file_id, fields='parents').execute().get('parents', []))
-    drive_service.files().update(fileId=file_id, addParents=fid, removeParents=prev, body={'name': rename_to}).execute()
-    print(f"✅ Drive updated: {rename_to}")
+def ensure_processed_folder():
+    try:
+        q = f"name='processed_coaching_logs' and '{INBOX_FOLDER_ID}' in parents"
+        folders = drive_service.files().list(q=q).execute().get('files', [])
+        if folders: return folders[0]['id']
+        folder = drive_service.files().create(body={'name': 'processed_coaching_logs', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [INBOX_FOLDER_ID]}, fields='id').execute()
+        return folder.get('id')
+    except Exception: return INBOX_FOLDER_ID
+
+def upload_mix_to_drive(local_path, folder_id, rename_to):
+    print(f"📤 Uploading MP3: {rename_to}...", flush=True)
+    try:
+        media = MediaFileUpload(local_path, mimetype='audio/mpeg', resumable=True, chunksize=100*1024*1024)
+        drive_service.files().create(body={'name': rename_to, 'parents': [folder_id]}, media_body=media, fields='id').execute()
+        print("✅ Upload Complete.", flush=True)
+    except Exception as e:
+        log_error("Audio Upload Failed", e)
+
+def move_original_file(file_id, folder_id):
+    try:
+        prev = ",".join(drive_service.files().get(fileId=file_id, fields='parents').execute().get('parents', []))
+        drive_service.files().update(fileId=file_id, addParents=folder_id, removeParents=prev).execute()
+        print(f"📦 Archived original file.", flush=True)
+    except Exception: pass
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v95.0 - Chunk Loop Fix) ---", flush=True)
-    files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
+    print("--- SZ AUTO LOGGER ULTIMATE (v99.0 - New Target) ---", flush=True)
+    try:
+        files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
+    except Exception: return
+
     if not files: print("ℹ️ No files."); return
 
     for file in files:
@@ -247,15 +327,26 @@ def main():
             print(f"\n📂 Processing: {file['name']}")
             fpath = os.path.join(TEMP_DIR, file['name'])
             
-            # ★【修正点】100MBの壁を超えるダウンロードループ
-            with open(fpath, "wb") as f:
-                request = drive_service.files().get_media(fileId=file['id'])
-                downloader = MediaIoBaseDownload(f, request)
-                done = False
-                while done is False:
-                    status, done = downloader.next_chunk()
-                    # print(f"   ⬇️ Downloading {int(status.progress() * 100)}%...", flush=True) # ログがうるさくなるのでOFF
-            
+            # 堅牢なダウンロードループ
+            max_dl_retries = 3
+            for dl_attempt in range(max_dl_retries):
+                try:
+                    with open(fpath, "wb") as f:
+                        request = drive_service.files().get_media(fileId=file['id'])
+                        downloader = MediaIoBaseDownload(f, request, chunksize=100*1024*1024)
+                        done = False
+                        while done is False:
+                            status, done = downloader.next_chunk()
+                            print(f"   ⬇️ Downloading... {int(status.progress() * 100)}%", end="\r", flush=True)
+                    print("\n✅ Download Complete.")
+                    break 
+                except Exception as e:
+                    print(f"\n⚠️ Download Interrupted: {e}. Retrying ({dl_attempt+1}/{max_dl_retries})...")
+                    time.sleep(5)
+            else:
+                print("❌ Download Failed after retries. Skipping file.")
+                continue
+
             srcs = []
             if file['name'].endswith('.zip'):
                 try:
@@ -265,10 +356,11 @@ def main():
                             if af.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')) and 'final_mix' not in af and 'chunk' not in af:
                                 srcs.append(os.path.join(r, af))
                 except Exception as e:
-                    print(f"⚠️ Archive Error: {e}"); continue
+                    log_error(f"Archive Extraction Failed", e)
+                    continue
             else: srcs.append(fpath)
             
-            if not srcs: print("ℹ️ No audio files."); continue
+            if not srcs: print("ℹ️ No audio files found."); continue
             
             mixed = mix_audio_ffmpeg(srcs)
             chunks = split_audio_ffmpeg(mixed)
@@ -276,7 +368,9 @@ def main():
             meta, report, logs = analyze_text_with_gemini(full_text)
             
             did, oname = notion_query_student(meta['student_name'])
-            if not did: did = FINAL_FALLBACK_DB_ID
+            if not did: 
+                print("ℹ️ Student not found. Using Fallback DB.")
+                did = FINAL_FALLBACK_DB_ID
             
             props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {oname} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
             content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
@@ -286,15 +380,15 @@ def main():
                     blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
             
             notion_create_page_heavy(sanitize_id(did), props, blocks)
-            ext = os.path.splitext(file['name'])[1] or ".zip"
-            cleanup_drive_file(file['id'], f"{meta['date']}_{oname}{ext}")
+            
+            processed_folder_id = ensure_processed_folder()
+            upload_mix_to_drive(mixed, processed_folder_id, f"{meta['date']}_{oname}_Full.mp3")
+            move_original_file(file['id'], processed_folder_id)
 
         except Exception as e:
-            print(f"❌ Error processing {file['name']}: {e}")
-            import traceback; traceback.print_exc()
+            log_error(f"Processing Failed for {file['name']}", e)
             continue
         finally:
             if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
 
 if __name__ == "__main__": main()
-    

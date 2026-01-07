@@ -306,10 +306,20 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     * **④ 改善案 (Solution):** 具体的な修正アクション。
     * **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示。
 
-    **【Section 2: If-Then プランニング（記憶定着）】**
-    Section 1で特定した「課題」と「やること」を、実戦で無意識に実行できる形（トリガー＋アクション）に変換して列挙せよ。
-    * 形式: `【状況】 ➡️ 【行動】`
-    
+    **【Section 2: 課題セット】**
+    Section 1の内容を元に、生徒が試合中に反復確認するための**「超簡潔なアクションリスト」**を作成せよ。
+    * **文法ルール:** 文章の使用を禁ずる。「単語」と「矢印(→)」のみを使用すること。
+    * **形式:** `[状況/トリガー] → [アクション]`
+    * **改行ルール:** 項目名や分類などで「:（コロン）」を使用した場合は、**その直後で必ず改行を入れること。**
+
+    * **悪い例（禁止）:** 「相手がジャンプしたのを確認したら、空前を置いてリスクをつけましょう」
+        「復帰阻止: 相手のルートを見てから技を置く」
+
+    * **良い例（推奨）:**
+        「ジャンプ確認 → 空前」
+        「復帰阻止:
+        ルート確認 → 技置き」
+
     **【Section 3: 時系列ログ】**
     セッション全体の流れを時系列で箇条書きにせよ。
 
@@ -518,7 +528,7 @@ def move_original_file(file_id, folder_id):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v117.0 - Layout Fix) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v118.0 - TaskSet Mode) ---", flush=True)
     load_student_registry()
     
     try:
@@ -592,14 +602,13 @@ def main():
             # Content
             content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
             
-            # ★ FIX: Use the smart block converter instead of the primitive loop
+            # Convert to Blocks
             blocks = text_to_notion_blocks(content)
             
             # Divider for Transcript
             blocks.append({"object": "block", "type": "divider", "divider": {}})
             blocks.append({"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📜 全文文字起こし"}}]}})
             
-            # Transcript is just raw text, so chunk it simply
             for i in range(0, len(full_text), 1900):
                 chunk_text = full_text[i:i+1900]
                 blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk_text}}]}})

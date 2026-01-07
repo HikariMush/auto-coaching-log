@@ -295,26 +295,26 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
 
     ---
     提供された文字起こしデータを徹底的に分析し、以下のフォーマットで出力してください。
+    **特に [DETAILED_REPORT_START] 等のタグはシステム制御に必須です。絶対に出力に含めてください。**
 
     **【Section 1: 詳細分析レポート】**
-    会話で扱われた主要な技術的トピック（例：崖狩り、着地狩り、ライン管理、特定の技の対処法など）を抽出し、表形式のような構造で出力すること。
-    各トピックについて、以下の5項目を**具体的かつ専門的に**記述せよ。
+    会話で扱われた主要な技術的トピックを抽出し、表形式のような構造で出力すること。
+    各トピックについて、以下の5項目を具体的かつ専門的に記述せよ。
     * **① 現状 (Status):** プレイヤーの現在の挙動、癖、認識のズレ。
-    * **② 課題 (Problem):** その挙動が引き起こす具体的なリスク（フレーム不利、撃墜拒否の失敗等）。
-    * **③ 原因 (Root Cause):** なぜその課題が起きるのか（知識不足、操作精度、リスク管理の甘さ等）。
-    * **④ 改善案 (Solution):** 具体的な修正アクション（％帯による技選択の変化、視線の配り方等）。
-    * **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示（1行）。
+    * **② 課題 (Problem):** その挙動が引き起こす具体的なリスク。
+    * **③ 原因 (Root Cause):** なぜその課題が起きるのか。
+    * **④ 改善案 (Solution):** 具体的な修正アクション。
+    * **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示。
 
     **【Section 2: If-Then プランニング（記憶定着）】**
     Section 1で特定した「課題」と「やること」を、実戦で無意識に実行できる形（トリガー＋アクション）に変換して列挙せよ。
-    * 形式: `【状況】(敵が～した時 / 自分が～の時)  ➡️  【行動】(～する)`
-    * 条件は、プレイヤーが試合中にパニックになっても思い出せるよう、簡潔かつリズミカルに記述すること。
-
+    * 形式: `【状況】 ➡️ 【行動】`
+    
     **【Section 3: 時系列ログ】**
-    セッション全体の流れを時系列で箇条書きにせよ。重要なアドバイスや気づきがあったタイミングを逃さず記録すること。
+    セッション全体の流れを時系列で箇条書きにせよ。
 
     **【Section 4: メタデータJSON】**
-    以下のJSONのみを出力すること。student_nameはヒントがあればそれを最優先すること。
+    以下のJSONのみを出力すること。
     {{
       "student_name": "生徒名",
       "date": "YYYY-MM-DD",
@@ -322,16 +322,18 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     }}
 
     ---
+    **出力形式（順守すること）：**
+
     **[DETAILED_REPORT_START]**
-    (ここにSection 1とSection 2を出力)
+    (Section 1 と Section 2 の内容をここに記述)
     **[DETAILED_REPORT_END]**
 
     **[RAW_LOG_START]**
-    (ここにSection 3を出力)
+    (Section 3 の内容をここに記述)
     **[RAW_LOG_END]**
 
     **[JSON_START]**
-    (ここにSection 4を出力)
+    (Section 4 のJSONをここに記述)
     **[JSON_END]**
     ---
 
@@ -354,17 +356,94 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
                 log_error("Gemini Analysis Failed", e)
                 return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
     else: return {"student_name": "QuotaError", "date": datetime.now().strftime('%Y-%m-%d')}, "Quota Limit Exceeded", transcript_text[:2000]
-    
-    def extract(s, e, src):
-        m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
-        return m.group(1).strip() if m else ""
 
-    report = extract("[DETAILED_REPORT_START]", "[DETAILED_REPORT_END]", text)
-    time_log = extract("[RAW_LOG_START]", "[RAW_LOG_END]", text)
-    json_str = extract("[JSON_START]", "[JSON_END]", text)
-    try: data = json.loads(json_str)
-    except: data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
+    # --- 抽出ロジック（強化版） ---
+    def extract_safe(s, e, src):
+        m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
+        return m.group(1).strip() if m else None
+
+    # 1. 正規の方法で抽出
+    report = extract_safe("[DETAILED_REPORT_START]", "[DETAILED_REPORT_END]", text)
+    time_log = extract_safe("[RAW_LOG_START]", "[RAW_LOG_END]", text)
+    json_str = extract_safe("[JSON_START]", "[JSON_END]", text)
+
+    # 2. フォールバック（タグが欠落していた場合の救済）
+    if not report:
+        print("⚠️ Warning: Missing REPORT tags. Attempting fallback extraction...", flush=True)
+        # ログ開始タグ、またはJSON開始タグの前までをレポートとみなす
+        if "[RAW_LOG_START]" in text:
+            report = text.split("[RAW_LOG_START]")[0].replace("[DETAILED_REPORT_START]", "").strip()
+        elif "[JSON_START]" in text:
+            report = text.split("[JSON_START]")[0].replace("[DETAILED_REPORT_START]", "").strip()
+        else:
+            # タグが一切ない場合、全文をレポートとして扱う（JSONが末尾にある可能性は考慮）
+            report = text
+
+    if not time_log:
+        time_log = "Log tags missing. Check full report."
+
+    try: 
+        if json_str: data = json.loads(json_str)
+        else: raise ValueError("No JSON block")
+    except: 
+        # JSONが見つからない場合、正規表現で無理やりJSONっぽいのを探す
+        try:
+            json_candidate = re.search(r'\{.*"student_name".*\}', text, re.DOTALL)
+            if json_candidate:
+                data = json.loads(json_candidate.group(0))
+            else:
+                data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
+        except:
+            data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
+            
     return data, report, time_log
+
+def text_to_notion_blocks(text):
+    """
+    AIのMarkdownテキストを行ごとに解析し、Notionのブロックオブジェクト配列に変換する。
+    """
+    blocks = []
+    lines = text.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        clean_content = line.replace('**', '')[:1900] # Limit char to prevent API Error
+        
+        if line.startswith('### '):
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": clean_content[4:]}}]}
+            })
+        elif line.startswith('## '):
+            blocks.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": [{"type": "text", "text": {"content": clean_content[3:]}}]}
+            })
+        elif line.startswith('# '):
+            blocks.append({
+                "object": "block",
+                "type": "heading_1",
+                "heading_1": {"rich_text": [{"type": "text", "text": {"content": clean_content[2:]}}]}
+            })
+        elif line.startswith('- ') or line.startswith('* '):
+            blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": clean_content[2:]}}]}
+            })
+        else:
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": clean_content}}]}
+            })
+            
+    return blocks
 
 # --- 5. Asset Management ---
 
@@ -439,7 +518,7 @@ def move_original_file(file_id, folder_id):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v115.0 - Expert Brain) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v117.0 - Layout Fix) ---", flush=True)
     load_student_registry()
     
     try:
@@ -512,13 +591,15 @@ def main():
             
             # Content
             content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
-            blocks = []
-            for line in content.split('\n'):
-                if line.strip():
-                    blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
             
+            # ★ FIX: Use the smart block converter instead of the primitive loop
+            blocks = text_to_notion_blocks(content)
+            
+            # Divider for Transcript
             blocks.append({"object": "block", "type": "divider", "divider": {}})
             blocks.append({"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📜 全文文字起こし"}}]}})
+            
+            # Transcript is just raw text, so chunk it simply
             for i in range(0, len(full_text), 1900):
                 chunk_text = full_text[i:i+1900]
                 blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk_text}}]}})

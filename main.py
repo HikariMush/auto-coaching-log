@@ -302,11 +302,11 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     * **② 課題 (Problem):** その挙動が引き起こす具体的なリスク（フレーム不利、撃墜拒否の失敗等）。
     * **③ 原因 (Root Cause):** なぜその課題が起きるのか（知識不足、操作精度、リスク管理の甘さ等）。
     * **④ 改善案 (Solution):** 具体的な修正アクション（％帯による技選択の変化、視線の配り方等）。
-    * **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示。状況+行動の形で曖昧性を排除（1行）。
+    * **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示（1行）。
 
     **【Section 2: If-Then プランニング（記憶定着）】**
     Section 1で特定した「課題」と「やること」を、実戦で無意識に実行できる形（トリガー＋アクション）に変換して列挙せよ。
-    * 形式: `【状況】(敵が～した時 / 自分が～の時 / （あれば）位置関係や％等の付加情報)  ➡️  【行動】(～する)`
+    * 形式: `【状況】(敵が～した時 / 自分が～の時)  ➡️  【行動】(～する)`
     * 条件は、プレイヤーが試合中にパニックになっても思い出せるよう、簡潔かつリズミカルに記述すること。
 
     **【Section 3: 時系列ログ】**
@@ -515,3 +515,41 @@ def main():
             for line in content.split('\n'):
                 if line.strip():
                     blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
+            
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+            blocks.append({"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📜 全文文字起こし"}}]}})
+            for i in range(0, len(full_text), 1900):
+                chunk_text = full_text[i:i+1900]
+                blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk_text}}]}})
+            
+            props = {
+                "名前": {"title": [{"text": {"content": f"{precise_datetime} {oname} 通話ログ"}}]}, 
+                "日付": {"date": {"start": date_only}}
+            }
+
+            print("💾 Saving to Fallback DB (All Data)...")
+            notion_create_page_heavy(sanitize_id(FINAL_FALLBACK_DB_ID), copy.deepcopy(props), copy.deepcopy(blocks))
+            
+            if did and did != FINAL_FALLBACK_DB_ID:
+                print(f"👤 Saving to Student DB ({oname})...")
+                notion_create_page_heavy(sanitize_id(did), copy.deepcopy(props), copy.deepcopy(blocks))
+            
+            # Artifacts
+            processed_folder_id = ensure_processed_folder()
+            safe_filename_time = precise_datetime.replace(':', '-').replace(' ', '_')
+            
+            upload_file_to_drive(mixed, processed_folder_id, f"{safe_filename_time}_{oname}_Full.mp3", 'audio/mpeg')
+            
+            txt_path = os.path.join(TEMP_DIR, "transcript.txt")
+            with open(txt_path, "w") as f: f.write(full_text)
+            upload_file_to_drive(txt_path, processed_folder_id, f"{safe_filename_time}_{oname}_Transcript.txt", 'text/plain')
+            
+            move_original_file(file['id'], processed_folder_id)
+
+        except Exception as e:
+            log_error(f"Processing Failed for {file['name']}", e)
+            continue
+        finally:
+            if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
+
+if __name__ == "__main__": main()

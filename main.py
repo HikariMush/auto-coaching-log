@@ -288,6 +288,7 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、プレイヤーの勝利に執着する冷徹な戦略家です。
     曖昧な励ましや感情論は一切排除し、論理的整合性と実行可能性のみを追求してください。
+    出力先はnotionなので、notion内で見やすい形で文章の体裁を加工してください。
 
     【メタデータ情報】
     {hint_context}

@@ -7,6 +7,8 @@ import shutil
 import glob
 import re
 import traceback
+import random
+import copy # ★データの複製に使用
 from datetime import datetime
 
 # --- 0. SDK & Tools ---
@@ -37,7 +39,7 @@ CHUNK_LENGTH = 900  # 15 min
 
 # Global Variables
 RESOLVED_MODEL_ID = None
-BOT_EMAIL = None # ★追加
+BOT_EMAIL = None
 
 # --- Helper: Verbose Error Printer ---
 def log_error(context, error_obj):
@@ -55,17 +57,14 @@ def setup_env():
     if sa_key:
         with open("service_account.json", "w") as f:
             f.write(sa_key)
-        
-        # ★【新機能】自己紹介機能
         try:
             key_data = json.loads(sa_key)
             BOT_EMAIL = key_data.get("client_email", "Unknown")
             print(f"\n==========================================")
             print(f"🤖 BOT EMAIL: {BOT_EMAIL}")
-            print(f"👉 Please add this email as 'Editor' to your Drive Folder!")
+            print(f"👉 Ensure this email is an 'Editor' of the folder!")
             print(f"==========================================\n", flush=True)
-        except:
-            print("⚠️ Could not parse Service Account Email.")
+        except: pass
     else:
         print("❌ ENV Error: GCP_SA_KEY is missing.")
         sys.exit(1)
@@ -77,7 +76,13 @@ try:
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
     print("💎 Detecting Best Available Model...", flush=True)
-    PRIORITY_TARGETS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
+    
+    # Proは制限がきついのでFlashのみ
+    PRIORITY_TARGETS = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash"
+    ]
+    
     for target in PRIORITY_TARGETS:
         print(f"👉 Testing: [{target}]...", flush=True)
         try:
@@ -88,8 +93,8 @@ try:
         except Exception: continue
                 
     if not RESOLVED_MODEL_ID:
-        RESOLVED_MODEL_ID = "gemini-2.0-flash-lite"
-        print(f"⚠️ Fallback to: {RESOLVED_MODEL_ID}")
+        RESOLVED_MODEL_ID = "gemini-2.0-flash"
+        print(f"⚠️ All checks failed. Forcing Fallback to: {RESOLVED_MODEL_ID}")
 
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     if not NOTION_TOKEN: raise Exception("NOTION_TOKEN missing")
@@ -217,9 +222,9 @@ def analyze_text_with_gemini(transcript_text):
             break 
         except Exception as e:
             err_str = str(e).lower()
-            if "429" in err_str or "quota" in err_str:
+            if "429" in err_str or "quota" in err_str or "overloaded" in err_str:
                 wait = 60 * (attempt + 1)
-                print(f"⏳ Gemini Busy. Waiting {wait}s...", flush=True)
+                print(f"⏳ Gemini Busy ({RESOLVED_MODEL_ID}). Waiting {wait}s...", flush=True)
                 time.sleep(wait)
             else:
                 log_error("Gemini Analysis Failed", e)
@@ -237,7 +242,7 @@ def analyze_text_with_gemini(transcript_text):
     except: data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
     return data, report, time_log
 
-# --- 4. Asset Management ---
+# --- 4. Asset Management (Dual Write & Archive) ---
 
 def notion_query_student(name):
     db_id = sanitize_id(FINAL_CONTROL_DB_ID)
@@ -254,6 +259,7 @@ def notion_query_student(name):
 
 def notion_create_page_heavy(db_id, props, children):
     print(f"📤 Posting to Notion DB: {db_id}...", flush=True)
+    
     res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": props, "children": children[:100]})
     if res.status_code != 200:
         print(f"⚠️ Initial Post Failed ({res.status_code}). Retrying with SAFE MODE...", flush=True)
@@ -270,6 +276,7 @@ def notion_create_page_heavy(db_id, props, children):
         if res.status_code != 200:
             print(f"❌ NOTION SAFE MODE FAILED: {res.status_code}\n{res.text}", flush=True)
             return
+
     response_data = res.json()
     pid = response_data.get('id')
     print(f"🔗 Notion Page Created: {response_data.get('url')}", flush=True)
@@ -288,14 +295,14 @@ def ensure_processed_folder():
         log_error("Failed to Get/Create Processed Folder", e)
         return INBOX_FOLDER_ID
 
-def upload_mix_to_drive(local_path, folder_id, rename_to):
-    print(f"📤 Uploading MP3: {rename_to}...", flush=True)
+def upload_file_to_drive(local_path, folder_id, rename_to, mime_type):
+    print(f"📤 Uploading {rename_to}...", flush=True)
     try:
-        media = MediaFileUpload(local_path, mimetype='audio/mpeg', resumable=True, chunksize=100*1024*1024)
+        media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True, chunksize=100*1024*1024)
         drive_service.files().create(body={'name': rename_to, 'parents': [folder_id]}, media_body=media, fields='id').execute()
         print("✅ Upload Complete.", flush=True)
     except Exception as e:
-        log_error("Audio Upload Failed", e)
+        log_error(f"Upload Failed for {rename_to}", e)
 
 def move_original_file(file_id, folder_id):
     if folder_id == INBOX_FOLDER_ID:
@@ -312,7 +319,7 @@ def move_original_file(file_id, folder_id):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v101.0 - Identity Reveal) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v105.0 - NotebookLM Ready) ---", flush=True)
     try:
         files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     except Exception: return
@@ -363,22 +370,43 @@ def main():
             full_text = transcribe_with_groq(chunks)
             meta, report, logs = analyze_text_with_gemini(full_text)
             
+            # 生徒IDの特定 (Control DB)
             did, oname = notion_query_student(meta['student_name'])
-            if not did: 
-                print("ℹ️ Student not found. Using Fallback DB.")
-                did = FINAL_FALLBACK_DB_ID
             
-            props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {oname} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
+            # --- Notion Write Phase (Dual Write Strategy) ---
+            
+            # ページ本文の構築
             content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
             blocks = []
             for line in content.split('\n'):
                 if line.strip():
                     blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
             
-            notion_create_page_heavy(sanitize_id(did), props, blocks)
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+            blocks.append({"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📜 全文文字起こし"}}]}})
+            for i in range(0, len(full_text), 1900):
+                chunk_text = full_text[i:i+1900]
+                blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk_text}}]}})
             
+            props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {oname} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
+
+            # 1. 常にFallback DB (NotebookLM用) に書き込む
+            print("💾 Saving to Fallback DB (All Data)...")
+            notion_create_page_heavy(sanitize_id(FINAL_FALLBACK_DB_ID), copy.deepcopy(props), copy.deepcopy(blocks))
+            
+            # 2. 生徒が特定できている場合、その生徒のDBにも書き込む
+            if did and did != FINAL_FALLBACK_DB_ID:
+                print(f"👤 Saving to Student DB ({oname})...")
+                notion_create_page_heavy(sanitize_id(did), copy.deepcopy(props), copy.deepcopy(blocks))
+            
+            # --- Artifact Management ---
             processed_folder_id = ensure_processed_folder()
-            upload_mix_to_drive(mixed, processed_folder_id, f"{meta['date']}_{oname}_Full.mp3")
+            upload_file_to_drive(mixed, processed_folder_id, f"{meta['date']}_{oname}_Full.mp3", 'audio/mpeg')
+            
+            txt_path = os.path.join(TEMP_DIR, "transcript.txt")
+            with open(txt_path, "w") as f: f.write(full_text)
+            upload_file_to_drive(txt_path, processed_folder_id, f"{meta['date']}_{oname}_Transcript.txt", 'text/plain')
+            
             move_original_file(file['id'], processed_folder_id)
 
         except Exception as e:

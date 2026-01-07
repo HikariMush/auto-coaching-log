@@ -9,7 +9,7 @@ import re
 import traceback
 import random
 import copy
-import difflib # ★追加: あいまい検索用
+import difflib
 from datetime import datetime, timedelta, timezone
 
 # --- 0. SDK & Tools ---
@@ -42,7 +42,7 @@ CHUNK_LENGTH = 900  # 15 min
 # Global Variables
 RESOLVED_MODEL_ID = None
 BOT_EMAIL = None
-STUDENT_REGISTRY = {} # ★生徒名簿キャッシュ { "name": "page_id" }
+STUDENT_REGISTRY = {}
 
 # --- Helper: Verbose Error Printer ---
 def log_error(context, error_obj):
@@ -115,12 +115,9 @@ def sanitize_id(raw_id):
     match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
     return match.group(1) if match else None
 
-# --- ★ New Logic: Student Registry & Fuzzy Match ---
+# --- Logic: Registry & Fuzzy Match ---
 
 def load_student_registry():
-    """
-    Control DBから生徒一覧を一括取得してキャッシュする
-    """
     global STUDENT_REGISTRY
     print("📋 Loading Student Registry from Notion...", flush=True)
     db_id = sanitize_id(FINAL_CONTROL_DB_ID)
@@ -138,56 +135,32 @@ def load_student_registry():
             res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=HEADERS, json=payload)
             if res.status_code != 200: break
             data = res.json()
-            
             for row in data.get("results", []):
-                # Nameプロパティの取得
                 try:
                     name_list = row["properties"]["Name"]["title"]
                     if not name_list: continue
                     name = name_list[0]["plain_text"]
-                    
-                    # TargetID (生徒別DBのID) の取得
                     tid_list = row["properties"]["TargetID"]["rich_text"]
                     tid = sanitize_id(tid_list[0]["plain_text"]) if tid_list else None
-                    
                     if name and tid:
                         STUDENT_REGISTRY[name] = tid
                         count += 1
                 except: continue
-            
             has_more = data.get("has_more", False)
             next_cursor = data.get("next_cursor")
-        except Exception as e:
-            print(f"⚠️ Registry Load Error: {e}")
-            break
-            
+        except Exception as e: break
     print(f"✅ Loaded {count} students into registry.", flush=True)
 
 def find_best_student_match(query_name):
-    """
-    あいまい検索で最も近い生徒を探す
-    """
-    if not query_name or not STUDENT_REGISTRY:
-        return None, query_name
-
-    # 1. 完全一致チェック
-    if query_name in STUDENT_REGISTRY:
-        return STUDENT_REGISTRY[query_name], query_name
-
-    # 2. あいまい検索 (類似度0.4以上)
-    # difflib.get_close_matches はリストを返す
-    candidates = list(STUDENT_REGISTRY.keys())
-    matches = difflib.get_close_matches(query_name, candidates, n=1, cutoff=0.4)
-    
+    if not query_name or not STUDENT_REGISTRY: return None, query_name
+    if query_name in STUDENT_REGISTRY: return STUDENT_REGISTRY[query_name], query_name
+    matches = difflib.get_close_matches(query_name, list(STUDENT_REGISTRY.keys()), n=1, cutoff=0.4)
     if matches:
-        best_name = matches[0]
-        print(f"🎯 Fuzzy Match: '{query_name}' -> '{best_name}'", flush=True)
-        return STUDENT_REGISTRY[best_name], best_name
-    
-    print(f"⚠️ No match found for '{query_name}'.", flush=True)
+        print(f"🎯 Fuzzy Match: '{query_name}' -> '{matches[0]}'", flush=True)
+        return STUDENT_REGISTRY[matches[0]], matches[0]
     return None, query_name
 
-# --- 2. Logic: Metadata Helpers ---
+# --- Logic: Metadata Helpers ---
 
 def sanitize_filename(filename):
     return filename.replace("/", "_").replace("\\", "_")
@@ -224,12 +197,9 @@ def detect_student_candidate_raw(file_list, original_archive_name):
     for f in file_list:
         basename = os.path.basename(f).lower()
         if any(ign in basename for ign in ignore_files): continue
-        
         name_part = os.path.splitext(basename)[0]
         craig_match = re.match(r'^\d+-(.+)', name_part)
-        
         candidate = craig_match.group(1) if craig_match else name_part
-            
         if any(ign in candidate for ign in ignore_names): continue
         if len(candidate) < 2: continue
 
@@ -237,7 +207,6 @@ def detect_student_candidate_raw(file_list, original_archive_name):
         else: weak_candidates.append(candidate)
 
     final = strong_candidates if strong_candidates else weak_candidates
-    
     if not final:
         base = os.path.basename(original_archive_name)
         name_cleaned = re.sub(r'\.zip|\.flac|\.mp3|\.wav', '', base, flags=re.IGNORECASE)
@@ -306,59 +275,62 @@ def transcribe_with_groq(chunk_paths):
         else: raise Exception("❌ Groq Rate Limit persists. Aborting.")
     return full_transcript
 
-# --- 4. Intelligence Analysis ---
+# --- 4. Intelligence Analysis (Expert Mode) ---
 
 def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     print(f"🧠 Gemini Analyzing using [{RESOLVED_MODEL_ID}]...", flush=True)
     
     hint_context = f"録音日時: {date_hint}"
     if raw_name_hint:
-        hint_context += f"\n【重要】ファイル名ヒント: '{raw_name_hint}'"
+        hint_context += f"\n【重要】ファイル名ヒント: '{raw_name_hint}' (これを最優先で生徒名として採用せよ)"
     
+    # ★プロンプトの超強化
     prompt = f"""
-    あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストです。
-    
-    【重要: 生徒名の特定】
-    以下のヒントと会話内容から、生徒の名前を特定してください。
-    
+    あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、プレイヤーの勝利に執着する冷徹な戦略家です。
+    曖昧な励ましや感情論は一切排除し、論理的整合性と実行可能性のみを追求してください。
+
+    【メタデータ情報】
     {hint_context}
 
-    * ヒント（例: nattsu9463）がある場合、それは**ほぼ確実に生徒名**です。
-    * もしヒントが無くても、会話で「〇〇さん」と呼ばれていればそれを採用してください。
-    * どうしても不明な場合のみ "Unknown" としてください。
-
     ---
-    会話ログを精読し、以下の3つのセクションを出力すること。
+    提供された文字起こしデータを徹底的に分析し、以下のフォーマットで出力してください。
 
-    **【Section 1: トピック別・詳細分析レポート】**
-    主要なトピックを抽出し、以下5要素で記述。
-    * ① 現状 (Status)
-    * ② 課題 (Problem)
-    * ③ 原因 (Root Cause)
-    * ④ 改善案 (Solution)
-    * ⑤ やること (Next Action): 1行
+    **【Section 1: 詳細分析レポート】**
+    会話で扱われた主要な技術的トピック（例：崖狩り、着地狩り、ライン管理、特定の技の対処法など）を抽出し、表形式のような構造で出力すること。
+    各トピックについて、以下の5項目を**具体的かつ専門的に**記述せよ。
+    * **① 現状 (Status):** プレイヤーの現在の挙動、癖、認識のズレ。
+    * **② 課題 (Problem):** その挙動が引き起こす具体的なリスク（フレーム不利、撃墜拒否の失敗等）。
+    * **③ 原因 (Root Cause):** なぜその課題が起きるのか（知識不足、操作精度、リスク管理の甘さ等）。
+    * **④ 改善案 (Solution):** 具体的な修正アクション（％帯による技選択の変化、視線の配り方等）。
+    * **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示。状況+行動の形で曖昧性を排除（1行）。
 
-    **【Section 2: 時系列ログ】**
-    箇条書きで詳細に。
+    **【Section 2: If-Then プランニング（記憶定着）】**
+    Section 1で特定した「課題」と「やること」を、実戦で無意識に実行できる形（トリガー＋アクション）に変換して列挙せよ。
+    * 形式: `【状況】(敵が～した時 / 自分が～の時 / （あれば）位置関係や％等の付加情報)  ➡️  【行動】(～する)`
+    * 条件は、プレイヤーが試合中にパニックになっても思い出せるよう、簡潔かつリズミカルに記述すること。
 
-    **【Section 3: メタデータJSON】**
+    **【Section 3: 時系列ログ】**
+    セッション全体の流れを時系列で箇条書きにせよ。重要なアドバイスや気づきがあったタイミングを逃さず記録すること。
+
+    **【Section 4: メタデータJSON】**
+    以下のJSONのみを出力すること。student_nameはヒントがあればそれを最優先すること。
     {{
-      "student_name": "決定した生徒名",
+      "student_name": "生徒名",
       "date": "YYYY-MM-DD",
-      "next_action": "アクション1つ"
+      "next_action": "最も優先度の高いアクション1つ"
     }}
 
     ---
     **[DETAILED_REPORT_START]**
-    (Section 1)
+    (ここにSection 1とSection 2を出力)
     **[DETAILED_REPORT_END]**
 
     **[RAW_LOG_START]**
-    (Section 2)
+    (ここにSection 3を出力)
     **[RAW_LOG_END]**
 
     **[JSON_START]**
-    (Section 3)
+    (ここにSection 4を出力)
     **[JSON_END]**
     ---
 
@@ -466,9 +438,7 @@ def move_original_file(file_id, folder_id):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v114.0 - Fuzzy Matcher) ---", flush=True)
-    
-    # ★処理開始前に全生徒リストをロード
+    print("--- SZ AUTO LOGGER ULTIMATE (v115.0 - Expert Brain) ---", flush=True)
     load_student_registry()
     
     try:
@@ -519,9 +489,7 @@ def main():
                             extracted_files.append(full_p)
                             if af.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')) and 'final_mix' not in af and 'chunk' not in af:
                                 srcs.append(full_p)
-                    
                     candidate_raw_name = detect_student_candidate_raw(extracted_files, file['name'])
-
                 except Exception as e:
                     log_error(f"Archive Extraction Failed", e)
                     continue
@@ -534,53 +502,16 @@ def main():
             mixed = mix_audio_ffmpeg(srcs)
             chunks = split_audio_ffmpeg(mixed)
             full_text = transcribe_with_groq(chunks)
+            
+            # Analysis
             meta, report, logs = analyze_text_with_gemini(full_text, precise_datetime, candidate_raw_name)
             
-            # ★【変更】あいまい検索で正式名称とIDを特定
+            # DB Matching
             did, oname = find_best_student_match(meta['student_name'])
             
-            # Content Construction
+            # Content
             content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
             blocks = []
             for line in content.split('\n'):
                 if line.strip():
                     blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": line[:1900]}}]}})
-            
-            blocks.append({"object": "block", "type": "divider", "divider": {}})
-            blocks.append({"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📜 全文文字起こし"}}]}})
-            for i in range(0, len(full_text), 1900):
-                chunk_text = full_text[i:i+1900]
-                blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk_text}}]}})
-            
-            # 正式名称を使ってタイトル生成
-            props = {
-                "名前": {"title": [{"text": {"content": f"{precise_datetime} {oname} 通話ログ"}}]}, 
-                "日付": {"date": {"start": date_only}}
-            }
-
-            print("💾 Saving to Fallback DB (All Data)...")
-            notion_create_page_heavy(sanitize_id(FINAL_FALLBACK_DB_ID), copy.deepcopy(props), copy.deepcopy(blocks))
-            
-            if did and did != FINAL_FALLBACK_DB_ID:
-                print(f"👤 Saving to Student DB ({oname})...")
-                notion_create_page_heavy(sanitize_id(did), copy.deepcopy(props), copy.deepcopy(blocks))
-            
-            # Artifacts
-            processed_folder_id = ensure_processed_folder()
-            safe_filename_time = precise_datetime.replace(':', '-').replace(' ', '_')
-            
-            upload_file_to_drive(mixed, processed_folder_id, f"{safe_filename_time}_{oname}_Full.mp3", 'audio/mpeg')
-            
-            txt_path = os.path.join(TEMP_DIR, "transcript.txt")
-            with open(txt_path, "w") as f: f.write(full_text)
-            upload_file_to_drive(txt_path, processed_folder_id, f"{safe_filename_time}_{oname}_Transcript.txt", 'text/plain')
-            
-            move_original_file(file['id'], processed_folder_id)
-
-        except Exception as e:
-            log_error(f"Processing Failed for {file['name']}", e)
-            continue
-        finally:
-            if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR); os.makedirs(TEMP_DIR)
-
-if __name__ == "__main__": main()

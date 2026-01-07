@@ -1,14 +1,14 @@
 name: SZ Auto Logger Ultimate
 
 on:
-  workflow_dispatch: # 手動実行ボタン
+  workflow_dispatch: # 手動実行ボタン（テスト用）
   schedule:
-    - cron: '*/30 * * * *' # 【追加】30分ごとに自動実行 (UTC)
+    - cron: '0 0,12 * * *' # 毎日 UTC 0:00(JST 9:00) と 12:00(JST 21:00)
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 350 # 長時間の音声処理に耐えるため延長
+    timeout-minutes: 360 # 6時間（念の為長めに）
 
     steps:
       - name: Checkout repository

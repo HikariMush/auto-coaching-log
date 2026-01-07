@@ -284,47 +284,56 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     if raw_name_hint:
         hint_context += f"\n【重要】ファイル名ヒント: '{raw_name_hint}' (これを最優先で生徒名として採用せよ)"
     
-    # ★プロンプト修正：表形式とHTMLを禁止し、Notion互換のマークダウンを強制
+    # ★プロンプト強化：レイアウトは維持しつつ、分析精度を極限まで高める
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、プレイヤーの勝利に執着する冷徹な戦略家です。
-    曖昧な励ましや感情論は一切排除し、論理的整合性と実行可能性のみを追求してください。
+    曖昧な励ましや社交辞令は一切排除し、フレームデータ、リスクリターン、人読み（癖読み）の観点から深く鋭い指摘を行ってください。
 
     【メタデータ情報】
     {hint_context}
 
     ---
-    提供された文字起こしデータを徹底的に分析し、以下のフォーマットで出力してください。
-    
-    **【重要：出力形式の厳守】**
-    * **表形式（Markdown Table）はNotionで崩れるため絶対に使用しないこと。**
-    * **<br>等のHTMLタグは使用しないこと。**
-    * 必ず「見出し（###）」と「箇条書き（-）」の組み合わせで構成すること。
+    **【重要：出力レイアウト規則】**
+    * Notionで見やすい階層構造を作ること。表形式(Markdown Table)やHTMLタグは禁止。
+    * **構造:**
+        * トピック名: `##` (H2)
+        * 詳細項目: `- **項目名:** 内容` (箇条書き＋太字)
+    * **余白:** 項目やセクションの間には必ず「空行」を入れること。
 
     **【Section 1: 詳細分析レポート】**
-    会話で扱われた主要な技術的トピックを抽出し、以下の構造で記述せよ。
+    会話データから主要な改善ポイント（例：崖狩り、着地狩り、ライン管理、復帰阻止など）を抽出し、
+    各トピックについて以下の**5つの観点**を必ず網羅して記述せよ。省略は許されない。
 
-    ### [トピック名]
-    - **現状:** プレイヤーの現在の挙動、癖。
-    - **課題:** その挙動が引き起こすリスク。
-    - **原因:** なぜその課題が起きるのか。
-    - **改善案:** 具体的な修正アクション。
-    - **やること:** 即座に実行可能な指示。
+    ## [トピック名]
 
-    (トピックが複数ある場合は上記を繰り返す)
+    - **① 現状 (Status):** プレイヤーが現在行っている具体的な挙動、癖、認識のズレ。
+
+    - **② 課題 (Problem):** その挙動が引き起こすリスク（不利フレーム、撃墜拒否ミス、ライン喪失など）。
+
+    - **③ 原因 (Root Cause):** なぜその課題が起きるのか（知識不足、手癖、リスク管理の甘さ、相手の行動確認不足など）。
+
+    - **④ 改善案 (Solution):** 具体的な修正アクション（％帯による技選択、視線の配り方、意識配分）。
+
+    - **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示。
+
+    (トピックが複数ある場合は、空行を入れてこれを繰り返す)
 
     **【Section 2: 課題セット】**
-    Section 1の内容を元に、生徒が試合中に反復確認するための**「超簡潔なアクションリスト」**を作成せよ。
-    * **文法ルール:** 文章の使用を禁ずる。「単語」と「矢印(→)」のみを使用すること。
-    * **形式:** `[状況/トリガー] → [アクション]`
-    * **改行ルール:** 項目名や分類などで「:（コロン）」を使用した場合は、**その直後で必ず改行を入れること。**
+    Section 1の内容を元に、生徒が試合中や練習中に反復確認するための**「超簡潔なアクションリスト」**を作成せよ。
+    * **形式:** `### [状況/分類]` で見出しを作り、その下に `[トリガー] → [アクション]` を列挙。
+    * **文法:** 文章禁止。単語と矢印のみ。
 
-    * **良い例（推奨）:**
-        「ジャンプ確認 → 空前」
-        「復帰阻止:
-        ルート確認 → 技置き」
+    * **出力例:**
+    ### 復帰阻止展開
+    - ルート確認 → 空前置き
+    - 崖下待機 → メテオ合わせ
+
+    ### 着地狩り
+    - N回避確認 → 最大リターン
+    - 暴れ読み → ガード待機
 
     **【Section 3: 時系列ログ】**
-    セッション全体の流れを時系列で箇条書きにせよ。
+    セッション全体の流れを時系列で箇条書きにせよ。重要な気づきの瞬間を逃さないこと。
 
     **【Section 4: メタデータJSON】**
     以下のJSONのみを出力すること。
@@ -335,18 +344,18 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     }}
 
     ---
-    **出力ブロック（システム制御のためタグ必須）：**
+    **出力ブロック（システム制御用タグ）：**
 
     **[DETAILED_REPORT_START]**
-    (Section 1 と Section 2 の内容をここに記述)
+    (Section 1 と Section 2 の内容)
     **[DETAILED_REPORT_END]**
 
     **[RAW_LOG_START]**
-    (Section 3 の内容をここに記述)
+    (Section 3 の内容)
     **[RAW_LOG_END]**
 
     **[JSON_START]**
-    (Section 4 のJSONをここに記述)
+    (Section 4 のJSON)
     **[JSON_END]**
     ---
 
@@ -370,28 +379,22 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
                 return {"student_name": "AnalysisError", "date": datetime.now().strftime('%Y-%m-%d')}, f"Analysis Error: {e}", transcript_text[:2000]
     else: return {"student_name": "QuotaError", "date": datetime.now().strftime('%Y-%m-%d')}, "Quota Limit Exceeded", transcript_text[:2000]
 
-    # --- 抽出ロジック（強化版） ---
     def extract_safe(s, e, src):
         m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
         return m.group(1).strip() if m else None
 
-    # 1. 正規の方法で抽出
     report = extract_safe("[DETAILED_REPORT_START]", "[DETAILED_REPORT_END]", text)
     time_log = extract_safe("[RAW_LOG_START]", "[RAW_LOG_END]", text)
     json_str = extract_safe("[JSON_START]", "[JSON_END]", text)
 
-    # 2. フォールバック（タグが欠落していた場合の救済）
     if not report:
-        print("⚠️ Warning: Missing REPORT tags. Attempting fallback extraction...", flush=True)
+        print("⚠️ Warning: Missing REPORT tags. Fallback...", flush=True)
         if "[RAW_LOG_START]" in text:
             report = text.split("[RAW_LOG_START]")[0].replace("[DETAILED_REPORT_START]", "").strip()
-        elif "[JSON_START]" in text:
-            report = text.split("[JSON_START]")[0].replace("[DETAILED_REPORT_START]", "").strip()
         else:
             report = text
 
-    if not time_log:
-        time_log = "Log tags missing. Check full report."
+    if not time_log: time_log = "Log tags missing."
 
     try: 
         if json_str: data = json.loads(json_str)
@@ -399,10 +402,8 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     except: 
         try:
             json_candidate = re.search(r'\{.*"student_name".*\}', text, re.DOTALL)
-            if json_candidate:
-                data = json.loads(json_candidate.group(0))
-            else:
-                data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
+            if json_candidate: data = json.loads(json_candidate.group(0))
+            else: data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
         except:
             data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
             
@@ -410,26 +411,25 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
 
 def text_to_notion_blocks(text):
     """
-    AIのMarkdownテキストを行ごとに解析し、Notionのブロックオブジェクト配列に変換する。
+    Markdownを行ごとに解析し、Notionブロックに変換。
     """
     blocks = []
     lines = text.split('\n')
     
     for line in lines:
-        line = line.strip()
-        if not line:
+        if not line.strip():
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": []} # Empty paragraph for spacing
+            })
             continue
         
-        # テーブル構文が残っていた場合の緊急回避（表の罫線などを無視）
-        if line.startswith('|') or line.startswith('+-') or '---' in line:
-             # テーブルの中身の文字だけは救出したいが、罫線はスキップ
-             if set(line.strip()) <= {'|', '-', '+', ' '}: continue
-             # テーブル行の場合は、単なるテキストとして処理（パイプ削除）
-             clean_content = line.replace('|', ' ').strip()
-        else:
-             clean_content = line
+        if line.startswith('|') or line.startswith('+-'):
+             continue 
 
-        clean_content = clean_content.replace('**', '')[:1900] 
+        # 太字(**)はNotion APIでサポートされるため、削除せずそのまま渡す
+        clean_content = line[:1900] 
         
         if line.startswith('### '):
             blocks.append({
@@ -537,7 +537,7 @@ def move_original_file(file_id, folder_id):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v119.0 - Layout Fix) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v121.0 - Analyst Hardened) ---", flush=True)
     load_student_registry()
     
     try:
@@ -609,7 +609,7 @@ def main():
             did, oname = find_best_student_match(meta['student_name'])
             
             # Content
-            content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
+            content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n\n### 📝 時系列ログ\n\n{logs}"
             
             # Convert to Blocks
             blocks = text_to_notion_blocks(content)

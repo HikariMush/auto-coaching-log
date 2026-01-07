@@ -284,36 +284,39 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     if raw_name_hint:
         hint_context += f"\n【重要】ファイル名ヒント: '{raw_name_hint}' (これを最優先で生徒名として採用せよ)"
     
-    # ★プロンプトの超強化
+    # ★プロンプト修正：表形式とHTMLを禁止し、Notion互換のマークダウンを強制
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、プレイヤーの勝利に執着する冷徹な戦略家です。
     曖昧な励ましや感情論は一切排除し、論理的整合性と実行可能性のみを追求してください。
-    出力先はnotionなので、notion内で見やすい形で文章の体裁を加工してください。インデントを禁じます。
 
     【メタデータ情報】
     {hint_context}
 
     ---
     提供された文字起こしデータを徹底的に分析し、以下のフォーマットで出力してください。
-    **特に [DETAILED_REPORT_START] 等のタグはシステム制御に必須です。絶対に出力に含めてください。**
+    
+    **【重要：出力形式の厳守】**
+    * **表形式（Markdown Table）はNotionで崩れるため絶対に使用しないこと。**
+    * **<br>等のHTMLタグは使用しないこと。**
+    * 必ず「見出し（###）」と「箇条書き（-）」の組み合わせで構成すること。
 
     **【Section 1: 詳細分析レポート】**
-    会話で扱われた主要な技術的トピックを抽出し、表形式のような構造で出力すること。
-    各トピックについて、以下の5項目を具体的かつ専門的に記述せよ。
-    **① 現状 (Status):** プレイヤーの現在の挙動、癖、認識のズレ。
-    **② 課題 (Problem):** その挙動が引き起こす具体的なリスク。
-    **③ 原因 (Root Cause):** なぜその課題が起きるのか。
-    **④ 改善案 (Solution):** 具体的な修正アクション。
-    **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示。
+    会話で扱われた主要な技術的トピックを抽出し、以下の構造で記述せよ。
+
+    ### [トピック名]
+    - **現状:** プレイヤーの現在の挙動、癖。
+    - **課題:** その挙動が引き起こすリスク。
+    - **原因:** なぜその課題が起きるのか。
+    - **改善案:** 具体的な修正アクション。
+    - **やること:** 即座に実行可能な指示。
+
+    (トピックが複数ある場合は上記を繰り返す)
 
     **【Section 2: 課題セット】**
     Section 1の内容を元に、生徒が試合中に反復確認するための**「超簡潔なアクションリスト」**を作成せよ。
     * **文法ルール:** 文章の使用を禁ずる。「単語」と「矢印(→)」のみを使用すること。
     * **形式:** `[状況/トリガー] → [アクション]`
     * **改行ルール:** 項目名や分類などで「:（コロン）」を使用した場合は、**その直後で必ず改行を入れること。**
-
-    * **悪い例（禁止）:** 「相手がジャンプしたのを確認したら、空前を置いてリスクをつけましょう」
-        「復帰阻止: 相手のルートを見てから技を置く」
 
     * **良い例（推奨）:**
         「ジャンプ確認 → 空前」
@@ -332,7 +335,7 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     }}
 
     ---
-    **出力形式（順守すること）：**
+    **出力ブロック（システム制御のためタグ必須）：**
 
     **[DETAILED_REPORT_START]**
     (Section 1 と Section 2 の内容をここに記述)
@@ -380,13 +383,11 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     # 2. フォールバック（タグが欠落していた場合の救済）
     if not report:
         print("⚠️ Warning: Missing REPORT tags. Attempting fallback extraction...", flush=True)
-        # ログ開始タグ、またはJSON開始タグの前までをレポートとみなす
         if "[RAW_LOG_START]" in text:
             report = text.split("[RAW_LOG_START]")[0].replace("[DETAILED_REPORT_START]", "").strip()
         elif "[JSON_START]" in text:
             report = text.split("[JSON_START]")[0].replace("[DETAILED_REPORT_START]", "").strip()
         else:
-            # タグが一切ない場合、全文をレポートとして扱う（JSONが末尾にある可能性は考慮）
             report = text
 
     if not time_log:
@@ -396,7 +397,6 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
         if json_str: data = json.loads(json_str)
         else: raise ValueError("No JSON block")
     except: 
-        # JSONが見つからない場合、正規表現で無理やりJSONっぽいのを探す
         try:
             json_candidate = re.search(r'\{.*"student_name".*\}', text, re.DOTALL)
             if json_candidate:
@@ -419,8 +419,17 @@ def text_to_notion_blocks(text):
         line = line.strip()
         if not line:
             continue
+        
+        # テーブル構文が残っていた場合の緊急回避（表の罫線などを無視）
+        if line.startswith('|') or line.startswith('+-') or '---' in line:
+             # テーブルの中身の文字だけは救出したいが、罫線はスキップ
+             if set(line.strip()) <= {'|', '-', '+', ' '}: continue
+             # テーブル行の場合は、単なるテキストとして処理（パイプ削除）
+             clean_content = line.replace('|', ' ').strip()
+        else:
+             clean_content = line
 
-        clean_content = line.replace('**', '')[:1900] # Limit char to prevent API Error
+        clean_content = clean_content.replace('**', '')[:1900] 
         
         if line.startswith('### '):
             blocks.append({
@@ -528,7 +537,7 @@ def move_original_file(file_id, folder_id):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v118.0 - TaskSet Mode) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v119.0 - Layout Fix) ---", flush=True)
     load_student_registry()
     
     try:

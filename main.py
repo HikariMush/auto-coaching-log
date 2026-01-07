@@ -8,7 +8,7 @@ import glob
 import re
 import traceback
 import random
-import copy # ★データの複製に使用
+import copy
 from datetime import datetime
 
 # --- 0. SDK & Tools ---
@@ -29,6 +29,7 @@ from groq import Groq
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.errors import HttpError
 import patoolib
 
 # --- Configuration ---
@@ -43,9 +44,12 @@ BOT_EMAIL = None
 
 # --- Helper: Verbose Error Printer ---
 def log_error(context, error_obj):
-    print(f"\n❌ [ERROR] {context}", flush=True)
-    print(f"   Details: {str(error_obj)}", flush=True)
-    print("-" * 30, flush=True)
+    if isinstance(error_obj, HttpError) and "storageQuotaExceeded" in str(error_obj):
+        print(f"⚠️ [Quota Limit] Could not upload artifact ({context}). Skipping.", flush=True)
+    else:
+        print(f"\n❌ [ERROR] {context}", flush=True)
+        print(f"   Details: {str(error_obj)}", flush=True)
+        print("-" * 30, flush=True)
 
 # --- 1. Initialization (Setup) ---
 def setup_env():
@@ -77,10 +81,10 @@ try:
     
     print("💎 Detecting Best Available Model...", flush=True)
     
-    # Proは制限がきついのでFlashのみ
     PRIORITY_TARGETS = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash"
+        "gemini-2.5-flash", 
+        "gemini-2.0-flash",
+        "gemini-1.5-flash"
     ]
     
     for target in PRIORITY_TARGETS:
@@ -93,7 +97,7 @@ try:
         except Exception: continue
                 
     if not RESOLVED_MODEL_ID:
-        RESOLVED_MODEL_ID = "gemini-2.0-flash"
+        RESOLVED_MODEL_ID = "gemini-1.5-flash"
         print(f"⚠️ All checks failed. Forcing Fallback to: {RESOLVED_MODEL_ID}")
 
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -114,7 +118,44 @@ def sanitize_id(raw_id):
     match = re.search(r'([a-fA-F0-9]{32})', str(raw_id).replace("-", ""))
     return match.group(1) if match else None
 
-# --- 2. Audio Pipeline ---
+# --- 2. Logic: Date & Name Extraction ---
+
+def extract_date_from_filename(filename):
+    # Craig Format: craig_ID_YYYY-MM-DD_HH-MM-SS.flac.zip
+    match = re.search(r'(\d{4}-\d{2}-\d{2})_(\d{1,2}-\d{1,2}-\d{1,2})', filename)
+    if match:
+        d_part = match.group(1)
+        t_part = match.group(2).replace('-', ':')
+        t_parts = t_part.split(':')
+        t_formatted = f"{int(t_parts[0]):02}:{int(t_parts[1]):02}:{int(t_parts[2]):02}"
+        return f"{d_part} {t_formatted}", d_part
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S'), datetime.now().strftime('%Y-%m-%d')
+
+def detect_student_candidate_raw(file_list):
+    candidates = []
+    
+    print("🔎 Scanning files for student ID hint...", flush=True)
+    for f in file_list:
+        basename = os.path.basename(f).lower()
+        name_part = os.path.splitext(basename)[0]
+        
+        if '-' in name_part:
+            parts = name_part.split('-', 1)
+            if parts[0].isdigit():
+                name_part = parts[1]
+        
+        if "hikari" in name_part or "craig" in name_part:
+            continue
+            
+        candidates.append(name_part)
+
+    if candidates:
+        hint = ", ".join(sorted(list(set(candidates))))
+        print(f"💡 Found Student Candidate Hint: {hint}", flush=True)
+        return hint
+    return None
+
+# --- 3. Audio Pipeline ---
 
 def run_ffmpeg_command(cmd, task_name):
     try:
@@ -168,13 +209,27 @@ def transcribe_with_groq(chunk_paths):
         else: raise Exception("❌ Groq Rate Limit persists. Aborting.")
     return full_transcript
 
-# --- 3. Intelligence Analysis ---
+# --- 4. Intelligence Analysis (AI Name Fusion) ---
 
-def analyze_text_with_gemini(transcript_text):
+def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     print(f"🧠 Gemini Analyzing using [{RESOLVED_MODEL_ID}]...", flush=True)
+    
+    hint_context = f"録音日時: {date_hint}"
+    if raw_name_hint:
+        hint_context += f"\n【重要】ファイル名に含まれていた参加者ID: '{raw_name_hint}'"
+    
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的かつ冷徹なコーチング記録官です。
-    渡された対話ログを精読し、以下の3つのセクションを厳密なフォーマットで出力してください。
+    
+    【ミッション】
+    以下のメタデータヒントと、実際の会話内容（文字起こし）を統合し、生徒の名前を特定してください。
+    ファイル名にあるID（例: tarou_ssb）と、会話中の呼びかけ（例: 「太郎さん」）に表記揺れがある場合は、
+    **人間が読んで自然な名前（例: 太郎）** を優先して採用してください。
+
+    {hint_context}
+
+    ---
+    会話ログを精読し、以下の3つのセクションを出力すること。
 
     **【Section 1: トピック別・詳細分析レポート】**
     会話の中で扱われた「主要なトピック（例：崖上がり狩り、ライン管理、復帰阻止）」をすべて抽出し、
@@ -190,9 +245,9 @@ def analyze_text_with_gemini(transcript_text):
     セッションの流れを時系列（Time-Series）で詳細に箇条書きにすること。
 
     **【Section 3: メタデータJSON】**
-    以下のJSONのみを出力すること。
+    以下のJSONのみを出力すること。student_nameはあなたが決定した最適な名前にすること。
     {{
-      "student_name": "生徒の名前（不明ならUnknown）",
+      "student_name": "決定した生徒名",
       "date": "YYYY-MM-DD",
       "next_action": "最も優先度の高いアクション1つ"
     }}
@@ -242,12 +297,13 @@ def analyze_text_with_gemini(transcript_text):
     except: data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
     return data, report, time_log
 
-# --- 4. Asset Management (Dual Write & Archive) ---
+# --- 5. Asset Management ---
 
 def notion_query_student(name):
     db_id = sanitize_id(FINAL_CONTROL_DB_ID)
     if not db_id: return None, name
     try:
+        # Notion検索
         res = requests.post(f"https://api.notion.com/v1/databases/{db_id}/query", headers=HEADERS, json={"filter": {"property": "Name", "title": {"contains": name}}})
         if res.status_code == 200 and res.json().get("results"):
             row = res.json()["results"][0]
@@ -259,7 +315,6 @@ def notion_query_student(name):
 
 def notion_create_page_heavy(db_id, props, children):
     print(f"📤 Posting to Notion DB: {db_id}...", flush=True)
-    
     res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": props, "children": children[:100]})
     if res.status_code != 200:
         print(f"⚠️ Initial Post Failed ({res.status_code}). Retrying with SAFE MODE...", flush=True)
@@ -269,8 +324,9 @@ def notion_create_page_heavy(db_id, props, children):
         if not safe_props:
              content_text = props.get("名前", {}).get("title", [{}])[0].get("text", {}).get("content", "Log")
              safe_props = {"Name": {"title": [{"text": {"content": content_text}}]}}
-        date_info = props.get("日付", {}).get("date", {}).get("start", "Unknown Date")
-        error_note = {"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": f"⚠️ Date Property Missing. Date: {date_info}"}}]}}
+        # 日付がない場合の警告
+        date_val = props.get("日付", {}).get("date", {}).get("start", "Unknown")
+        error_note = {"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": f"⚠️ Date Prop Missing. Date: {date_val}"}}]}}
         children.insert(0, error_note)
         res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": safe_props, "children": children[:100]})
         if res.status_code != 200:
@@ -299,7 +355,12 @@ def upload_file_to_drive(local_path, folder_id, rename_to, mime_type):
     print(f"📤 Uploading {rename_to}...", flush=True)
     try:
         media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True, chunksize=100*1024*1024)
-        drive_service.files().create(body={'name': rename_to, 'parents': [folder_id]}, media_body=media, fields='id').execute()
+        drive_service.files().create(
+            body={'name': rename_to, 'parents': [folder_id]}, 
+            media_body=media, 
+            fields='id',
+            supportsAllDrives=True
+        ).execute()
         print("✅ Upload Complete.", flush=True)
     except Exception as e:
         log_error(f"Upload Failed for {rename_to}", e)
@@ -311,7 +372,12 @@ def move_original_file(file_id, folder_id):
     try:
         prev_parents = drive_service.files().get(fileId=file_id, fields='parents').execute().get('parents', [])
         prev_str = ",".join(prev_parents)
-        drive_service.files().update(fileId=file_id, addParents=folder_id, removeParents=prev_str).execute()
+        drive_service.files().update(
+            fileId=file_id, 
+            addParents=folder_id, 
+            removeParents=prev_str,
+            supportsAllDrives=True
+        ).execute()
         print(f"📦 Archived original file to folder [{folder_id}].", flush=True)
     except Exception as e:
         log_error(f"Move Original File Failed (ID: {file_id})", e)
@@ -319,7 +385,7 @@ def move_original_file(file_id, folder_id):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v105.0 - NotebookLM Ready) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v111.0 - Title Formatting) ---", flush=True)
     try:
         files = drive_service.files().list(q=f"'{INBOX_FOLDER_ID}' in parents and trashed=false and mimeType!='application/vnd.google-apps.folder'").execute().get('files', [])
     except Exception: return
@@ -331,6 +397,7 @@ def main():
             print(f"\n📂 Processing: {file['name']}")
             fpath = os.path.join(TEMP_DIR, file['name'])
             
+            # --- Step A: Download ---
             max_dl_retries = 3
             for dl_attempt in range(max_dl_retries):
                 try:
@@ -351,13 +418,21 @@ def main():
                 continue
 
             srcs = []
+            candidate_raw_name = None
+
             if file['name'].endswith('.zip'):
                 try:
                     patoolib.extract_archive(fpath, outdir=TEMP_DIR)
+                    extracted_files = []
                     for r, _, fs in os.walk(TEMP_DIR):
                         for af in fs:
+                            full_p = os.path.join(r, af)
+                            extracted_files.append(full_p)
                             if af.lower().endswith(('.flac', '.mp3', '.m4a', '.wav')) and 'final_mix' not in af and 'chunk' not in af:
-                                srcs.append(os.path.join(r, af))
+                                srcs.append(full_p)
+                    
+                    candidate_raw_name = detect_student_candidate_raw(extracted_files)
+
                 except Exception as e:
                     log_error(f"Archive Extraction Failed", e)
                     continue
@@ -365,17 +440,18 @@ def main():
             
             if not srcs: print("ℹ️ No audio files found."); continue
             
+            # --- Step B: Processing ---
+            precise_datetime, date_only = extract_date_from_filename(file['name'])
+
             mixed = mix_audio_ffmpeg(srcs)
             chunks = split_audio_ffmpeg(mixed)
             full_text = transcribe_with_groq(chunks)
-            meta, report, logs = analyze_text_with_gemini(full_text)
+            meta, report, logs = analyze_text_with_gemini(full_text, precise_datetime, candidate_raw_name)
             
-            # 生徒IDの特定 (Control DB)
+            # --- Step C: DB Linking ---
             did, oname = notion_query_student(meta['student_name'])
             
-            # --- Notion Write Phase (Dual Write Strategy) ---
-            
-            # ページ本文の構築
+            # --- Step D: Construct Content ---
             content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n### 📝 時系列ログ\n\n{logs}"
             blocks = []
             for line in content.split('\n'):
@@ -388,24 +464,27 @@ def main():
                 chunk_text = full_text[i:i+1900]
                 blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk_text}}]}})
             
-            props = {"名前": {"title": [{"text": {"content": f"{meta['date']} {oname} ログ"}}]}, "日付": {"date": {"start": meta['date']}}}
+            # ★【変更】タイトルフォーマット: "日時 生徒名 通話ログ"
+            props = {
+                "名前": {"title": [{"text": {"content": f"{precise_datetime} {oname} 通話ログ"}}]}, 
+                "日付": {"date": {"start": date_only}}
+            }
 
-            # 1. 常にFallback DB (NotebookLM用) に書き込む
             print("💾 Saving to Fallback DB (All Data)...")
             notion_create_page_heavy(sanitize_id(FINAL_FALLBACK_DB_ID), copy.deepcopy(props), copy.deepcopy(blocks))
             
-            # 2. 生徒が特定できている場合、その生徒のDBにも書き込む
             if did and did != FINAL_FALLBACK_DB_ID:
                 print(f"👤 Saving to Student DB ({oname})...")
                 notion_create_page_heavy(sanitize_id(did), copy.deepcopy(props), copy.deepcopy(blocks))
             
-            # --- Artifact Management ---
+            # --- Step E: Artifacts ---
             processed_folder_id = ensure_processed_folder()
-            upload_file_to_drive(mixed, processed_folder_id, f"{meta['date']}_{oname}_Full.mp3", 'audio/mpeg')
+            safe_filename_time = precise_datetime.replace(':', '-')
+            upload_file_to_drive(mixed, processed_folder_id, f"{safe_filename_time}_{oname}_Full.mp3", 'audio/mpeg')
             
             txt_path = os.path.join(TEMP_DIR, "transcript.txt")
             with open(txt_path, "w") as f: f.write(full_text)
-            upload_file_to_drive(txt_path, processed_folder_id, f"{meta['date']}_{oname}_Transcript.txt", 'text/plain')
+            upload_file_to_drive(txt_path, processed_folder_id, f"{safe_filename_time}_{oname}_Transcript.txt", 'text/plain')
             
             move_original_file(file['id'], processed_folder_id)
 

@@ -24,9 +24,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
+          # main.py と generalize.py 両方に必要なライブラリを一括インストール
           pip install google-genai groq patool google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
 
-      - name: Run Auto Logger
+      # --- Step 1: Log Generation (事実の記録) ---
+      - name: Run Auto Logger (main.py)
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -34,3 +36,13 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: python main.py
+
+      # --- Step 2: Knowledge Generalization (解釈の蓄積) ---
+      # main.py が成功した場合のみ、続けて実行される
+      - name: Run Generalization (generalize.py)
+        if: success() 
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # DB IDはコード内に記述済みだが、Secret化して渡す場合はここに追加
+        run: python generalize.py

@@ -35,6 +35,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
         run: python main.py
 
       # --- Step 2: Knowledge Generalization (解釈の蓄積) ---

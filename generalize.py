@@ -105,12 +105,15 @@ def text_to_blocks(text):
 def generate_theories(log_text):
     client = genai.Client(api_key=GEMINI_API_KEY)
     
+    # ★修正ポイント: キャラクター名とタグの言語指定を厳格化
     prompt = f"""
     あなたはスマブラの理論構築AIです。入力されたコーチングログから「一般的攻略理論」を抽出してください。
     
-    【重要】
+    【重要：データ構造のルール】
     1. "detail" フィールドは、Notionのページ本文になります。見出し(###)や箇条書き(-)を使って、人間が読みやすいMarkdown形式で記述してください。
-    2. 必ず以下のJSON形式で出力してください。
+    2. "characters"（キャラクター名）は、**必ず「スマブラSPの日本語正式名称」**で出力してください。（例: Cloud -> クラウド, Steve -> スティーブ, Pyra/Mythra -> ホムラ/ヒカリ）。
+    3. 対象が特定のキャラでない場合は "全般" と出力してください。
+    4. 以下のJSON形式で出力してください。
 
     Format (JSON Array):
     [
@@ -118,8 +121,8 @@ def generate_theories(log_text):
         "theory_name": "タイトル (30文字以内)",
         "category": "立ち回り", 
         "importance": "S",
-        "characters": ["Cloud", "Common"],
-        "tags": ["着地狩り", "崖"],
+        "characters": ["クラウド", "全般"],  <-- ★ここを日本語に強制
+        "tags": ["着地狩り", "崖", "復帰阻止"],
         "abstract": "一覧表示用の3行要約",
         "detail": "### 解説\\nここに詳細な理論を書く。\\n- 理由1\\n- 理由2", 
         "source_context": "元ログからの引用抜粋"

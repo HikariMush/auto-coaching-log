@@ -32,7 +32,6 @@ NOTION_HEADERS = {
 }
 
 # --- Discord Bot Setup ---
-# Guilds等のIntentを明示的に有効化
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True 
@@ -40,11 +39,18 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- Gemini Helper Functions ---
 def extract_search_query(user_question):
+    """
+    検索クエリ抽出
+    """
     client = genai.Client(api_key=GEMINI_API_KEY)
     model_id = "gemini-2.0-flash-exp"
     prompt = f"""
-    ユーザーの質問から、Notionデータベースを検索するための「最も重要な単語1つ」を抽出してください。
-    Output Rule: 余計な説明は不要。単語のみ出力。英語キャラ名はカタカナ変換。
+    Task: Extract the single most important search keyword from the User Question for a Notion database query.
+    Rules:
+    - Output ONLY the keyword. No explanation.
+    - If a specific character name is present, that is the priority.
+    - Convert English character names to Japanese (e.g. "ROB" -> "ロボット").
+    
     User Question: {user_question}
     """
     try:
@@ -54,11 +60,21 @@ def extract_search_query(user_question):
         return user_question
 
 def generate_answer(question, context_texts):
+    """
+    初回回答生成用 (ロジック固定: Context優先 + 推論注釈)
+    """
     client = genai.Client(api_key=GEMINI_API_KEY)
     model_id = "gemini-2.0-flash-exp"
+    
     prompt = f"""
     あなたはスマブラのプロコーチのアシスタントAIです。
-    生徒からの質問に対し、以下のContextに基づいて回答してください。
+    生徒からの質問に対し、以下の「コーチのメモ (Context)」に基づいて回答してください。
+
+    【知識利用のルール】
+    1. **Context優先**: 何よりもまず、Context内にある情報を正として回答を構成してください。
+    2. **推論の条件付き許可**: Contextに直接的な答えがない場合、あなたの一般的なスマブラ知識や論理的推論を用いて補足することを**許可**します。
+       - **重要**: 推論や一般知識を使用する場合は、必ず**「（※ここからは推論ですが）」「（※一般論としては）」**のように、コーチのメモ（DB）由来ではないことを明記してください。
+    3. **ハルシネーション排除**: 推論によっても導き出せない固有の情報については、無理に創作せず「データベースに情報がありません」と答えてください。
 
     Context (コーチのメモ):
     {context_texts[:30000]}
@@ -67,18 +83,9 @@ def generate_answer(question, context_texts):
     {question}
     
     Response Guidelines:
-    1. **トーン**: 
-       - 「～です/～ます」調の丁寧語。
-       - **感情的な煽りや、過度な感嘆符（！）は用いない。**
-       - 推奨や提案の形（～が有効です）をとる。
-    2. **構造化**: 
-       - 結論を最初に端的に述べる。
-       - 理由や具体的なアクションを箇条書きで整理する。
-    3. **内容**: 
-       - Contextにある理論や数値に基づき、淡々と事実を伝える。
-       - 精神論や根性論は排除する。
-       - Contextにない情報は「データベースに情報がありません」と回答する。
-       - 回答の最後にユーザーを励ます。
+    1. **トーン**: 丁寧語（～です/ます）。感情的に煽らず、理知的・分析的なコーチとして振る舞う。
+    2. **構造化**: 結論を最初に述べ、理由やアクションを箇条書きで整理する。
+    3. **内容**: 事実に基づき淡々と伝える。最後にユーザーを軽く励ます。
     """
     try:
         res = client.models.generate_content(model=model_id, contents=prompt)
@@ -87,11 +94,20 @@ def generate_answer(question, context_texts):
         return "AI Error: 回答生成に失敗しました。"
 
 def generate_chat_answer(history_text, context_text, new_question):
+    """
+    スレッド会話用 (ロジック固定)
+    """
     client = genai.Client(api_key=GEMINI_API_KEY)
     model_id = "gemini-2.0-flash-exp"
+    
     prompt = f"""
     あなたはスマブラのプロコーチのアシスタントAIです。
     ユーザーとの会話履歴とContextに基づき回答してください。
+
+    【知識利用のルール】
+    1. **Context優先**: Contextの情報を最優先してください。
+    2. **推論の条件付き許可**: 不足部分は推論や一般知識で補足可能ですが、**必ず「（※推論ですが）」と注釈を入れて区別**してください。
+    3. **整合性**: これまでの会話の流れを汲み取ってください。
 
     Context:
     {context_text[:20000]}
@@ -99,12 +115,11 @@ def generate_chat_answer(history_text, context_text, new_question):
     History:
     {history_text}
     
-    Question:
+    Current Question:
     {new_question}
     
-    Guidelines:
-    - 初回回答と同じトーン（丁寧、冷静、論理的）を維持。
-    - Context情報を最優先。
+    Response Guidelines:
+    - 丁寧、冷静、論理的なトーンを維持。
     - 最後に軽く励ます。
     """
     try:
@@ -171,7 +186,10 @@ def append_block_to_page(page_id, text_content):
         ]
     }
     try:
-        requests.patch(url, headers=NOTION_HEADERS, json=payload)
+        res = requests.patch(url, headers=NOTION_HEADERS, json=payload)
+        if res.status_code != 200:
+             print(f"Append Error: {res.text}")
+             return False
         return True
     except Exception as e:
         print(f"Append Error: {e}")
@@ -179,10 +197,16 @@ def append_block_to_page(page_id, text_content):
 
 def create_feedback_ticket(user_name, question, answer, comment, ref_page_ids):
     url = "https://api.notion.com/v1/pages"
-    relations = [{"id": pid} for pid in ref_page_ids]
+    
+    # Relationsの構築（念のため空リスト対応）
+    relations = [{"id": pid} for pid in ref_page_ids] if ref_page_ids else []
+    
+    # ペイロード作成
+    # 注意: ここでプロパティ名がDBと完全に一致していないとエラーになります
     payload = {
         "parent": {"database_id": FEEDBACK_DB_ID},
         "properties": {
+            # タイトル列の名前が "Topic" でない場合（"Name", "タイトル"など）は修正が必要
             "Topic": {"title": [{"text": {"content": f"Fix: {question[:20]}..."}}]},
             "Question": {"rich_text": [{"text": {"content": question[:2000]}}]},
             "AI Answer": {"rich_text": [{"text": {"content": answer[:2000]}}]},
@@ -193,7 +217,22 @@ def create_feedback_ticket(user_name, question, answer, comment, ref_page_ids):
             "Reference Source": {"relation": relations}
         }
     }
-    requests.post(url, headers=NOTION_HEADERS, json=payload)
+    
+    try:
+        res = requests.post(url, headers=NOTION_HEADERS, json=payload)
+        
+        # 【重要】エラーレスポンスのデバッグ出力
+        if res.status_code != 200:
+            print(f"❌ Feedback Create Error: {res.status_code}")
+            print(f"Response: {res.text}") # ここにNotionからの詳細なエラー理由が出る
+            return False
+        
+        print("✅ Feedback created successfully")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Feedback Create Exception: {e}")
+        return False
 
 def create_request_ticket(user_name, request_content, context, is_talk_request=False):
     url = "https://api.notion.com/v1/pages"
@@ -221,10 +260,16 @@ class FeedbackModal(Modal, title="情報の修正・補足提案"):
         self.answer = answer
         self.ref_ids = ref_ids
     async def on_submit(self, interaction: discord.Interaction):
-        # APIコール前にレスポンスを保留しないとModal終了後に即タイムアウトする場合があるため注意
-        # Modalの場合はon_submitで勝手にdefer状態になるが、念のため処理
-        create_feedback_ticket(interaction.user, self.question, self.answer, self.comment.value, self.ref_ids)
-        await interaction.response.send_message("✅ 修正依頼を受け付けました。", ephemeral=True)
+        # 処理中であることを伝える
+        await interaction.response.defer(ephemeral=True)
+        
+        # API実行
+        success = create_feedback_ticket(interaction.user, self.question, self.answer, self.comment.value, self.ref_ids)
+        
+        if success:
+            await interaction.followup.send("✅ 修正依頼を受け付けました。", ephemeral=True)
+        else:
+            await interaction.followup.send("⚠️ エラー: Feedbackの送信に失敗しました。管理者がログを確認してください。", ephemeral=True)
 
 class RequestModal(Modal, title="新規コンテンツのリクエスト"):
     req_content = TextInput(label="知りたい内容")
@@ -246,13 +291,9 @@ class ResponseView(View):
 
     @discord.ui.button(label="コーチに直接聞く", style=discord.ButtonStyle.blurple, emoji="🙋")
     async def ask_coach(self, interaction: discord.Interaction, button: Button):
-        # タイムアウト回避のためにdefer
         await interaction.response.defer(ephemeral=True) 
-        
         context_str = f"Question: {self.question}\nAI Answer Preview: {self.answer[:100]}..."
         create_request_ticket(interaction.user, self.question, context_str, is_talk_request=True)
-        
-        # defer後は followup.send を使う
         await interaction.followup.send("✅ 通話ネタとして保存しました。\nコーチが確認後、通話時に詳しく解説します！", ephemeral=True)
 
     @discord.ui.button(label="修正提案", style=discord.ButtonStyle.secondary, emoji="⚠️")
@@ -276,28 +317,43 @@ async def on_message(message):
 
     # --- Admin Command: !add ---
     if message.content.startswith("!add"):
-        # Adminチェック
+        print(f"DEBUG: !add command from {message.author.name} (ID: {message.author.id})")
+        
+        # Adminチェック (環境変数がない場合は警告)
+        if not ADMIN_USER_ID:
+            await message.channel.send("⚠️ 環境変数 `ADMIN_USER_ID` が設定されていません。")
+            return
+
         if str(message.author.id) != str(ADMIN_USER_ID):
+            await message.channel.send(f"⛔ **権限エラー**: ID `{message.author.id}` は許可されていません。")
             return 
 
-        # スレッド内チェック
         if not isinstance(message.channel, discord.Thread):
-            await message.channel.send("⚠️ `!add` コマンドはBotが作成したスレッド内でのみ有効です。")
+            await message.channel.send("⚠️ `!add` コマンドはBotが作成した**スレッドの中でのみ**有効です。")
             return
 
         target_content = message.content[5:].strip()
+        if not target_content:
+             await message.channel.send("⚠️ 追記内容が空です。")
+             return
+
         thread_name = message.channel.name
         search_word = thread_name.replace("Q. ", "") 
         
+        await message.add_reaction("⏳")
+
         pages = search_notion(search_word)
         if not pages:
-            await message.channel.send("⚠️ 追記対象のページが見つかりませんでした。")
+            await message.channel.send(f"⚠️ 追記対象のページが見つかりませんでした (検索ワード: {search_word})。")
             return
             
         target_page = pages[0]
         success = append_block_to_page(target_page["id"], f"【コーチ補足】\n{target_content}")
+        
         if success:
             await message.channel.send(f"✅ ページ **[{target_page['title']}]** に補足情報を追記しました。")
+            await message.remove_reaction("⏳", bot.user)
+            await message.add_reaction("✅")
         else:
             await message.channel.send("❌ Notionへの書き込みに失敗しました。")
         return
@@ -310,13 +366,11 @@ async def on_message(message):
             
             context_text = ""
             try:
-                # 親メッセージを取得
                 starter_msg = await message.channel.parent.fetch_message(message.channel.id)
                 if starter_msg.embeds:
                     context_text = starter_msg.embeds[0].description
-            except Exception as e:
-                print(f"Context Fetch Error: {e}")
-                context_text = "（元の情報が取得できませんでした）"
+            except:
+                context_text = ""
 
             answer = generate_chat_answer(history_text, context_text, message.content)
             await message.channel.send(answer)
@@ -351,21 +405,12 @@ async def ask(interaction: discord.Interaction, question: str):
     
     view = ResponseView(question, ai_answer, ref_ids)
     
-    # 【重要修正】wait=TrueでWebhookMessageを受け取った後、fetch_messageで完全なMessageオブジェクトを取り直す
     webhook_msg = await interaction.followup.send(embed=embed, view=view, wait=True)
     
     try:
-        # ここでGuild情報を持つ完全なメッセージオブジェクトを取得
         full_msg = await interaction.channel.fetch_message(webhook_msg.id)
-        
-        # スレッド作成
         thread = await full_msg.create_thread(name=f"Q. {search_keyword}", auto_archive_duration=1440)
-        
-        # 最初のメッセージ
         await thread.send(f"このスレッドで続けて質問ができます。\n（コーチは `!add 補足内容` でここからDBに追記できます）")
-    
-    except discord.Forbidden:
-        await interaction.channel.send("⚠️ Botにスレッド作成権限がありません。「公開スレッドの作成」権限を確認してください。")
     except Exception as e:
         await interaction.channel.send(f"⚠️ スレッド作成エラー: {e}")
 

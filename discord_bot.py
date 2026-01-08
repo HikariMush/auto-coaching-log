@@ -59,17 +59,13 @@ def search_notion(query_text):
             title = title_list[0].get("text", {}).get("content", "No Title") if title_list else "No Title"
             page_id = page.get("id")
             url = page.get("url")
-            
-            # 本文取得（簡易版：最初のブロックのみ）
-            content_preview = "..." 
-            results.append({"id": page_id, "title": title, "url": url, "content": content_preview})
+            results.append({"id": page_id, "title": title, "url": url})
         return results
     except Exception as e:
         print(f"Notion Search Error: {e}")
         return []
 
 def get_page_content_text(page_id):
-    """ページの中身（テキスト）を取得してGeminiに読ませる用"""
     url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=50"
     try:
         res = requests.get(url, headers=NOTION_HEADERS)
@@ -85,12 +81,8 @@ def get_page_content_text(page_id):
         return ""
 
 def create_feedback_ticket(user_name, question, answer, comment, ref_page_ids):
-    """Feedback DBに修正依頼を作成"""
     url = "https://api.notion.com/v1/pages"
-    
-    # 複数のリファレンスIDをリレーション形式に変換
     relations = [{"id": pid} for pid in ref_page_ids]
-    
     payload = {
         "parent": {"database_id": FEEDBACK_DB_ID},
         "properties": {
@@ -101,18 +93,22 @@ def create_feedback_ticket(user_name, question, answer, comment, ref_page_ids):
             "User Name": {"rich_text": [{"text": {"content": str(user_name)}}]},
             "Status": {"status": {"name": "New"}},
             "受付日": {"date": {"start": datetime.now().isoformat()}},
-            "Reference Source": {"relation": relations} # ここで紐付け
+            "Reference Source": {"relation": relations}
         }
     }
     requests.post(url, headers=NOTION_HEADERS, json=payload)
 
-def create_request_ticket(user_name, request_content, context):
-    """Request DBに新規要望を作成"""
+def create_request_ticket(user_name, request_content, context, is_talk_request=False):
+    """Request DBにチケット作成。is_talk_request=Trueなら「通話ネタ」としてタグ付け"""
     url = "https://api.notion.com/v1/pages"
+    
+    # 通話ネタの場合はタイトルに【通話希望】とつける等で区別
+    title_prefix = "【通話ネタ】" if is_talk_request else ""
+    
     payload = {
         "parent": {"database_id": REQUEST_DB_ID},
         "properties": {
-            "Request Content": {"title": [{"text": {"content": request_content[:100]}}]},
+            "Request Content": {"title": [{"text": {"content": f"{title_prefix}{request_content[:80]}"}}]},
             "Context": {"rich_text": [{"text": {"content": context[:2000]}}]},
             "User Name": {"rich_text": [{"text": {"content": str(user_name)}}]},
             "Status": {"status": {"name": "New"}},
@@ -125,11 +121,11 @@ def create_request_ticket(user_name, request_content, context):
 # --- Gemini Logic ---
 def generate_answer(question, context_texts):
     client = genai.Client(api_key=GEMINI_API_KEY)
-    model_id = "gemini-2.0-flash-exp" # 利用可能なモデル
+    model_id = "gemini-2.0-flash-exp"
     
     prompt = f"""
     あなたはスマブラのプロコーチのアシスタントAIです。
-    以下の「コーチが書いた理論（Context）」だけを根拠にして、生徒の質問に答えてください。
+    生徒からの質問に対し、以下の「コーチが書いた理論（Context）」を根拠に回答してください。
     
     Context:
     {context_texts[:30000]}
@@ -138,42 +134,38 @@ def generate_answer(question, context_texts):
     {question}
     
     Instruction:
-    - 生徒に対して親身かつ論理的に答えてください。
-    - Contextに答えがない場合は「申し訳ありません、その情報はまだデータベースにありません」と正直に答えてください。
-    - 嘘をつかないでください。
+    - Contextにある情報だけで答えてください。
+    - 答えられない場合は正直に「データベースに情報がありません」と答えてください。
     """
     try:
         res = client.models.generate_content(model=model_id, contents=prompt)
         return res.text
-    except Exception as e:
+    except:
         return "AI Error: 回答生成に失敗しました。"
 
 # --- Discord UI Components ---
 
-# 1. 修正提案用モーダル
+# 1. 修正提案モーダル
 class FeedbackModal(Modal, title="情報の修正・補足提案"):
-    comment = TextInput(label="修正すべき点や補足情報を教えてください", style=discord.TextStyle.paragraph, placeholder="例: ver13.0で空後の発生が早くなったので...")
-
+    comment = TextInput(label="修正点・補足", style=discord.TextStyle.paragraph)
     def __init__(self, question, answer, ref_ids):
         super().__init__()
         self.question = question
         self.answer = answer
         self.ref_ids = ref_ids
-
     async def on_submit(self, interaction: discord.Interaction):
         create_feedback_ticket(interaction.user, self.question, self.answer, self.comment.value, self.ref_ids)
-        await interaction.response.send_message("✅ フィードバックありがとうございます！コーチに修正依頼を出しました。", ephemeral=True)
+        await interaction.response.send_message("✅ 修正依頼を受け付けました。", ephemeral=True)
 
-# 2. 新規リクエスト用モーダル
+# 2. リクエストモーダル
 class RequestModal(Modal, title="新規コンテンツのリクエスト"):
-    req_content = TextInput(label="知りたい内容（タイトル）", placeholder="例: カズヤの即死コンボの抜け方")
-    context = TextInput(label="具体的な状況や背景", style=discord.TextStyle.paragraph, placeholder="いつも0%から運ばれて死にます。ずらし方向が知りたいです。", required=False)
-
+    req_content = TextInput(label="知りたい内容")
+    context = TextInput(label="背景・詳細", style=discord.TextStyle.paragraph, required=False)
     async def on_submit(self, interaction: discord.Interaction):
         create_request_ticket(interaction.user, self.req_content.value, self.context.value)
-        await interaction.response.send_message("✅ リクエストを受け付けました！今後の更新をお待ちください。", ephemeral=True)
+        await interaction.response.send_message("✅ リクエストを受け付けました。", ephemeral=True)
 
-# 3. 回答下のボタンView
+# 3. メインビュー
 class ResponseView(View):
     def __init__(self, question, answer, ref_ids):
         super().__init__(timeout=None)
@@ -181,15 +173,30 @@ class ResponseView(View):
         self.answer = answer
         self.ref_ids = ref_ids
 
+    # Button A: 役に立った
     @discord.ui.button(label="役に立った", style=discord.ButtonStyle.green, emoji="👍")
     async def helpful(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_message("評価ありがとうございます！", ephemeral=True)
 
-    @discord.ui.button(label="修正・補足を提案", style=discord.ButtonStyle.secondary, emoji="⚠️")
+    # Button B: コーチに直接聞く (NEW)
+    @discord.ui.button(label="コーチに直接聞く", style=discord.ButtonStyle.blurple, emoji="🙋")
+    async def ask_coach(self, interaction: discord.Interaction, button: Button):
+        # 即座にRequest DBへ登録
+        context_str = f"Question: {self.question}\nAI Answer Preview: {self.answer[:100]}..."
+        create_request_ticket(interaction.user, self.question, context_str, is_talk_request=True)
+        
+        await interaction.response.send_message(
+            f"✅ **「{self.question}」** を次回の通話ネタとして保存しました。\nコーチが確認後、通話時に詳しく解説します！", 
+            ephemeral=True
+        )
+
+    # Button C: 修正提案
+    @discord.ui.button(label="修正提案", style=discord.ButtonStyle.secondary, emoji="⚠️")
     async def feedback(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_modal(FeedbackModal(self.question, self.answer, self.ref_ids))
 
-    @discord.ui.button(label="情報なし/リクエスト", style=discord.ButtonStyle.primary, emoji="🆕")
+    # Button D: 新規リクエスト
+    @discord.ui.button(label="リクエスト", style=discord.ButtonStyle.secondary, emoji="🆕")
     async def request(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_modal(RequestModal())
 
@@ -197,56 +204,47 @@ class ResponseView(View):
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}!')
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} commands")
-    except Exception as e:
-        print(e)
+    await bot.tree.sync()
 
-@bot.tree.command(name="ask", description="スマブラの攻略情報を検索・質問します")
+@bot.tree.command(name="ask", description="攻略情報を検索")
 async def ask(interaction: discord.Interaction, question: str):
-    await interaction.response.defer() # 処理中表示
+    await interaction.response.defer()
     
-    # 1. Notion検索
     pages = search_notion(question)
     
+    # 検索ヒットなし -> リクエストへ誘導
     if not pages:
-        # ヒットしなかった場合 -> 即リクエスト誘導
         view = View()
         req_btn = Button(label="リクエストを送る", style=discord.ButtonStyle.primary, emoji="🆕")
-        
-        async def req_callback(intr):
-            await intr.response.send_modal(RequestModal())
+        async def req_callback(intr): await intr.response.send_modal(RequestModal())
         req_btn.callback = req_callback
         view.add_item(req_btn)
-        
-        await interaction.followup.send(f"検索結果: 0件\n「{question}」に関する情報はデータベースに見つかりませんでした。\nコーチに執筆リクエストを送りますか？", view=view)
+        await interaction.followup.send(f"情報が見つかりませんでした。\n執筆リクエストを送りますか？", view=view)
         return
 
-    # 2. 中身を取得してコンテキスト作成
+    # コンテキスト作成
     context_text = ""
     ref_links = []
     ref_ids = []
     
-    for p in pages[:3]: # Top 3のみ使用
+    for p in pages[:3]:
         text = get_page_content_text(p["id"])
         context_text += f"--- Source: {p['title']} ---\n{text}\n"
         ref_links.append(f"・[{p['title']}]({p['url']})")
         ref_ids.append(p["id"])
 
-    # 3. Geminiで回答生成
+    # 回答生成
     ai_answer = generate_answer(question, context_text)
     
-    # 4. 返信作成
+    # 埋め込み作成
     embed = discord.Embed(title=f"Q. {question}", description=ai_answer, color=0x00ff00)
     if ref_links:
-        embed.add_field(name="📚 参照ソース (根拠)", value="\n".join(ref_links), inline=False)
+        embed.add_field(name="📚 Reference", value="\n".join(ref_links), inline=False)
     
-    embed.set_footer(text="内容が古い・間違っている場合は「修正提案」ボタンを押してください。")
+    # フッター案内
+    embed.set_footer(text="これについて詳しく聞きたい場合は「🙋 コーチに直接聞く」を押してください。")
     
-    # 5. 送信
     view = ResponseView(question, ai_answer, ref_ids)
     await interaction.followup.send(embed=embed, view=view)
 
-# Run
 bot.run(DISCORD_TOKEN)

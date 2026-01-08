@@ -18,11 +18,11 @@ HEADERS = {
     "Notion-Version": "2022-06-28"
 }
 
-# --- Model Resolver (2026 Ready) ---
+# --- Model Resolver ---
 def resolve_best_model():
     client = genai.Client(api_key=GEMINI_API_KEY)
     candidates = [
-        "gemini-2.5-flash",       # 最優先
+        "gemini-2.5-flash",       # ★最優先
         "gemini-2.0-flash-exp",   # 次点
         "gemini-1.5-flash",       # フォールバック
         "gemini-1.5-pro"
@@ -179,58 +179,66 @@ def save_theory(theory, log_id):
     except Exception as e:
         print(f"❌ Network Error: {e}")
 
-# --- Main (Test Mode: 5 logs only) ---
+# --- Main (Bulk Mode) ---
 def main():
     global ACTIVE_MODEL_ID
-    print("--- Generalization Started (Test Mode: Max 5) ---")
+    print("--- Generalization Started (Bulk Mode) ---")
     ACTIVE_MODEL_ID = resolve_best_model()
 
-    # 未処理ログを5件だけ取得
-    query = {
-        "filter": {
-            "property": "AI処理済み",
-            "checkbox": {
-                "equals": False
-            }
-        },
-        "page_size": 5, 
-        "sorts": [{"property": "日付", "direction": "descending"}]
-    }
+    has_more = True
     
-    try:
-        res = requests.post(f"https://api.notion.com/v1/databases/{SOURCE_LOG_DB_ID}/query", headers=HEADERS, json=query)
-        logs = res.json().get("results", [])
-    except Exception as e:
-        print(f"❌ Failed to fetch logs: {e}")
-        logs = []
-    
-    if not logs:
-        print("ℹ️ No unprocessed logs found.")
-        return
-
-    print(f"🔍 Processing {len(logs)} logs...")
-
-    for log in logs:
-        print(f"Processing Log: {log['id']}")
-        content = get_page_content(log["id"])
+    while has_more:
+        # 未処理ログを50件ずつ取得
+        query = {
+            "filter": {
+                "property": "AI処理済み",
+                "checkbox": {
+                    "equals": False
+                }
+            },
+            "page_size": 50, 
+            "sorts": [{"property": "日付", "direction": "descending"}]
+        }
         
-        if len(content) < 50: 
-            print("   ⚠️ Content too short. Marking as processed.")
-            mark_log_as_processed(log["id"])
-            continue
+        try:
+            res = requests.post(f"https://api.notion.com/v1/databases/{SOURCE_LOG_DB_ID}/query", headers=HEADERS, json=query)
+            logs = res.json().get("results", [])
+        except Exception as e:
+            print(f"❌ Failed to fetch logs: {e}")
+            break
         
-        theories = generate_theories(content)
-        
-        if not theories:
-             print("   ⚠️ No theories extracted. Marking as processed.")
-             mark_log_as_processed(log["id"])
-             continue
+        if not logs:
+            print("ℹ️ No more unprocessed logs found. System sleeping.")
+            has_more = False
+            break
 
-        for t in theories:
-            save_theory(t, log["id"])
-            time.sleep(1)
+        print(f"🔍 Found batch of {len(logs)} logs. Processing...")
+
+        for log in logs:
+            print(f"\nProcessing Log: {log['id']}")
+            content = get_page_content(log["id"])
             
-        mark_log_as_processed(log["id"])
+            # 短すぎるコンテンツはスキップ＆処理済みに
+            if len(content) < 50: 
+                print("   ⚠️ Content too short. Marking as processed.")
+                mark_log_as_processed(log["id"])
+                continue
+            
+            theories = generate_theories(content)
+            
+            # 理論が出なくても処理済みに（ループ防止）
+            if not theories:
+                 print("   ⚠️ No theories extracted. Marking as processed.")
+                 mark_log_as_processed(log["id"])
+                 continue
+
+            for t in theories:
+                save_theory(t, log["id"])
+                time.sleep(1) # Notion API Rate Limit
+                
+            mark_log_as_processed(log["id"])
+            
+        time.sleep(2) # バッチ間の休憩
 
 if __name__ == "__main__":
     main()

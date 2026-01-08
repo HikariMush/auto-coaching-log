@@ -19,25 +19,32 @@ HEADERS = {
 }
 
 # --- Model Resolver ---
+# --- Model Resolver (Updated for 2026) ---
 def resolve_best_model():
     client = genai.Client(api_key=GEMINI_API_KEY)
+    # 優先順位リスト: 2.5 (User Preferred) -> 2.0 -> 1.5
     candidates = [
-        "gemini-2.0-flash-exp", 
-        "gemini-1.5-flash", 
-        "gemini-1.5-flash-001",
+        "gemini-2.5-flash",       # ★最優先
+        "gemini-2.5-flash-001",   # バージョン指定も念のため
+        "gemini-2.0-flash-exp",   # 次点
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",       # フォールバック
         "gemini-1.5-pro"
     ]
+    
     print("💎 Resolving Best Gemini Model...", flush=True)
     for model in candidates:
         try:
+            # 軽いテストリクエストを送って生存確認
             client.models.generate_content(model=model, contents="Test")
             print(f"✅ Model Resolved: {model}", flush=True)
             return model
-        except Exception: continue
+        except Exception:
+            # 存在しない、またはアクセス権がない場合は次へ
+            continue
+    
     print("⚠️ All checks failed. Fallback to 'gemini-1.5-flash'", flush=True)
     return "gemini-1.5-flash"
-
-ACTIVE_MODEL_ID = None
 
 # --- Notion API Helpers ---
 def get_page_content(page_id):

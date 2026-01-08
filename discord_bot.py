@@ -35,10 +35,78 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# --- Gemini Helper Functions ---
+def extract_search_query(user_question):
+    """
+    ユーザーの質問文からNotion検索用の単語（特にキャラクター名や単語）を抽出する。
+    これにより「ロボット対策教えて」→「ロボット」で検索が可能になる。
+    """
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    model_id = "gemini-2.0-flash-exp"
+    
+    prompt = f"""
+    あなたはデータベース検索のクエリエキスパートです。
+    ユーザーの質問から、Notionデータベースを検索するための「最も重要な単語1つ」を抽出してください。
+    
+    ターゲットのNotionDBのプロパティ傾向:
+    - キャラクター名（例: ロボット, マリオ, スネーク, ホムヒカ）
+    - スマブラの技術用語（例: 崖狩り, 着地狩り, 復帰阻止, ライン管理）
+    
+    User Question: {user_question}
+    
+    Output Rule:
+    - 余計な説明は一切不要。単語のみを出力すること。
+    - 複数の単語がある場合、最も核心となる単語（特にキャラクター名）を最優先して1つだけ選ぶこと。
+    - 英語のキャラ名はカタカナに直すこと（Rob -> ロボット）。
+    - 略称は一般的な名称に直すこと（クラウド -> クラウド, ガノン -> ガノンドロフ）。
+    """
+    
+    try:
+        res = client.models.generate_content(model=model_id, contents=prompt)
+        return res.text.strip()
+    except Exception as e:
+        print(f"Gemini Extract Error: {e}")
+        return user_question # エラー時はそのまま返す
+
+def generate_answer(question, context_texts):
+    """
+    検索結果(Context)をもとに、コーチとしての回答を生成する。
+    """
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    model_id = "gemini-2.0-flash-exp"
+    
+    prompt = f"""
+    あなたは「スマブラのプロコーチ」として振る舞ってください。
+    生徒（ユーザー）からの質問に対し、以下の「コーチ自身のメモ（Context）」に基づいて、
+    具体的かつ論理的にアドバイスを行ってください。
+
+    Context (コーチのメモ):
+    {context_texts[:30000]}
+    
+    Question:
+    {question}
+    
+    Response Guidelines:
+    1. **結論ファースト**: 最初に核心となる答えを端的に述べる。
+    2. **構造化**: 箇条書きや太字を使用し、Discordで読みやすいフォーマットにする。
+    3. **情報量**: Contextにある情報は可能な限り活用し、薄い回答にならないようにする。
+    4. **トーン**: プロフェッショナルだが、熱意を持って教えるコーチの口調。
+    5. **ハルシネーション排除**: Contextにない情報は「その件についてはデータベースに記載がありませんでした」と正直に伝え、知ったかぶりをしない。
+    """
+    
+    try:
+        res = client.models.generate_content(model=model_id, contents=prompt)
+        return res.text
+    except Exception as e:
+        print(f"Gemini Generate Error: {e}")
+        return "AI Error: 回答生成に失敗しました。"
+
 # --- Notion API Helpers ---
 def search_notion(query_text):
     """Theory DBから関連ページを検索"""
     url = f"https://api.notion.com/v1/databases/{THEORY_DB_ID}/query"
+    
+    # 検索クエリの構築
     payload = {
         "page_size": 5,
         "filter": {
@@ -49,23 +117,29 @@ def search_notion(query_text):
             ]
         }
     }
+    
     try:
         res = requests.post(url, headers=NOTION_HEADERS, json=payload)
         data = res.json()
         results = []
         for page in data.get("results", []):
             props = page.get("properties", {})
+            
+            # タイトル取得
             title_list = props.get("Theory Name", {}).get("title", [])
             title = title_list[0].get("text", {}).get("content", "No Title") if title_list else "No Title"
+            
             page_id = page.get("id")
-            url = page.get("url")
-            results.append({"id": page_id, "title": title, "url": url})
+            page_url = page.get("url")
+            results.append({"id": page_id, "title": title, "url": page_url})
+            
         return results
     except Exception as e:
         print(f"Notion Search Error: {e}")
         return []
 
 def get_page_content_text(page_id):
+    """ページ内のブロックを取得してテキスト化"""
     url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=50"
     try:
         res = requests.get(url, headers=NOTION_HEADERS)
@@ -73,6 +147,7 @@ def get_page_content_text(page_id):
         full_text = ""
         for block in data.get("results", []):
             btype = block.get("type")
+            # テキストが含まれる可能性のあるブロックタイプ
             if "rich_text" in block.get(btype, {}):
                 text_list = block[btype].get("rich_text", [])
                 full_text += "".join([t.get("text", {}).get("content", "") for t in text_list]) + "\n"
@@ -118,31 +193,6 @@ def create_request_ticket(user_name, request_content, context, is_talk_request=F
     }
     requests.post(url, headers=NOTION_HEADERS, json=payload)
 
-# --- Gemini Logic ---
-def generate_answer(question, context_texts):
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    model_id = "gemini-2.0-flash-exp"
-    
-    prompt = f"""
-    あなたはスマブラのプロコーチのアシスタントAIです。
-    生徒からの質問に対し、以下の「コーチが書いた理論（Context）」を根拠に回答してください。
-    
-    Context:
-    {context_texts[:30000]}
-    
-    Question:
-    {question}
-    
-    Instruction:
-    - Contextにある情報だけで答えてください。
-    - 答えられない場合は正直に「データベースに情報がありません」と答えてください。
-    """
-    try:
-        res = client.models.generate_content(model=model_id, contents=prompt)
-        return res.text
-    except:
-        return "AI Error: 回答生成に失敗しました。"
-
 # --- Discord UI Components ---
 
 # 1. 修正提案モーダル
@@ -178,7 +228,7 @@ class ResponseView(View):
     async def helpful(self, interaction: discord.Interaction, button: Button):
         await interaction.response.send_message("評価ありがとうございます！", ephemeral=True)
 
-    # Button B: コーチに直接聞く (NEW)
+    # Button B: コーチに直接聞く
     @discord.ui.button(label="コーチに直接聞く", style=discord.ButtonStyle.blurple, emoji="🙋")
     async def ask_coach(self, interaction: discord.Interaction, button: Button):
         # 即座にRequest DBへ登録
@@ -210,7 +260,12 @@ async def on_ready():
 async def ask(interaction: discord.Interaction, question: str):
     await interaction.response.defer()
     
-    pages = search_notion(question)
+    # 1. Geminiに検索ワードを考えさせる
+    search_keyword = extract_search_query(question)
+    print(f"Original: {question} -> Search Keyword: {search_keyword}") # ログ確認用
+    
+    # 2. 抽出したキーワードでNotionを検索
+    pages = search_notion(search_keyword)
     
     # 検索ヒットなし -> リクエストへ誘導
     if not pages:
@@ -219,10 +274,13 @@ async def ask(interaction: discord.Interaction, question: str):
         async def req_callback(intr): await intr.response.send_modal(RequestModal())
         req_btn.callback = req_callback
         view.add_item(req_btn)
-        await interaction.followup.send(f"情報が見つかりませんでした。\n執筆リクエストを送りますか？", view=view)
+        
+        # ユーザーには「何で検索したか」も伝える
+        msg = f"「{search_keyword}」に関する情報が見つかりませんでした。\n(検索ワード自動変換: {question} → {search_keyword})\n\n執筆リクエストを送りますか？"
+        await interaction.followup.send(msg, view=view)
         return
 
-    # コンテキスト作成
+    # 3. コンテキスト作成
     context_text = ""
     ref_links = []
     ref_ids = []
@@ -233,15 +291,14 @@ async def ask(interaction: discord.Interaction, question: str):
         ref_links.append(f"・[{p['title']}]({p['url']})")
         ref_ids.append(p["id"])
 
-    # 回答生成
+    # 4. 回答生成 (Contextだけでなく、ユーザーの元の質問文 question を渡す)
     ai_answer = generate_answer(question, context_text)
     
-    # 埋め込み作成
+    # 5. 埋め込み作成
     embed = discord.Embed(title=f"Q. {question}", description=ai_answer, color=0x00ff00)
     if ref_links:
         embed.add_field(name="📚 Reference", value="\n".join(ref_links), inline=False)
     
-    # フッター案内
     embed.set_footer(text="これについて詳しく聞きたい場合は「🙋 コーチに直接聞く」を押してください。")
     
     view = ResponseView(question, ai_answer, ref_ids)

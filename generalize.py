@@ -6,7 +6,7 @@ from google import genai
 from google.genai import types
 
 # --- Config ---
-SOURCE_LOG_DB_ID = "2e01bc8521e380ffaf28c2ab9376b00d"   # 既存のログDB
+SOURCE_LOG_DB_ID = "2e01bc8521e380ffaf28c2ab9376b00d"   # ログDB
 TARGET_THEORY_DB_ID = "2e21bc8521e38029b8b1d5c4b49731eb"  # Theory DB
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -62,12 +62,21 @@ def get_page_content(page_id):
         except: break
     return all_text
 
-def check_if_processed(log_page_id):
-    query = {"filter": {"property": "Source Log", "relation": {"contains": log_page_id}}, "page_size": 1}
+def mark_log_as_processed(page_id):
+    """ログ側の『AI処理済み』チェックボックスをONにする"""
+    url = f"https://api.notion.com/v1/pages/{page_id}"
+    payload = {
+        "properties": {
+            "AI処理済み": {
+                "checkbox": True
+            }
+        }
+    }
     try:
-        res = requests.post(f"https://api.notion.com/v1/databases/{TARGET_THEORY_DB_ID}/query", headers=HEADERS, json=query)
-        return len(res.json().get("results", [])) > 0 if res.status_code == 200 else False
-    except: return False
+        requests.patch(url, headers=HEADERS, json=payload)
+        print(f"   ☑️ Marked as processed: {page_id}")
+    except Exception as e:
+        print(f"   ⚠️ Failed to mark processed: {e}")
 
 def text_to_blocks(text):
     blocks = []
@@ -126,7 +135,6 @@ def generate_theories(log_text):
 
 # --- Save Logic ---
 def save_theory(theory, log_id):
-    # ★修正箇所: キー名をNotionの表示名に合わせる
     props = {
         "Theory Name": {"title": [{"text": {"content": theory.get("theory_name", "Untitled")}}]},
         "Category": {"select": {"name": theory.get("category", "立ち回り")}},
@@ -134,10 +142,7 @@ def save_theory(theory, log_id):
         "Abstract": {"rich_text": [{"text": {"content": theory.get("abstract", "")}}]},
         "Source Log": {"relation": [{"id": log_id}]},
         "Verification": {"status": {"name": "Draft"}},
-        
-        # ★重要: 画像に合わせて "Characters" -> "キャラクター" に変更
         "キャラクター": {"multi_select": [{"name": c} for c in theory.get("characters", [])]},
-        
         "Tags": {"multi_select": [{"name": t} for t in theory.get("tags", [])]}
     }
     
@@ -150,7 +155,6 @@ def save_theory(theory, log_id):
                 "icon": {"emoji": "💡"}
             }
         })
-
     children.extend(text_to_blocks(theory.get("detail", "")))
 
     try:
@@ -159,7 +163,6 @@ def save_theory(theory, log_id):
             headers=HEADERS, 
             json={"parent": {"database_id": TARGET_THEORY_DB_ID}, "properties": props, "children": children}
         )
-        # ★エラーハンドリング強化: 失敗したら理由を表示
         if res.status_code == 200:
             print(f"✅ Saved: {theory.get('theory_name')}")
         else:
@@ -173,26 +176,52 @@ def main():
     print("--- Generalization Started ---")
     ACTIVE_MODEL_ID = resolve_best_model()
 
-    query = {"page_size": 5, "sorts": [{"property": "日付", "direction": "descending"}]}
+    # ★最適化: 「AI処理済み」がチェックされていないものだけを取得
+    query = {
+        "filter": {
+            "property": "AI処理済み",
+            "checkbox": {
+                "equals": False
+            }
+        },
+        "page_size": 5, 
+        "sorts": [{"property": "日付", "direction": "descending"}]
+    }
+    
     try:
         res = requests.post(f"https://api.notion.com/v1/databases/{SOURCE_LOG_DB_ID}/query", headers=HEADERS, json=query)
         logs = res.json().get("results", [])
-    except: logs = []
+    except Exception as e:
+        print(f"❌ Failed to fetch logs: {e}")
+        logs = []
     
+    if not logs:
+        print("ℹ️ No unprocessed logs found.")
+        return
+
     for log in logs:
-        # 重複チェック（デバッグ時はコメントアウトしても良いが、通常は有効化）
-        if check_if_processed(log["id"]): 
-             print(f"Skipping {log['id']} (Already processed).")
-             continue
-            
         print(f"Processing Log: {log['id']}")
         content = get_page_content(log["id"])
-        if len(content) < 50: continue
+        
+        # コンテンツが少なすぎる場合はスキップするが、処理済みにはする（ループ防止）
+        if len(content) < 50: 
+            print("   ⚠️ Content too short. Marking as processed.")
+            mark_log_as_processed(log["id"])
+            continue
         
         theories = generate_theories(content)
+        
+        if not theories:
+             print("   ⚠️ No theories extracted. Marking as processed.")
+             mark_log_as_processed(log["id"])
+             continue
+
         for t in theories:
             save_theory(t, log["id"])
             time.sleep(1)
+            
+        # 最後に処理済みフラグを立てる
+        mark_log_as_processed(log["id"])
 
 if __name__ == "__main__":
     main()

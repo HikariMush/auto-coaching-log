@@ -1,5 +1,7 @@
-google-generativeai>=0.7.2
-groq
 requests
-google-api-python-client
+google-genai
+groq
 google-auth
+google-api-python-client
+patool
+python-dotenv

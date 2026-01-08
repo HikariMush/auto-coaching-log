@@ -18,41 +18,29 @@ HEADERS = {
     "Notion-Version": "2022-06-28"
 }
 
-# --- Model Resolver (Fix for 404 Error) ---
+# --- Model Resolver ---
 def resolve_best_model():
-    """利用可能なGeminiモデルを動的に判定する"""
     client = genai.Client(api_key=GEMINI_API_KEY)
-    # 優先順位リスト: 2.0系 -> 1.5系の具体的バージョン -> エイリアス -> Pro
     candidates = [
         "gemini-2.0-flash-exp", 
         "gemini-1.5-flash", 
         "gemini-1.5-flash-001",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-pro",
-        "gemini-1.5-pro-001"
+        "gemini-1.5-pro"
     ]
-    
     print("💎 Resolving Best Gemini Model...", flush=True)
     for model in candidates:
         try:
-            # 軽いテストリクエストを送って生存確認
             client.models.generate_content(model=model, contents="Test")
             print(f"✅ Model Resolved: {model}", flush=True)
             return model
-        except Exception as e:
-            # 404や権限エラーなら次へ
-            continue
-    
-    # 全部だめならデフォルト（これで落ちたらAPIキーかプランの問題）
+        except Exception: continue
     print("⚠️ All checks failed. Fallback to 'gemini-1.5-flash'", flush=True)
     return "gemini-1.5-flash"
 
-# グローバル変数としてモデルIDを保持
 ACTIVE_MODEL_ID = None
 
 # --- Notion API Helpers ---
 def get_page_content(page_id):
-    """ログページの全文を取得"""
     all_text = ""
     has_more = True
     start_cursor = None
@@ -75,7 +63,6 @@ def get_page_content(page_id):
     return all_text
 
 def check_if_processed(log_page_id):
-    """既に理論化済みのログかチェック"""
     query = {"filter": {"property": "Source Log", "relation": {"contains": log_page_id}}, "page_size": 1}
     try:
         res = requests.post(f"https://api.notion.com/v1/databases/{TARGET_THEORY_DB_ID}/query", headers=HEADERS, json=query)
@@ -83,13 +70,11 @@ def check_if_processed(log_page_id):
     except: return False
 
 def text_to_blocks(text):
-    """MarkdownテキストをNotion Blockに変換（詳細解説用）"""
     blocks = []
     for line in text.split('\n'):
         if not line.strip(): 
             blocks.append({"object":"block", "type":"paragraph", "paragraph":{"rich_text":[]}})
             continue
-        # 簡易Markdown解析
         ct = line.replace('**', '')[:1900]
         if line.startswith('### '):
             blocks.append({"object":"block", "type":"heading_3", "heading_3":{"rich_text":[{"text":{"content":ct[4:]}}]}})
@@ -104,16 +89,13 @@ def text_to_blocks(text):
 # --- Gemini Logic ---
 def generate_theories(log_text):
     client = genai.Client(api_key=GEMINI_API_KEY)
-    
-    # ★修正ポイント: キャラクター名とタグの言語指定を厳格化
     prompt = f"""
     あなたはスマブラの理論構築AIです。入力されたコーチングログから「一般的攻略理論」を抽出してください。
     
-    【重要：データ構造のルール】
-    1. "detail" フィールドは、Notionのページ本文になります。見出し(###)や箇条書き(-)を使って、人間が読みやすいMarkdown形式で記述してください。
-    2. "characters"（キャラクター名）は、**必ず「スマブラSPの日本語正式名称」**で出力してください。（例: Cloud -> クラウド, Steve -> スティーブ, Pyra/Mythra -> ホムラ/ヒカリ）。
-    3. 対象が特定のキャラでない場合は "全般" と出力してください。
-    4. 以下のJSON形式で出力してください。
+    【重要】
+    1. "detail" フィールドは、Notionのページ本文になります。Markdown形式で記述してください。
+    2. "characters"（キャラクター名）は、必ず「スマブラSPの日本語正式名称」で出力してください。
+    3. 以下のJSON形式で出力してください。
 
     Format (JSON Array):
     [
@@ -121,10 +103,10 @@ def generate_theories(log_text):
         "theory_name": "タイトル (30文字以内)",
         "category": "立ち回り", 
         "importance": "S",
-        "characters": ["クラウド", "全般"],  <-- ★ここを日本語に強制
-        "tags": ["着地狩り", "崖", "復帰阻止"],
+        "characters": ["クラウド", "全般"],
+        "tags": ["着地狩り", "崖"],
         "abstract": "一覧表示用の3行要約",
-        "detail": "### 解説\\nここに詳細な理論を書く。\\n- 理由1\\n- 理由2", 
+        "detail": "### 解説\\nここに詳細な理論を書く。", 
         "source_context": "元ログからの引用抜粋"
       }}
     ]
@@ -132,7 +114,6 @@ def generate_theories(log_text):
     Log: {log_text[:15000]}
     """
     try:
-        # Resolveされたモデルを使用
         res = client.models.generate_content(
             model=ACTIVE_MODEL_ID, 
             contents=prompt, 
@@ -145,6 +126,7 @@ def generate_theories(log_text):
 
 # --- Save Logic ---
 def save_theory(theory, log_id):
+    # ★修正箇所: キー名をNotionの表示名に合わせる
     props = {
         "Theory Name": {"title": [{"text": {"content": theory.get("theory_name", "Untitled")}}]},
         "Category": {"select": {"name": theory.get("category", "立ち回り")}},
@@ -152,12 +134,14 @@ def save_theory(theory, log_id):
         "Abstract": {"rich_text": [{"text": {"content": theory.get("abstract", "")}}]},
         "Source Log": {"relation": [{"id": log_id}]},
         "Verification": {"status": {"name": "Draft"}},
-        "Characters": {"multi_select": [{"name": c} for c in theory.get("characters", [])]},
+        
+        # ★重要: 画像に合わせて "Characters" -> "キャラクター" に変更
+        "キャラクター": {"multi_select": [{"name": c} for c in theory.get("characters", [])]},
+        
         "Tags": {"multi_select": [{"name": t} for t in theory.get("tags", [])]}
     }
     
     children = []
-    
     if "source_context" in theory:
         children.append({
             "object":"block", "type":"callout", 
@@ -167,25 +151,26 @@ def save_theory(theory, log_id):
             }
         })
 
-    detail_blocks = text_to_blocks(theory.get("detail", ""))
-    children.extend(detail_blocks)
+    children.extend(text_to_blocks(theory.get("detail", "")))
 
     try:
-        requests.post(
+        res = requests.post(
             "https://api.notion.com/v1/pages", 
             headers=HEADERS, 
             json={"parent": {"database_id": TARGET_THEORY_DB_ID}, "properties": props, "children": children}
         )
-        print(f"Saved: {theory.get('theory_name')}")
+        # ★エラーハンドリング強化: 失敗したら理由を表示
+        if res.status_code == 200:
+            print(f"✅ Saved: {theory.get('theory_name')}")
+        else:
+            print(f"❌ Save Failed ({res.status_code}): {res.text}")
     except Exception as e:
-        print(f"Save Error: {e}")
+        print(f"❌ Network Error: {e}")
 
 # --- Main ---
 def main():
     global ACTIVE_MODEL_ID
     print("--- Generalization Started ---")
-    
-    # 1. モデル解決を実行
     ACTIVE_MODEL_ID = resolve_best_model()
 
     query = {"page_size": 5, "sorts": [{"property": "日付", "direction": "descending"}]}
@@ -195,13 +180,13 @@ def main():
     except: logs = []
     
     for log in logs:
+        # 重複チェック（デバッグ時はコメントアウトしても良いが、通常は有効化）
         if check_if_processed(log["id"]): 
-            print("Skipping (Already processed).")
-            continue
+             print(f"Skipping {log['id']} (Already processed).")
+             continue
             
         print(f"Processing Log: {log['id']}")
         content = get_page_content(log["id"])
-        
         if len(content) < 50: continue
         
         theories = generate_theories(content)

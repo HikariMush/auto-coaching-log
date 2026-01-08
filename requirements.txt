@@ -1,7 +1,9 @@
+discord.py
 requests
 google-genai
+python-dotenv
+# (以下既存のもの)
 groq
 google-auth
 google-api-python-client
 patool
-python-dotenv

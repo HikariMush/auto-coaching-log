@@ -6,9 +6,8 @@ from google import genai
 from google.genai import types
 
 # --- Config ---
-# IDはハードコードするか、os.getenvでSecretsから取るか統一してください
 SOURCE_LOG_DB_ID = "2e01bc8521e380ffaf28c2ab9376b00d"   # 既存のログDB
-TARGET_THEORY_DB_ID = "2e21bc8521e38029b8b1d5c4b49731eb"  # 今回作ったTheory DB
+TARGET_THEORY_DB_ID = "2e21bc8521e38029b8b1d5c4b49731eb"  # Theory DB
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -18,6 +17,38 @@ HEADERS = {
     "Content-Type": "application/json",
     "Notion-Version": "2022-06-28"
 }
+
+# --- Model Resolver (Fix for 404 Error) ---
+def resolve_best_model():
+    """利用可能なGeminiモデルを動的に判定する"""
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    # 優先順位リスト: 2.0系 -> 1.5系の具体的バージョン -> エイリアス -> Pro
+    candidates = [
+        "gemini-2.0-flash-exp", 
+        "gemini-1.5-flash", 
+        "gemini-1.5-flash-001",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro",
+        "gemini-1.5-pro-001"
+    ]
+    
+    print("💎 Resolving Best Gemini Model...", flush=True)
+    for model in candidates:
+        try:
+            # 軽いテストリクエストを送って生存確認
+            client.models.generate_content(model=model, contents="Test")
+            print(f"✅ Model Resolved: {model}", flush=True)
+            return model
+        except Exception as e:
+            # 404や権限エラーなら次へ
+            continue
+    
+    # 全部だめならデフォルト（これで落ちたらAPIキーかプランの問題）
+    print("⚠️ All checks failed. Fallback to 'gemini-1.5-flash'", flush=True)
+    return "gemini-1.5-flash"
+
+# グローバル変数としてモデルIDを保持
+ACTIVE_MODEL_ID = None
 
 # --- Notion API Helpers ---
 def get_page_content(page_id):
@@ -73,7 +104,7 @@ def text_to_blocks(text):
 # --- Gemini Logic ---
 def generate_theories(log_text):
     client = genai.Client(api_key=GEMINI_API_KEY)
-    # プロンプト：詳細解説をMarkdownで見やすく書かせる
+    
     prompt = f"""
     あなたはスマブラの理論構築AIです。入力されたコーチングログから「一般的攻略理論」を抽出してください。
     
@@ -98,9 +129,9 @@ def generate_theories(log_text):
     Log: {log_text[:15000]}
     """
     try:
-        # Gemini 1.5 Flash (高速・安価) を使用
+        # Resolveされたモデルを使用
         res = client.models.generate_content(
-            model="gemini-1.5-flash", 
+            model=ACTIVE_MODEL_ID, 
             contents=prompt, 
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
@@ -111,7 +142,6 @@ def generate_theories(log_text):
 
 # --- Save Logic ---
 def save_theory(theory, log_id):
-    # プロパティ設定
     props = {
         "Theory Name": {"title": [{"text": {"content": theory.get("theory_name", "Untitled")}}]},
         "Category": {"select": {"name": theory.get("category", "立ち回り")}},
@@ -119,16 +149,12 @@ def save_theory(theory, log_id):
         "Abstract": {"rich_text": [{"text": {"content": theory.get("abstract", "")}}]},
         "Source Log": {"relation": [{"id": log_id}]},
         "Verification": {"status": {"name": "Draft"}},
-        # Detailプロパティは廃止し、Abstractのみプロパティに残す
-        # "Detail": ... (Don't set property, use page content)
         "Characters": {"multi_select": [{"name": c} for c in theory.get("characters", [])]},
         "Tags": {"multi_select": [{"name": t} for t in theory.get("tags", [])]}
     }
     
-    # ページ本文（ブロック）の作成
     children = []
     
-    # 1. 引用元情報
     if "source_context" in theory:
         children.append({
             "object":"block", "type":"callout", 
@@ -138,7 +164,6 @@ def save_theory(theory, log_id):
             }
         })
 
-    # 2. 詳細解説 (Markdown -> Blocks)
     detail_blocks = text_to_blocks(theory.get("detail", ""))
     children.extend(detail_blocks)
 
@@ -154,8 +179,12 @@ def save_theory(theory, log_id):
 
 # --- Main ---
 def main():
+    global ACTIVE_MODEL_ID
     print("--- Generalization Started ---")
-    # 直近5件のログを取得
+    
+    # 1. モデル解決を実行
+    ACTIVE_MODEL_ID = resolve_best_model()
+
     query = {"page_size": 5, "sorts": [{"property": "日付", "direction": "descending"}]}
     try:
         res = requests.post(f"https://api.notion.com/v1/databases/{SOURCE_LOG_DB_ID}/query", headers=HEADERS, json=query)
@@ -175,7 +204,7 @@ def main():
         theories = generate_theories(content)
         for t in theories:
             save_theory(t, log["id"])
-            time.sleep(1) # API Rate Limit対策
+            time.sleep(1)
 
 if __name__ == "__main__":
     main()

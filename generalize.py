@@ -18,33 +18,26 @@ HEADERS = {
     "Notion-Version": "2022-06-28"
 }
 
-# --- Model Resolver ---
-# --- Model Resolver (Updated for 2026) ---
+# --- Model Resolver (2026 Ready) ---
 def resolve_best_model():
     client = genai.Client(api_key=GEMINI_API_KEY)
-    # 優先順位リスト: 2.5 (User Preferred) -> 2.0 -> 1.5
     candidates = [
-        "gemini-2.5-flash",       # ★最優先
-        "gemini-2.5-flash-001",   # バージョン指定も念のため
+        "gemini-2.5-flash",       # 最優先
         "gemini-2.0-flash-exp",   # 次点
-        "gemini-2.0-flash",
         "gemini-1.5-flash",       # フォールバック
         "gemini-1.5-pro"
     ]
-    
     print("💎 Resolving Best Gemini Model...", flush=True)
     for model in candidates:
         try:
-            # 軽いテストリクエストを送って生存確認
             client.models.generate_content(model=model, contents="Test")
             print(f"✅ Model Resolved: {model}", flush=True)
             return model
-        except Exception:
-            # 存在しない、またはアクセス権がない場合は次へ
-            continue
-    
+        except Exception: continue
     print("⚠️ All checks failed. Fallback to 'gemini-1.5-flash'", flush=True)
     return "gemini-1.5-flash"
+
+ACTIVE_MODEL_ID = None
 
 # --- Notion API Helpers ---
 def get_page_content(page_id):
@@ -72,13 +65,7 @@ def get_page_content(page_id):
 def mark_log_as_processed(page_id):
     """ログ側の『AI処理済み』チェックボックスをONにする"""
     url = f"https://api.notion.com/v1/pages/{page_id}"
-    payload = {
-        "properties": {
-            "AI処理済み": {
-                "checkbox": True
-            }
-        }
-    }
+    payload = {"properties": {"AI処理済み": {"checkbox": True}}}
     try:
         requests.patch(url, headers=HEADERS, json=payload)
         print(f"   ☑️ Marked as processed: {page_id}")
@@ -105,9 +92,24 @@ def text_to_blocks(text):
 # --- Gemini Logic ---
 def generate_theories(log_text):
     client = genai.Client(api_key=GEMINI_API_KEY)
+    
+    # カテゴリ・プロンプト定義（最新版）
     prompt = f"""
     あなたはスマブラの理論構築AIです。入力されたコーチングログから「一般的攻略理論」を抽出してください。
     
+    【抽出カテゴリの定義】
+    以下のいずれかのカテゴリに分類してください。曖昧な場合はより具体的な方を選び、安易に「立ち回り」に入れないこと。
+    - 復帰阻止 (Edgeguarding)
+    - 復帰 (Recovery)
+    - 崖上がり (Ledge Option)
+    - 崖狩り (Ledge Trapping)
+    - 立ち回り (Neutral/Footsies)
+    - 思考 (Thinking/Decision Making)
+    - メンタル (Mental)
+    - 撃墜 (Kill Confirm/KO)
+    - 撃墜拒否 (Survival)
+    - その他 (Other)
+
     【重要】
     1. "detail" フィールドは、Notionのページ本文になります。Markdown形式で記述してください。
     2. "characters"（キャラクター名）は、必ず「スマブラSPの日本語正式名称」で出力してください。
@@ -117,17 +119,17 @@ def generate_theories(log_text):
     [
       {{
         "theory_name": "タイトル (30文字以内)",
-        "category": "立ち回り", 
+        "category": "崖狩り", 
         "importance": "S",
         "characters": ["クラウド", "全般"],
-        "tags": ["着地狩り", "崖"],
+        "tags": ["ジャンプ上がり", "空後"],
         "abstract": "一覧表示用の3行要約",
         "detail": "### 解説\\nここに詳細な理論を書く。", 
         "source_context": "元ログからの引用抜粋"
       }}
     ]
 
-    Log: {log_text[:15000]}
+    Log: {log_text[:20000]}
     """
     try:
         res = client.models.generate_content(
@@ -144,10 +146,10 @@ def generate_theories(log_text):
 def save_theory(theory, log_id):
     props = {
         "Theory Name": {"title": [{"text": {"content": theory.get("theory_name", "Untitled")}}]},
-        "Category": {"select": {"name": theory.get("category", "立ち回り")}},
+        "Category": {"select": {"name": theory.get("category", "その他")}},
         "Importance": {"select": {"name": theory.get("importance", "B (状況限定)")}},
         "Abstract": {"rich_text": [{"text": {"content": theory.get("abstract", "")}}]},
-        "Source Log": {"relation": [{"id": log_id}]},
+        "Source Log": {"relation": [{"id": log_id}]}, # リレーション
         "Verification": {"status": {"name": "Draft"}},
         "キャラクター": {"multi_select": [{"name": c} for c in theory.get("characters", [])]},
         "Tags": {"multi_select": [{"name": t} for t in theory.get("tags", [])]}
@@ -177,13 +179,13 @@ def save_theory(theory, log_id):
     except Exception as e:
         print(f"❌ Network Error: {e}")
 
-# --- Main ---
+# --- Main (Test Mode: 5 logs only) ---
 def main():
     global ACTIVE_MODEL_ID
-    print("--- Generalization Started ---")
+    print("--- Generalization Started (Test Mode: Max 5) ---")
     ACTIVE_MODEL_ID = resolve_best_model()
 
-    # ★最適化: 「AI処理済み」がチェックされていないものだけを取得
+    # 未処理ログを5件だけ取得
     query = {
         "filter": {
             "property": "AI処理済み",
@@ -206,11 +208,12 @@ def main():
         print("ℹ️ No unprocessed logs found.")
         return
 
+    print(f"🔍 Processing {len(logs)} logs...")
+
     for log in logs:
         print(f"Processing Log: {log['id']}")
         content = get_page_content(log["id"])
         
-        # コンテンツが少なすぎる場合はスキップするが、処理済みにはする（ループ防止）
         if len(content) < 50: 
             print("   ⚠️ Content too short. Marking as processed.")
             mark_log_as_processed(log["id"])
@@ -227,7 +230,6 @@ def main():
             save_theory(t, log["id"])
             time.sleep(1)
             
-        # 最後に処理済みフラグを立てる
         mark_log_as_processed(log["id"])
 
 if __name__ == "__main__":

@@ -38,8 +38,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # --- Gemini Helper Functions ---
 def extract_search_query(user_question):
     """
-    ユーザーの質問文からNotion検索用の単語（特にキャラクター名や単語）を抽出する。
-    これにより「ロボット対策教えて」→「ロボット」で検索が可能になる。
+    ユーザーの質問文からNotion検索用の単語を抽出する。
     """
     client = genai.Client(api_key=GEMINI_API_KEY)
     model_id = "gemini-2.0-flash-exp"
@@ -76,9 +75,9 @@ def generate_answer(question, context_texts):
     model_id = "gemini-2.0-flash-exp"
     
     prompt = f"""
-    あなたは「スマブラのプロコーチ」として振る舞ってください。
+    あなたはスマブラの「分析官・参謀」です。
     生徒（ユーザー）からの質問に対し、以下の「コーチ自身のメモ（Context）」に基づいて、
-    具体的かつ論理的にアドバイスを行ってください。
+    **冷静かつ論理的**に回答してください。
 
     Context (コーチのメモ):
     {context_texts[:30000]}
@@ -87,11 +86,18 @@ def generate_answer(question, context_texts):
     {question}
     
     Response Guidelines:
-    1. **結論ファースト**: 最初に核心となる答えを端的に述べる。
-    2. **構造化**: 箇条書きや太字を使用し、Discordで読みやすいフォーマットにする。
-    3. **情報量**: Contextにある情報は可能な限り活用し、薄い回答にならないようにする。
-    4. **トーン**: プロフェッショナルだが、熱意を持って教えるコーチの口調。
-    5. **ハルシネーション排除**: Contextにない情報は「その件についてはデータベースに記載がありませんでした」と正直に伝え、知ったかぶりをしない。
+    1. **トーン**: 
+       - 「～です/～ます」調の丁寧語。
+       - **感情的な煽りや、過度な感嘆符（！）は一切禁止。**
+       - 「～だと思え！」「～しろ！」といった命令口調は禁止。推奨や提案の形（～が有効です、～を推奨します）をとる。
+       - 絵文字は視認性を高めるためのアイコン（✅や🔹など）を使用し、装飾目的の絵文字（🍕や🎁）は淡々とした印象を与えすぎないよう必要に応じて使用する。
+    2. **構造化**: 
+       - 結論を最初に端的に述べる。
+       - 理由や具体的なアクションを箇条書きで整理する。
+    3. **内容**: 
+       - Contextにある理論や数値に基づき、淡々と事実を伝える。
+       - 精神論や根性論は排除する。
+       - Contextにない情報はハルシネーション（嘘）を防ぐため、「データベースに情報がありません」と回答する。
     """
     
     try:
@@ -291,17 +297,4 @@ async def ask(interaction: discord.Interaction, question: str):
         ref_links.append(f"・[{p['title']}]({p['url']})")
         ref_ids.append(p["id"])
 
-    # 4. 回答生成 (Contextだけでなく、ユーザーの元の質問文 question を渡す)
-    ai_answer = generate_answer(question, context_text)
-    
-    # 5. 埋め込み作成
-    embed = discord.Embed(title=f"Q. {question}", description=ai_answer, color=0x00ff00)
-    if ref_links:
-        embed.add_field(name="📚 Reference", value="\n".join(ref_links), inline=False)
-    
-    embed.set_footer(text="これについて詳しく聞きたい場合は「🙋 コーチに直接聞く」を押してください。")
-    
-    view = ResponseView(question, ai_answer, ref_ids)
-    await interaction.followup.send(embed=embed, view=view)
-
-bot.run(DISCORD_TOKEN)
+    # 4. 回答生成 (Contextだけでなく、ユーザーの元の質問文 question を渡

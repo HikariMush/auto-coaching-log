@@ -306,7 +306,7 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
 
     ## [トピック名]
 
-    - **① 現状 (Status):** プレイヤーが現在行っている具体的な挙動、癖、認識のズレ。
+    - **① 現状 (Status):** プレイヤーが現在行っている具体的な挙動、癖、認識のズレ。良い点やすでに出来ている点に言及があればそれを列挙したあと、今後の課題につながる点=癖や認識のズレの言及に入る。
 
     - **② 課題 (Problem):** その挙動が引き起こすリスク（不利フレーム、撃墜拒否ミス、ライン喪失など）。
 
@@ -314,7 +314,7 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
 
     - **④ 改善案 (Solution):** 具体的な修正アクション（％帯による技選択、視線の配り方、意識配分）。
 
-    - **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示。
+    - **⑤ やること (Next Action):** 即座に実行可能な、短く明確な指示。できている点や良かった点など、継続ポイントがあればそれにも言及。
 
     (トピックが複数ある場合は、空行を入れてこれを繰り返す)
 
@@ -342,6 +342,15 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
       "student_name": "生徒名",
       "date": "YYYY-MM-DD",
       "next_action": "最も優先度の高いアクション1つ"
+
+    **【Section 5: 思考フローチャート (Mermaid)】**
+    Section 1で分析した「判断の分岐」や「改善アクションのプロセス」を、Mermaid記法（flowchart TD）で視覚化せよ。
+    
+    **＜Mermaid作成の絶対ルール＞**
+    1. **構文:** `graph TD` を使用する。
+    2. **テキスト:** 日本語を使用してよいが、**ダブルクォーテーション " は絶対に使用禁止**。シングルクォート ' を使うか、引用符なしにすること（JSONパースエラー防止）。
+    3. **内容:** 単なる項目の羅列ではなく、**「Check（判断）」→「Branch（分岐）」→「Action（行動）」**の流れを描くこと。
+    4. **形状:** 判断/分岐にはひし形 {{ }}、処理/行動には四角 [ ] を正しく使い分けること。
     }}
 
     ---
@@ -358,6 +367,10 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     **[JSON_START]**
     (Section 4 のJSON)
     **[JSON_END]**
+
+    **[MERMAID_START]**
+    (Section 5 のMermaidコードのみ。バッククォート不要)
+    **[MERMAID_END]**
     ---
 
     【入力テキスト】
@@ -492,6 +505,8 @@ def notion_create_page_heavy(db_id, props, children):
     if pid and len(children) > 100:
         for i in range(100, len(children), 100):
             requests.patch(f"https://api.notion.com/v1/blocks/{pid}/children", headers=HEADERS, json={"children": children[i:i+100]})
+
+
 
 def ensure_processed_folder():
     try:

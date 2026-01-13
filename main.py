@@ -397,13 +397,21 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
         m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
         return m.group(1).strip() if m else None
 
+   # ... (前略) ...
+
+    # 抽出処理
     report = extract_safe("[DETAILED_REPORT_START]", "[DETAILED_REPORT_END]", text)
     time_log = extract_safe("[RAW_LOG_START]", "[RAW_LOG_END]", text)
     json_str = extract_safe("[JSON_START]", "[JSON_END]", text)
-    
-    # ★追加: Mermaid抽出
     mermaid_code = extract_safe("[MERMAID_START]", "[MERMAID_END]", text)
-    
+
+    # -------------------------------------------------------
+    # 【ここを修正・追記】
+    # Geminiが勝手にMarkdownの装飾（**や```）をつけるのを防ぐクリーニング処理
+    # -------------------------------------------------------
+    if mermaid_code:
+        mermaid_code = mermaid_code.replace("**", "").replace("```mermaid", "").replace("```", "").strip()
+
     # フォールバック（タグがない場合）
     if not mermaid_code:
         m_match = re.search(r'```mermaid(.*?)```', text, re.DOTALL)

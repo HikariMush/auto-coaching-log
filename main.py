@@ -397,7 +397,7 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
         m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
         return m.group(1).strip() if m else None
 
-  report = extract_safe("[DETAILED_REPORT_START]", "[DETAILED_REPORT_END]", text)
+    report = extract_safe("[DETAILED_REPORT_START]", "[DETAILED_REPORT_END]", text)
     time_log = extract_safe("[RAW_LOG_START]", "[RAW_LOG_END]", text)
     json_str = extract_safe("[JSON_START]", "[JSON_END]", text)
     

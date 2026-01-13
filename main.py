@@ -397,10 +397,18 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
         m = re.search(f'{re.escape(s)}(.*?){re.escape(e)}', src, re.DOTALL)
         return m.group(1).strip() if m else None
 
-    report = extract_safe("[DETAILED_REPORT_START]", "[DETAILED_REPORT_END]", text)
+  report = extract_safe("[DETAILED_REPORT_START]", "[DETAILED_REPORT_END]", text)
     time_log = extract_safe("[RAW_LOG_START]", "[RAW_LOG_END]", text)
     json_str = extract_safe("[JSON_START]", "[JSON_END]", text)
-
+    
+    # ★追加: Mermaid抽出
+    mermaid_code = extract_safe("[MERMAID_START]", "[MERMAID_END]", text)
+    
+    # フォールバック（タグがない場合）
+    if not mermaid_code:
+        m_match = re.search(r'```mermaid(.*?)```', text, re.DOTALL)
+        if m_match: mermaid_code = m_match.group(1).strip()
+            
     if not report:
         print("⚠️ Warning: Missing REPORT tags. Fallback...", flush=True)
         if "[RAW_LOG_START]" in text:
@@ -421,7 +429,7 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
         except:
             data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
             
-    return data, report, time_log
+    return data, report, time_log, mermaid_code
 
 def text_to_notion_blocks(text):
     """
@@ -618,25 +626,61 @@ def main():
             chunks = split_audio_ffmpeg(mixed)
             full_text = transcribe_with_groq(chunks)
             
-            # Analysis
-            meta, report, logs = analyze_text_with_gemini(full_text, precise_datetime, candidate_raw_name)
+          # ---------------------------------------------------------
+            # 【修正】main関数内の Notionブロック作成ロジック
+            # ---------------------------------------------------------
+
+            # 1. 戻り値を受け取る変数を4つにする
+            meta, report, logs, mermaid_code = analyze_text_with_gemini(full_text, precise_datetime, candidate_raw_name)
             
-            # DB Matching
+            # DB Matching (既存のまま)
             did, oname = find_best_student_match(meta['student_name'])
             
-            # Content
-            content = f"### 📊 SZメソッド詳細分析\n\n{report}\n\n---\n\n### 📝 時系列ログ\n\n{logs}"
-            
-            # Convert to Blocks
-            blocks = text_to_notion_blocks(content)
-            
-            # Divider for Transcript
-            blocks.append({"object": "block", "type": "divider", "divider": {}})
-            blocks.append({"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📜 全文文字起こし"}}]}})
+            # 2. ブロックリストの構築（順序: 分析 -> 図 -> ログ -> 全文）
+            final_blocks = []
+
+            # A. 詳細分析レポート
+            report_header = "### 📊 SZメソッド詳細分析\n\n" + report
+            final_blocks.extend(text_to_notion_blocks(report_header))
+
+            # B. Mermaidブロック（存在すれば挿入）
+            if mermaid_code:
+                final_blocks.append({"object": "block", "type": "divider", "divider": {}})
+                final_blocks.append({
+                    "object": "block", 
+                    "type": "heading_2", 
+                    "heading_2": {"rich_text": [{"text": {"content": "🧠 思考フローチャート"}}]}
+                })
+                final_blocks.append({
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [{"text": {"content": "上の分析内容を構造化したものです。判断に迷った時の地図として使ってください。"}}],
+                        "icon": {"emoji": "🗺️"}
+                    }
+                })
+                final_blocks.append({
+                    "object": "block",
+                    "type": "code",
+                    "code": {
+                        "rich_text": [{"type": "text", "text": {"content": mermaid_code}}],
+                        "language": "mermaid" 
+                    }
+                })
+
+            # C. 時系列ログ
+            logs_content = f"\n---\n\n### 📝 時系列ログ\n\n{logs}"
+            final_blocks.extend(text_to_notion_blocks(logs_content))
+
+            # D. 全文文字起こし
+            final_blocks.append({"object": "block", "type": "divider", "divider": {}})
+            final_blocks.append({"object": "block", "type": "heading_3", "heading_3": {"rich_text": [{"text": {"content": "📜 全文文字起こし"}}]}})
             
             for i in range(0, len(full_text), 1900):
                 chunk_text = full_text[i:i+1900]
-                blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk_text}}]}})
+                final_blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk_text}}]}})
+            
+            # ---------------------------------------------------------
             
             props = {
                 "名前": {"title": [{"text": {"content": f"{precise_datetime} {oname} 通話ログ"}}]}, 
@@ -644,8 +688,8 @@ def main():
             }
 
             print("💾 Saving to Fallback DB (All Data)...")
-            notion_create_page_heavy(sanitize_id(FINAL_FALLBACK_DB_ID), copy.deepcopy(props), copy.deepcopy(blocks))
-            
+            # ★引数を final_blocks に変更するのを忘れずに！
+            notion_create_page_heavy(sanitize_id(FINAL_FALLBACK_DB_ID), copy.deepcopy(props), copy.deepcopy(final_blocks))
             if did and did != FINAL_FALLBACK_DB_ID:
                 print(f"👤 Saving to Student DB ({oname})...")
                 notion_create_page_heavy(sanitize_id(did), copy.deepcopy(props), copy.deepcopy(blocks))

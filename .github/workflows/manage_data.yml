@@ -33,21 +33,21 @@ jobs:
         python -m pip install --upgrade pip
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-    # 1. DB全削除 (条件を startsWith に変更)
+    # 1. DB全削除 (修正: startsWithを使用)
     - name: Clear Database
       if: ${{ startsWith(inputs.action_type, '1_clear_database') }}
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       run: python clear_database.py
 
-    # 2. ログリセット
+    # 2. ログリセット (修正: startsWithを使用)
     - name: Reset Logs
       if: ${{ startsWith(inputs.action_type, '2_reset_logs') }}
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       run: python reset_logs.py
 
-    # 3. 再構築 (Generalize)
+    # 3. 再構築 (修正: startsWithを使用)
     - name: Generalize (AI Analysis)
       if: ${{ startsWith(inputs.action_type, '3_generalize') }}
       env:
@@ -55,7 +55,7 @@ jobs:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: python generalize.py
 
-    # 4. メモリ同期 (Sync)
+    # 4. メモリ同期 (修正: startsWithを使用)
     - name: Sync to Pinecone
       if: ${{ startsWith(inputs.action_type, '4_sync_memory') }}
       env:

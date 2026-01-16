@@ -6,13 +6,14 @@ on:
       action_type:
         description: '実行するタスクを選択してください'
         required: true
-        default: '3_generalize'
+        default: '3_generalize (再構築)'
         type: choice
         options:
-        - 1_clear_database (ゴミ捨て: DB全削除)
-        - 2_reset_logs (リセット: ログを未処理に戻す)
-        - 3_generalize (再構築: 理論抽出実行)
-        - 4_sync_memory (同期: Pineconeへ保存)
+        # YAMLの解釈ミスを防ぐため、ダブルクォートで確実に囲む
+        - "1_clear_database (ゴミ捨て: DB全削除)"
+        - "2_reset_logs (リセット: ログを未処理に戻す)"
+        - "3_generalize (再構築: 理論抽出実行)"
+        - "4_sync_memory (同期: Pineconeへ保存)"
 
 jobs:
   run-script:
@@ -28,36 +29,42 @@ jobs:
       with:
         python-version: '3.10'
 
+    # 【診断用】何が選ばれたかログに出力する（これで原因特定可能）
+    - name: Debug Input
+      run: echo "Selected Action IS ${{ inputs.action_type }}"
+
+    # 依存関係のインストール（requirements.txtが無い場合も想定して主要ライブラリを強制インストール）
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
+        pip install requests google-generativeai pinecone-client discord.py python-dotenv
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-    # 1. DB全削除 (修正: startsWithを使用)
+    # 1. DB全削除 (先頭の "1_" だけで判定)
     - name: Clear Database
-      if: ${{ startsWith(inputs.action_type, '1_clear_database') }}
+      if: startsWith(inputs.action_type, '1_')
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       run: python clear_database.py
 
-    # 2. ログリセット (修正: startsWithを使用)
+    # 2. ログリセット (先頭の "2_" だけで判定)
     - name: Reset Logs
-      if: ${{ startsWith(inputs.action_type, '2_reset_logs') }}
+      if: startsWith(inputs.action_type, '2_')
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       run: python reset_logs.py
 
-    # 3. 再構築 (修正: startsWithを使用)
+    # 3. 再構築 (先頭の "3_" だけで判定)
     - name: Generalize (AI Analysis)
-      if: ${{ startsWith(inputs.action_type, '3_generalize') }}
+      if: startsWith(inputs.action_type, '3_')
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       run: python generalize.py
 
-    # 4. メモリ同期 (修正: startsWithを使用)
+    # 4. メモリ同期 (先頭の "4_" だけで判定)
     - name: Sync to Pinecone
-      if: ${{ startsWith(inputs.action_type, '4_sync_memory') }}
+      if: startsWith(inputs.action_type, '4_')
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

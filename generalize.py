@@ -2,12 +2,13 @@ import os
 import time
 import json
 import requests
+import re
 from google import genai
 from google.genai import types
 
 # --- Config ---
-SOURCE_LOG_DB_ID = "2e01bc8521e380ffaf28c2ab9376b00d"   # ログDB
-TARGET_THEORY_DB_ID = "2e21bc8521e38029b8b1d5c4b49731eb"  # Theory DB
+SOURCE_LOG_DB_ID = "2e01bc8521e380ffaf28c2ab9376b00d"
+TARGET_THEORY_DB_ID = "2e21bc8521e38029b8b1d5c4b49731eb"
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -18,24 +19,71 @@ HEADERS = {
     "Notion-Version": "2022-06-28"
 }
 
-# --- Model Resolver ---
+# --- Dynamic Model Resolver ---
 def resolve_best_model():
     client = genai.Client(api_key=GEMINI_API_KEY)
-    candidates = [
-        "gemini-2.5-flash",       # ★最優先
-        "gemini-2.0-flash-exp",   # 次点
-        "gemini-1.5-flash",       # フォールバック
-        "gemini-1.5-pro"
-    ]
-    print("💎 Resolving Best Gemini Model...", flush=True)
-    for model in candidates:
-        try:
-            client.models.generate_content(model=model, contents="Test")
-            print(f"✅ Model Resolved: {model}", flush=True)
-            return model
-        except Exception: continue
-    print("⚠️ All checks failed. Fallback to 'gemini-1.5-flash'", flush=True)
-    return "gemini-1.5-flash"
+    print("💎 Querying Google API for the absolute latest models...", flush=True)
+
+    try:
+        # 1. APIから利用可能な全モデルを動的に取得
+        all_models = list(client.models.list())
+        candidates = []
+        
+        for m in all_models:
+            # モデルIDの抽出 (例: models/gemini-1.5-pro -> gemini-1.5-pro)
+            name = m.name.replace("models/", "")
+            
+            # 生成モデルのみを対象にする (embeddingやvision単体モデルを除外)
+            if "gemini" in name and "vision" not in name and "embedding" not in name:
+                candidates.append(name)
+
+        # 2. 最強モデルを決めるためのスコアリングロジック
+        def model_score(name):
+            score = 0
+            # バージョン判定 (数字が大きいほど偉い)
+            version_match = re.search(r"(\d+\.\d+)", name)
+            if version_match:
+                version = float(version_match.group(1))
+                score += version * 1000  # 2.5 -> 2500, 2.0 -> 2000
+            
+            # グレード判定
+            if "ultra" in name: score += 300
+            elif "pro" in name: score += 200
+            elif "flash" in name: score += 100
+            
+            # 最新・実験的モデルの優先 (Expは最新機能が入っていることが多い)
+            if "exp" in name: score += 50
+            if "thinking" in name: score += 20 # 思考プロセス付きならさらに加点
+            
+            # 安定版(001, 002等)より最新の日付付きを優先したい場合などはここで調整
+            # ここではシンプルにバージョンとPro/Flash基準とする
+            return score
+
+        # スコアが高い順にソート
+        candidates.sort(key=model_score, reverse=True)
+        
+        print(f"📋 Detected Candidates (Top 5): {candidates[:5]}", flush=True)
+
+        # 3. 上から順に疎通テスト (Rate Limitなどで使えないやつはスキップ)
+        for model in candidates:
+            try:
+                client.models.generate_content(
+                    model=model, 
+                    contents="Test",
+                    config=types.GenerateContentConfig(response_mime_type="text/plain")
+                )
+                print(f"✅ ACTIVATED STRONGEST MODEL: {model}", flush=True)
+                return model
+            except Exception as e:
+                # 権限がない、廃止された、RateLimitなどの場合は次へ
+                continue
+
+    except Exception as e:
+        print(f"❌ Failed to list models dynamically: {e}")
+    
+    # 万が一全滅した場合の最後の砦 (ここには来ないはずだが念の為)
+    print("⚠️ Dynamic resolution failed. Fallback to hardcoded safe model.")
+    return "gemini-1.5-pro"
 
 ACTIVE_MODEL_ID = None
 
@@ -63,7 +111,6 @@ def get_page_content(page_id):
     return all_text
 
 def mark_log_as_processed(page_id):
-    """ログ側の『AI処理済み』チェックボックスをONにする"""
     url = f"https://api.notion.com/v1/pages/{page_id}"
     payload = {"properties": {"AI処理済み": {"checkbox": True}}}
     try:
@@ -74,10 +121,9 @@ def mark_log_as_processed(page_id):
 
 def text_to_blocks(text):
     blocks = []
-    for line in text.split('\n'):
-        if not line.strip(): 
-            blocks.append({"object":"block", "type":"paragraph", "paragraph":{"rich_text":[]}})
-            continue
+    lines = text.split('\n')
+    for line in lines:
+        if not line.strip(): continue
         ct = line.replace('**', '')[:1900]
         if line.startswith('### '):
             blocks.append({"object":"block", "type":"heading_3", "heading_3":{"rich_text":[{"text":{"content":ct[4:]}}]}})
@@ -93,65 +139,81 @@ def text_to_blocks(text):
 def generate_theories(log_text):
     client = genai.Client(api_key=GEMINI_API_KEY)
     
-    # カテゴリ・プロンプト定義（最新版）
     prompt = f"""
-    あなたはスマブラの理論構築AIです。入力されたコーチングログから「一般的攻略理論」を抽出してください。
+    あなたはスマブラのコーチングログ分析AIです。
+    入力されたログから「理論(Theory)」を抽出し、構造化データに変換してください。
     
-    【抽出カテゴリの定義】
-    以下のいずれかのカテゴリに分類してください。曖昧な場合はより具体的な方を選び、安易に「立ち回り」に入れないこと。
-    - 復帰阻止 (Edgeguarding)
-    - 復帰 (Recovery)
-    - 崖上がり (Ledge Option)
-    - 崖狩り (Ledge Trapping)
-    - 立ち回り (Neutral/Footsies)
-    - 思考 (Thinking/Decision Making)
-    - メンタル (Mental)
-    - 撃墜 (Kill Confirm/KO)
-    - 撃墜拒否 (Survival)
-    - その他 (Other)
+    【分析ルール】
+    1. **Scope判定**: 
+       - その理論は「全キャラ共通の一般論」か、「特定のキャラ対」か？
+       - 値は必ず **"全般"** または **"キャラ対"** のいずれかにすること。
+    
+    2. **Category (複数可)**:
+       - 該当するカテゴリをリスト形式で全て抽出せよ。
+       - 選択肢: 復帰阻止, 復帰, 崖上がり, 崖狩り, 立ち回り, 思考, メンタル, 撃墜, 撃墜拒否, コンボ, その他
 
-    【重要】
-    1. "detail" フィールドは、Notionのページ本文になります。Markdown形式で記述してください。
-    2. "characters"（キャラクター名）は、必ず「スマブラSPの日本語正式名称」で出力してください。
-    3. 以下のJSON形式で出力してください。
+    3. **キャラクター抽出**:
+       - Player Char: 使用キャラ（不明/全般なら "全般"）。
+       - Target Char: 対策対象（Scopeが"全般"なら空欄）。
+       - 名称は「スマブラSPの日本語正式名称」。
 
     Format (JSON Array):
     [
       {{
         "theory_name": "タイトル (30文字以内)",
-        "category": "崖狩り", 
+        "scope": "全般" | "キャラ対", 
+        "categories": ["復帰阻止", "撃墜"], 
+        "player_char": "クラウド",
+        "target_char": "ネス",
         "importance": "S",
-        "characters": ["クラウド", "全般"],
-        "tags": ["ジャンプ上がり", "空後"],
-        "abstract": "一覧表示用の3行要約",
-        "detail": "### 解説\\nここに詳細な理論を書く。", 
-        "source_context": "元ログからの引用抜粋"
+        "tags": ["ジャンプ読み", "空前"],
+        "abstract": "3行要約",
+        "detail": "### 解説\\n詳細な理論。", 
+        "source_context": "元ログからの引用"
       }}
     ]
 
-    Log: {log_text[:20000]}
+    Log Content:
+    {log_text[:25000]}
     """
-    try:
-        res = client.models.generate_content(
-            model=ACTIVE_MODEL_ID, 
-            contents=prompt, 
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        return json.loads(res.text)
-    except Exception as e:
-        print(f"Gemini Error: {e}")
-        return []
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            res = client.models.generate_content(
+                model=ACTIVE_MODEL_ID, 
+                contents=prompt, 
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            return json.loads(res.text)
+        except Exception as e:
+            if "429" in str(e) or "Resource exhausted" in str(e):
+                print(f"⚠️ Rate Limit hit ({ACTIVE_MODEL_ID}). Waiting 30s...", flush=True)
+                time.sleep(30)
+                continue
+            else:
+                print(f"Gemini Error: {e}")
+                return []
+    return []
 
 # --- Save Logic ---
 def save_theory(theory, log_id):
+    target_char = theory.get("target_char", "")
+    if target_char == "全般": target_char = None 
+    
+    raw_cats = theory.get("categories", [])
+    if isinstance(raw_cats, str): raw_cats = [raw_cats]
+    
     props = {
         "Theory Name": {"title": [{"text": {"content": theory.get("theory_name", "Untitled")}}]},
-        "Category": {"select": {"name": theory.get("category", "その他")}},
+        "Category": {"multi_select": [{"name": c} for c in raw_cats]},
+        "Scope": {"select": {"name": theory.get("scope", "全般")}},
+        "Player Char": {"select": {"name": theory.get("player_char", "全般")}}, 
+        "Target Char": {"select": {"name": target_char}} if target_char else {"select": None},
         "Importance": {"select": {"name": theory.get("importance", "B (状況限定)")}},
         "Abstract": {"rich_text": [{"text": {"content": theory.get("abstract", "")}}]},
-        "Source Log": {"relation": [{"id": log_id}]}, # リレーション
+        "Source Log": {"relation": [{"id": log_id}]},
         "Verification": {"status": {"name": "Draft"}},
-        "キャラクター": {"multi_select": [{"name": c} for c in theory.get("characters", [])]},
         "Tags": {"multi_select": [{"name": t} for t in theory.get("tags", [])]}
     }
     
@@ -160,7 +222,7 @@ def save_theory(theory, log_id):
         children.append({
             "object":"block", "type":"callout", 
             "callout":{
-                "rich_text":[{"text":{"content": f"Source Context:\n{theory['source_context'][:1900]}"}}],
+                "rich_text":[{"text":{"content": f"Source: {theory['source_context'][:1900]}"}}],
                 "icon": {"emoji": "💡"}
             }
         })
@@ -173,30 +235,33 @@ def save_theory(theory, log_id):
             json={"parent": {"database_id": TARGET_THEORY_DB_ID}, "properties": props, "children": children}
         )
         if res.status_code == 200:
-            print(f"✅ Saved: {theory.get('theory_name')}")
+            print(f"✅ Saved: [{theory.get('scope')}] {theory.get('theory_name')}")
         else:
             print(f"❌ Save Failed ({res.status_code}): {res.text}")
     except Exception as e:
         print(f"❌ Network Error: {e}")
 
-# --- Main (Bulk Mode) ---
+# --- Main ---
 def main():
     global ACTIVE_MODEL_ID
-    print("--- Generalization Started (Bulk Mode) ---")
-    ACTIVE_MODEL_ID = resolve_best_model()
+    print("--- Generalization Started (Dynamic Latest-Model Search Mode) ---")
+    
+    # 待機ループ: 有効なモデルが見つかるまで粘る
+    while True:
+        ACTIVE_MODEL_ID = resolve_best_model()
+        if ACTIVE_MODEL_ID:
+            break
+        print("⏳ Waiting 60s for models to become available...")
+        time.sleep(60)
 
     has_more = True
-    
     while has_more:
-        # 未処理ログを50件ずつ取得
         query = {
             "filter": {
                 "property": "AI処理済み",
-                "checkbox": {
-                    "equals": False
-                }
+                "checkbox": {"equals": False}
             },
-            "page_size": 50, 
+            "page_size": 10,
             "sorts": [{"property": "日付", "direction": "descending"}]
         }
         
@@ -205,40 +270,35 @@ def main():
             logs = res.json().get("results", [])
         except Exception as e:
             print(f"❌ Failed to fetch logs: {e}")
-            break
+            time.sleep(10)
+            continue
         
         if not logs:
-            print("ℹ️ No more unprocessed logs found. System sleeping.")
+            print("ℹ️ No more unprocessed logs found.")
             has_more = False
             break
 
-        print(f"🔍 Found batch of {len(logs)} logs. Processing...")
+        print(f"🔍 Processing batch of {len(logs)} logs with {ACTIVE_MODEL_ID}...")
 
         for log in logs:
             print(f"\nProcessing Log: {log['id']}")
             content = get_page_content(log["id"])
-            
-            # 短すぎるコンテンツはスキップ＆処理済みに
-            if len(content) < 50: 
-                print("   ⚠️ Content too short. Marking as processed.")
+            if len(content) < 30: 
                 mark_log_as_processed(log["id"])
                 continue
             
             theories = generate_theories(content)
             
-            # 理論が出なくても処理済みに（ループ防止）
             if not theories:
-                 print("   ⚠️ No theories extracted. Marking as processed.")
                  mark_log_as_processed(log["id"])
                  continue
 
             for t in theories:
                 save_theory(t, log["id"])
-                time.sleep(1) # Notion API Rate Limit
+                time.sleep(1) 
                 
             mark_log_as_processed(log["id"])
-            
-        time.sleep(2) # バッチ間の休憩
+            time.sleep(2)
 
 if __name__ == "__main__":
     main()

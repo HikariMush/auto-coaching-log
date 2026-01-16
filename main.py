@@ -88,9 +88,15 @@ try:
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
     
-    print("💎 Detecting Best Available Model...", flush=True)
+    print("💎 Detecting Best Gemini 3.0 Model...", flush=True)
     
-    PRIORITY_TARGETS = ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"]
+    # --- STRICT GEMINI 3.0 SERIES ONLY ---
+    PRIORITY_TARGETS = [
+        "gemini-3.0-flash",          # Priority 1: Stable
+        "gemini-3.0-flash-001",      # Priority 2: Versioned
+        "gemini-3.0-flash-exp"       # Priority 3: Experimental
+    ]
+    
     for target in PRIORITY_TARGETS:
         print(f"👉 Testing: [{target}]...", flush=True)
         try:
@@ -98,11 +104,14 @@ try:
             print(f"✅ SUCCESS! Using Model: [{target}]", flush=True)
             RESOLVED_MODEL_ID = target
             break
-        except Exception: continue
+        except Exception as e:
+            # print(f"   (Skipping {target}: {e})") 
+            continue
                 
     if not RESOLVED_MODEL_ID:
-        RESOLVED_MODEL_ID = "gemini-1.5-flash"
-        print(f"⚠️ All checks failed. Forcing Fallback to: {RESOLVED_MODEL_ID}")
+        # If all checks fail, default to the main 3.0 ID instead of falling back to 1.5
+        RESOLVED_MODEL_ID = "gemini-3.0-flash"
+        print(f"⚠️ Connection checks failed. Forcing use of: {RESOLVED_MODEL_ID}")
 
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
     if not NOTION_TOKEN: raise Exception("NOTION_TOKEN missing")
@@ -304,9 +313,9 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     {hint_context}
     {glossary_instruction}
 
-    【重要参照：カテゴリ定義】
+   【重要参照：カテゴリ定義】
     レポートの「トピック名」を決定する際は、以下の定義に最も合致するものを選べ。
-    **技術面（1-10）と、プレイヤー面（11-13）を明確に区別すること。**
+    **技術面（1-10）と、プレイヤー面（11-13）を明確に区別すること。また、同一番号の話題でも複数個のトピックの話が出ている場合は、分けること。例：着地狩り文脈で、回避着地を狩れていないこと、と、相手がジャンプした先を追う動きが出来ていない、があった場合は、別々に分解する必要がある。**
 
     -- ゲーム内技術 (In-Game) --
     1. **差し合い:** お互いが地上または空中にいて、有利不利がない状態。技の当て合い。
@@ -355,8 +364,15 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     即座に実行可能な、短く明確な指示。できている点や良かった点など、継続ポイントがあればそれにも言及。
 
     **【Section 2: 課題セット】**
-    「トリガー(相手の行動)」→「アクション(自分の行動)」の形式で箇条書きせよ。
-    ※メンタルや体調の場合は「トリガー(事象)」→「アクション(対処)」とする。
+    課題を箇条書きせよ。省略は許されない。
+    フォーマットに関して、技術面(1~10)の場合は、
+    「状況(距離&タイミング&その他情報に言及)」→「アクション(キャラの動き + 脳の動き)」の形。行動が２段階に分かれている場合はそれも記載する
+    例:
+    着地狩り 急降下回避着地狩り
+    状況：相手大ジャンプ1個分上 相手ジャンプなし
+    行動：引きステ(暴れケア) + 暴れ&回避確認 → DA差し返し or 横スマ
+
+    プレイヤー面(11~13)の場合は「トリガー(事象)」→「アクション(対処)」とする。
 
     **【Section 3: 時系列ログ】**
     セッションの流れを時系列で要約せよ。
@@ -581,7 +597,7 @@ def move_original_file(file_id, folder_id):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v128.0 - Full Categories & Clean Mermaid) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v128.0 - Gemini 3.0 Strict Mode) ---", flush=True)
     load_student_registry()
     
     try:

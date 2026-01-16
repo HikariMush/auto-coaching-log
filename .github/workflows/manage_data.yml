@@ -6,7 +6,7 @@ on:
       action_type:
         description: '実行するタスクを選択してください'
         required: true
-        default: 'generalize'
+        default: '3_generalize'
         type: choice
         options:
         - 1_clear_database (ゴミ捨て: DB全削除)
@@ -17,7 +17,7 @@ on:
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 最大6時間まで許可
+    timeout-minutes: 360
 
     steps:
     - name: Checkout code
@@ -32,25 +32,24 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-      # requirements.txtに google-generativeai, notion-client, pinecone-client 等が含まれている前提
 
-    # 1. DB全削除
+    # 1. DB全削除 (条件を startsWith に変更)
     - name: Clear Database
-      if: ${{ inputs.action_type == '1_clear_database' }}
+      if: ${{ startsWith(inputs.action_type, '1_clear_database') }}
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       run: python clear_database.py
 
     # 2. ログリセット
     - name: Reset Logs
-      if: ${{ inputs.action_type == '2_reset_logs' }}
+      if: ${{ startsWith(inputs.action_type, '2_reset_logs') }}
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
       run: python reset_logs.py
 
     # 3. 再構築 (Generalize)
     - name: Generalize (AI Analysis)
-      if: ${{ inputs.action_type == '3_generalize' }}
+      if: ${{ startsWith(inputs.action_type, '3_generalize') }}
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -58,7 +57,7 @@ jobs:
 
     # 4. メモリ同期 (Sync)
     - name: Sync to Pinecone
-      if: ${{ inputs.action_type == '4_sync_memory' }}
+      if: ${{ startsWith(inputs.action_type, '4_sync_memory') }}
       env:
         NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

@@ -7,7 +7,6 @@ import shutil
 import glob
 import re
 import traceback
-import random
 import copy
 import difflib
 from datetime import datetime, timedelta, timezone
@@ -60,71 +59,146 @@ def log_error(context, error_obj):
         print(f"   Details: {str(error_obj)}", flush=True)
         print("-" * 30, flush=True)
 
-# --- 1. Initialization (Setup) ---
-def setup_env():
+# --- 1. Model Selection Logic (Dynamic & Strict) ---
+
+def parse_model_score(model_name):
+    """
+    モデル名からバージョンとティアを解析し、スコア化する。
+    戻り値: (version_float, tier_score)
+    """
+    # Version extraction (e.g., gemini-1.5-pro -> 1.5)
+    ver_match = re.search(r"gemini-(\d+\.\d+)", model_name)
+    version = float(ver_match.group(1)) if ver_match else 0.0
+    
+    # Tier scoring
+    tier = 0
+    if "ultra" in model_name: tier = 5
+    elif "thinking" in model_name: tier = 4.5 # Thinking models often outperform Pro
+    elif "pro" in model_name: tier = 4
+    elif "flash" in model_name: tier = 2
+    elif "nano" in model_name: tier = 1
+    
+    # Experimental penalty/bonus? 
+    # Current stance: Use Exp if it's the highest version available. No penalty.
+    
+    return version, tier
+
+def fetch_and_rank_models(client):
+    print("📡 Fetching available models from API...", flush=True)
+    try:
+        # SDKの仕様に合わせてモデルリストを取得
+        # google-genai SDK v0.1+ uses client.models.list()
+        all_models = list(client.models.list())
+        
+        candidates = []
+        print(f"🔍 Found {len(all_models)} total models. Filtering...", flush=True)
+
+        for m in all_models:
+            # modelオブジェクトから名前を取得 (m.name or m.display_name depending on SDK version)
+            m_name = m.name.replace("models/", "") if hasattr(m, "name") else str(m)
+            
+            # 基本フィルタ: generateContentが使えるGemini系モデルのみ
+            if "gemini" not in m_name or "vision" in m_name: 
+                continue
+            
+            version, tier = parse_model_score(m_name)
+            
+            # --- STRICT THRESHOLD CHECK ---
+            # 下限: 2.5 Pro (Version >= 2.5 AND Tier >= Pro(4))
+            # ただし、Version 3.0 Flash (Ver=3.0, Tier=2) は 2.5 Proより賢い可能性が高いため、
+            # 「Versionが2.5より大きければFlashでも可」とするか、
+            # ユーザー指示通り「2.5Proが下限」を厳密に守るか。
+            # 指示：能力の下限が2.5Pro。
+            # 解釈：Version 2.5以上は必須。Version 2.5の場合はPro以上必須。
+            
+            is_qualified = False
+            if version > 2.5:
+                is_qualified = True # 3.0 Flash etc are OK
+            elif version == 2.5:
+                if tier >= 4: # Pro, Thinking, Ultra
+                    is_qualified = True
+            
+            if is_qualified:
+                candidates.append({
+                    "id": m_name,
+                    "version": version,
+                    "tier": tier,
+                    "score": version * 10 + tier # Weight version heavily
+                })
+        
+        # Sort by Score Descending
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates
+
+    except Exception as e:
+        print(f"❌ Failed to list models: {e}")
+        return []
+
+def setup_env_and_model():
     global RESOLVED_MODEL_ID, BOT_EMAIL
     if os.path.exists(TEMP_DIR): shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
     
+    # --- GCP Setup ---
     sa_key = os.getenv("GCP_SA_KEY")
     if sa_key:
-        with open("service_account.json", "w") as f:
-            f.write(sa_key)
+        with open("service_account.json", "w") as f: f.write(sa_key)
         try:
             key_data = json.loads(sa_key)
             BOT_EMAIL = key_data.get("client_email", "Unknown")
-            print(f"\n==========================================")
-            print(f"🤖 BOT EMAIL: {BOT_EMAIL}")
-            print(f"👉 Ensure this email is an 'Editor' of the folder!")
-            print(f"==========================================\n", flush=True)
         except: pass
     else:
-        print("❌ ENV Error: GCP_SA_KEY is missing.")
+        print("❌ ENV Error: GCP_SA_KEY missing.")
         sys.exit(1)
 
-setup_env()
+    # --- Model Selection ---
+    try:
+        gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        
+        # 1. Get Ranked Candidates
+        candidates = fetch_and_rank_models(gemini_client)
+        
+        if not candidates:
+            print("❌ CRITICAL: No models found meeting the minimum criteria (>= 2.5 Pro).")
+            print("   Please check your API Key permissions or wait for model release.")
+            sys.exit(1)
 
-try:
+        print(f"📋 Candidate List (Top 5): {[c['id'] for c in candidates[:5]]}", flush=True)
+
+        # 2. Test Candidates in Order
+        for cand in candidates:
+            mid = cand["id"]
+            print(f"👉 Testing Candidate: [{mid}]...", flush=True)
+            try:
+                # Ping test
+                gemini_client.models.generate_content(model=mid, contents="Test.")
+                print(f"✅ LOCKED: Using [{mid}] (Ver: {cand['version']}, Tier: {cand['tier']})", flush=True)
+                RESOLVED_MODEL_ID = mid
+                break
+            except Exception as e:
+                print(f"   ⚠️ Failed ({mid}): {e}")
+                continue
+        
+        if not RESOLVED_MODEL_ID:
+            print("❌ CRITICAL: All qualified models failed connectivity checks.")
+            sys.exit(1)
+
+    except Exception as e:
+        log_error("Model Setup Failed", e)
+        sys.exit(1)
+
+    # --- Other Services ---
+    global groq_client, drive_service, INBOX_FOLDER_ID, HEADERS
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-    
-    print("💎 Detecting Best Gemini 3.0 Model...", flush=True)
-    
-    # --- STRICT GEMINI 3.0 SERIES ONLY ---
-    PRIORITY_TARGETS = [
-        "gemini-3.0-flash",          # Priority 1: Stable
-        "gemini-3.0-flash-001",      # Priority 2: Versioned
-        "gemini-3.0-flash-exp"       # Priority 3: Experimental
-    ]
-    
-    for target in PRIORITY_TARGETS:
-        print(f"👉 Testing: [{target}]...", flush=True)
-        try:
-            gemini_client.models.generate_content(model=target, contents="Hello")
-            print(f"✅ SUCCESS! Using Model: [{target}]", flush=True)
-            RESOLVED_MODEL_ID = target
-            break
-        except Exception as e:
-            # print(f"   (Skipping {target}: {e})") 
-            continue
-                
-    if not RESOLVED_MODEL_ID:
-        # If all checks fail, default to the main 3.0 ID instead of falling back to 1.5
-        RESOLVED_MODEL_ID = "gemini-3.0-flash"
-        print(f"⚠️ Connection checks failed. Forcing use of: {RESOLVED_MODEL_ID}")
-
     NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-    if not NOTION_TOKEN: raise Exception("NOTION_TOKEN missing")
-    
     HEADERS = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     creds = service_account.Credentials.from_service_account_file("service_account.json", scopes=['https://www.googleapis.com/auth/drive'])
     drive_service = build('drive', 'v3', credentials=creds)
     INBOX_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-    if not INBOX_FOLDER_ID: raise Exception("DRIVE_FOLDER_ID missing")
-    
-except Exception as e:
-    log_error("Initialization Failed", e)
-    sys.exit(1)
+
+# --- Execute Setup ---
+setup_env_and_model()
+
 
 def sanitize_id(raw_id):
     if not raw_id: return None
@@ -291,9 +365,10 @@ def transcribe_with_groq(chunk_paths):
         else: raise Exception("❌ Groq Rate Limit persists. Aborting.")
     return full_transcript
 
-# --- 4. Intelligence Analysis (Expert Mode) ---
+# --- 4. Intelligence Analysis (Dynamic Expert Mode) ---
 
 def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
+    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY")) # Re-init to be safe
     print(f"🧠 Gemini Analyzing using [{RESOLVED_MODEL_ID}]...", flush=True)
     
     hint_context = f"録音日時: {date_hint}"
@@ -304,7 +379,7 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     if COMMON_TERMS:
         glossary_instruction = f"\n【重要参照：スマブラ用語集】\n誤字訂正用辞書です。以下の定義に基づき専門用語を補正せよ。\n{COMMON_TERMS}\n"
 
-    # ★ V128.0 PROMPT (Full Categories, Strict Mermaid, No Decor)
+    # ★ V130.0 PROMPT (Same High-Spec Instructions)
     prompt = f"""
     あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的思考の達人です。
     提供された会話データから、プレイヤーが直面している課題と解決策を抽出し、以下のフォーマットで出力してください。
@@ -313,7 +388,7 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     {hint_context}
     {glossary_instruction}
 
-   【重要参照：カテゴリ定義】
+    【重要参照：カテゴリ定義】
     レポートの「トピック名」を決定する際は、以下の定義に最も合致するものを選べ。
     **技術面（1-10）と、プレイヤー面（11-13）を明確に区別すること。また、同一番号の話題でも複数個のトピックの話が出ている場合は、分けること。例：着地狩り文脈で、回避着地を狩れていないこと、と、相手がジャンプした先を追う動きが出来ていない、があった場合は、別々に分解する必要がある。**
 
@@ -421,7 +496,7 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     max_retries = 10
     for attempt in range(max_retries):
         try:
-            response = gemini_client.models.generate_content(model=RESOLVED_MODEL_ID, contents=prompt)
+            response = client.models.generate_content(model=RESOLVED_MODEL_ID, contents=prompt)
             text = response.text.strip()
             break 
         except Exception as e:
@@ -597,7 +672,13 @@ def move_original_file(file_id, folder_id):
 
 # --- Main ---
 def main():
-    print("--- SZ AUTO LOGGER ULTIMATE (v128.0 - Gemini 3.0 Strict Mode) ---", flush=True)
+    print("--- SZ AUTO LOGGER ULTIMATE (v130.0 - Dynamic Spec Selection) ---", flush=True)
+    
+    # 接続テスト済みのRESOLVED_MODEL_IDがすでにセットアップされている状態で開始
+    if not RESOLVED_MODEL_ID:
+        print("❌ Model Selection Failed during Setup. Aborting.")
+        return
+
     load_student_registry()
     
     try:

@@ -278,35 +278,58 @@ def extract_date_smart(filename, drive_created_time_iso):
     return now_jst.strftime('%Y-%m-%d %H:%M:%S'), now_jst.strftime('%Y-%m-%d')
 
 def detect_student_candidate_raw(file_list, original_archive_name):
-    strong_candidates = []
-    weak_candidates = []
+    """
+    ファイル名の一部が、Notionデータベース（STUDENT_REGISTRY）の登録名に含まれているかを厳密にチェックする。
+    例: ファイル名 '2-kiyamu.flac' (clean: kiyamu) -> DB名 'キャム kiyamu' に包含されるためヒット。
+    """
+    global STUDENT_REGISTRY
+    
     ignore_files = ["raw.dat", "info.txt", "ds_store", "thumbs.db", "desktop.ini", "readme", "license"]
-    ignore_names = ["hikari", "craig", "entrymonster", "bot", "ssb"]
+    # hikariはコーチ（User）のため、候補から除外
+    ignore_names = ["hikari", "craig", "entrymonster", "bot", "ssb", "recording"] 
 
-    print("🔎 Scanning internal files for student ID hint...", flush=True)
+    potential_candidates = []
+
+    print("🔎 Scanning internal files for registry match...", flush=True)
+    
+    # 1. ファイルリストから候補文字列を抽出
     for f in file_list:
         basename = os.path.basename(f).lower()
         if any(ign in basename for ign in ignore_files): continue
+        
         name_part = os.path.splitext(basename)[0]
-        craig_match = re.match(r'^\d+-(.+)', name_part)
-        candidate = craig_match.group(1) if craig_match else name_part
-        if any(ign in candidate for ign in ignore_names): continue
-        if len(candidate) < 2: continue
+        # "1-name", "2_name" などのプレフィクスを除去
+        clean_name = re.sub(r'^\d+[-_]?', '', name_part)
+        
+        if any(ign in clean_name for ign in ignore_names): continue
+        if len(clean_name) < 2: continue
+        
+        potential_candidates.append(clean_name)
 
-        if craig_match: strong_candidates.append(candidate)
-        else: weak_candidates.append(candidate)
+    # 2. アーカイブ自体のファイル名も候補に加える
+    base_archive = os.path.basename(original_archive_name)
+    archive_clean = re.sub(r'\.zip|\.flac|\.mp3|\.wav', '', base_archive, flags=re.IGNORECASE)
+    archive_clean = re.sub(r'\d{4}-\d{2}-\d{2}', '', archive_clean).strip()
+    if len(archive_clean) > 2:
+        potential_candidates.append(archive_clean)
 
-    final = strong_candidates if strong_candidates else weak_candidates
-    if not final:
-        base = os.path.basename(original_archive_name)
-        name_cleaned = re.sub(r'\.zip|\.flac|\.mp3|\.wav', '', base, flags=re.IGNORECASE)
-        name_cleaned = re.sub(r'\d{4}-\d{2}-\d{2}', '', name_cleaned)
-        if len(name_cleaned) > 2: final = [name_cleaned]
+    # 3. データベース（Registry）との厳密な包含チェック
+    # ファイル名文字列(candidate) が DB名(db_name) に含まれているかを確認
+    if STUDENT_REGISTRY:
+        for candidate in potential_candidates:
+            cand_lower = candidate.lower()
+            for db_name in STUDENT_REGISTRY.keys():
+                # Registryキー（例: "キャム kiyamu"）の中に候補（"kiyamu"）が含まれるか
+                if cand_lower in db_name.lower():
+                    print(f"💡 Registry Match Found: File '{candidate}' matches DB '{db_name}'", flush=True)
+                    return db_name
 
-    if final:
-        hint = ", ".join(sorted(list(set(final))))
-        print(f"💡 Found Student Hint: {hint}", flush=True)
-        return hint
+    # 4. マッチしなかった場合、Geminiへのヒントとして候補文字列をそのまま返す（レガシー挙動）
+    if potential_candidates:
+        fallback = potential_candidates[0]
+        print(f"⚠️ No direct registry match. Using raw hint: {fallback}", flush=True)
+        return fallback
+
     return None
 
 # --- 3. Audio Pipeline ---

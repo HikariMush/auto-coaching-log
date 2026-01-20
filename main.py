@@ -278,35 +278,58 @@ def extract_date_smart(filename, drive_created_time_iso):
     return now_jst.strftime('%Y-%m-%d %H:%M:%S'), now_jst.strftime('%Y-%m-%d')
 
 def detect_student_candidate_raw(file_list, original_archive_name):
-    strong_candidates = []
-    weak_candidates = []
+    """
+    ファイル名の一部が、Notionデータベース（STUDENT_REGISTRY）の登録名に含まれているかを厳密にチェックする。
+    例: ファイル名 '2-kiyamu.flac' (clean: kiyamu) -> DB名 'キャム kiyamu' に包含されるためヒット。
+    """
+    global STUDENT_REGISTRY
+    
     ignore_files = ["raw.dat", "info.txt", "ds_store", "thumbs.db", "desktop.ini", "readme", "license"]
-    ignore_names = ["hikari", "craig", "entrymonster", "bot", "ssb"]
+    # hikariはコーチ（User）のため、候補から除外
+    ignore_names = ["hikari", "craig", "entrymonster", "bot", "ssb", "recording"] 
 
-    print("🔎 Scanning internal files for student ID hint...", flush=True)
+    potential_candidates = []
+
+    print("🔎 Scanning internal files for registry match...", flush=True)
+    
+    # 1. ファイルリストから候補文字列を抽出
     for f in file_list:
         basename = os.path.basename(f).lower()
         if any(ign in basename for ign in ignore_files): continue
+        
         name_part = os.path.splitext(basename)[0]
-        craig_match = re.match(r'^\d+-(.+)', name_part)
-        candidate = craig_match.group(1) if craig_match else name_part
-        if any(ign in candidate for ign in ignore_names): continue
-        if len(candidate) < 2: continue
+        # "1-name", "2_name" などのプレフィクスを除去
+        clean_name = re.sub(r'^\d+[-_]?', '', name_part)
+        
+        if any(ign in clean_name for ign in ignore_names): continue
+        if len(clean_name) < 2: continue
+        
+        potential_candidates.append(clean_name)
 
-        if craig_match: strong_candidates.append(candidate)
-        else: weak_candidates.append(candidate)
+    # 2. アーカイブ自体のファイル名も候補に加える
+    base_archive = os.path.basename(original_archive_name)
+    archive_clean = re.sub(r'\.zip|\.flac|\.mp3|\.wav', '', base_archive, flags=re.IGNORECASE)
+    archive_clean = re.sub(r'\d{4}-\d{2}-\d{2}', '', archive_clean).strip()
+    if len(archive_clean) > 2:
+        potential_candidates.append(archive_clean)
 
-    final = strong_candidates if strong_candidates else weak_candidates
-    if not final:
-        base = os.path.basename(original_archive_name)
-        name_cleaned = re.sub(r'\.zip|\.flac|\.mp3|\.wav', '', base, flags=re.IGNORECASE)
-        name_cleaned = re.sub(r'\d{4}-\d{2}-\d{2}', '', name_cleaned)
-        if len(name_cleaned) > 2: final = [name_cleaned]
+    # 3. データベース（Registry）との厳密な包含チェック
+    # ファイル名文字列(candidate) が DB名(db_name) に含まれているかを確認
+    if STUDENT_REGISTRY:
+        for candidate in potential_candidates:
+            cand_lower = candidate.lower()
+            for db_name in STUDENT_REGISTRY.keys():
+                # Registryキー（例: "キャム kiyamu"）の中に候補（"kiyamu"）が含まれるか
+                if cand_lower in db_name.lower():
+                    print(f"💡 Registry Match Found: File '{candidate}' matches DB '{db_name}'", flush=True)
+                    return db_name
 
-    if final:
-        hint = ", ".join(sorted(list(set(final))))
-        print(f"💡 Found Student Hint: {hint}", flush=True)
-        return hint
+    # 4. マッチしなかった場合、Geminiへのヒントとして候補文字列をそのまま返す（レガシー挙動）
+    if potential_candidates:
+        fallback = potential_candidates[0]
+        print(f"⚠️ No direct registry match. Using raw hint: {fallback}", flush=True)
+        return fallback
+
     return None
 
 # --- 3. Audio Pipeline ---
@@ -379,14 +402,24 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     if COMMON_TERMS:
         glossary_instruction = f"\n【重要参照：スマブラ用語集】\n誤字訂正用辞書です。以下の定義に基づき専門用語を補正せよ。\n{COMMON_TERMS}\n"
 
-    # ★ V130.0 PROMPT (Same High-Spec Instructions)
+    # ★ V130.1 PROMPT (High-Fidelity Logic Extraction - FULL)
     prompt = f"""
-    あなたは世界最高峰のスマブラ（Super Smash Bros.）アナリストであり、論理的思考の達人です。
-    提供された会話データから、プレイヤーが直面している課題と解決策を抽出し、以下のフォーマットで出力してください。
+    あなたは論理的な書記官であり、構造化のスペシャリストです。
+    提供された会話データ（指導ログ）から、指導内容を忠実に抽出し、Notion用のレポートを作成してください。
 
     【メタデータ情報】
     {hint_context}
     {glossary_instruction}
+
+    【重要：分析・出力の絶対制約】
+    1. **事実への忠実性 (No Hallucination):**
+       - 会話に含まれていない「褒め言葉」や「感情的表現」をAIが勝手に創作することを厳禁とする。
+       - 会話に含まれていない「最悪の未来（負ける、引退するなど）」を勝手に予測・記述することを厳禁とする。
+       - あくまで「会話の中で実際に指摘された論理」のみを構造化せよ。
+
+    2. **解釈の禁止:**
+       - 曖昧な発言を無理にポジティブ/ネガティブに解釈せず、発言の意図（ロジック）をそのまま記述せよ。
+       - 指導者が「良い」と言った箇所のみを「良い点」とし、「直すべき」と言った箇所のみを「課題」とせよ。
 
     【重要参照：カテゴリ定義】
     レポートの「トピック名」を決定する際は、以下の定義に最も合致するものを選べ。
@@ -418,34 +451,31 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
     * **余白:** 各項目の間には必ず「空行」を入れること。
 
     **【Section 1: 詳細分析レポート】**
-    会話データから主要な改善ポイントを抽出し、各トピックについて以下の**5つの観点**を必ず網羅して記述せよ。省略は許されない。
-    ※メンタルや体調管理の場合も、このフレームワーク（現状→課題→原因→改善→やること）に当てはめて論理的に分解せよ。
+    会話データから主要な改善ポイントを抽出し、各トピックについて以下の3つの観点を必ず網羅して記述せよ。省略は許されない。
 
     ## [カテゴリ名: 具体的な内容] (例: ## 体調管理: 大会前の睡眠リズム)
 
-    ### ① 現状
-    プレイヤーが現在行っている具体的な挙動、癖、認識のズレ。良い点やすでに出来ている点に言及があればそれを列挙したあと、今後の課題につながる点=癖や認識のズレの言及に入る。
+    ### ① 現状の挙動 (Fact)
+    プレイヤーがどのような動きをしていたか、あるいはどのような認識を持っていたか。
+    会話内で言及された事実のみを記述する。
+    ※指導者が肯定的に評価した部分があれば、ここに「評価点」として記載する。（無ければ記載しないこと）
 
-    ### ② 課題
-    その挙動が引き起こすリスク（不利フレーム、撃墜拒否ミス、ライン喪失など）。
+    ### ② 指摘事項 (Logic)
+    その挙動に対して、どのような修正指示や論理的指摘が入ったか。
+    「なぜそれがダメなのか」「どうあるべきか」という指導者のロジックを簡潔にまとめる。
 
-    ### ③ 原因
-    なぜその課題が起きるのか（知識不足、手癖、リスク管理の甘さ、相手の行動確認不足など）。
-
-    ### ④ 改善案
-    具体的な修正アクション（％帯による技選択、視線の配り方、意識配分）。
-
-    ### ⑤ やること
-    即座に実行可能な、短く明確な指示。できている点や良かった点など、継続ポイントがあればそれにも言及。
+    ### ③ 改善アクション (Action)
+    具体的にどう動くべきか、何を意識すべきか。
 
     **【Section 2: 課題セット】**
     課題を箇条書きせよ。省略は許されない。
     フォーマットに関して、技術面(1~10)の場合は、
-    「状況(距離&タイミング&その他情報に言及)」→「アクション(キャラの動き + 脳の動き)」の形。行動が２段階に分かれている場合はそれも記載する
+    「状況(距離&タイミング&その他情報に言及)」→「正解行動(キャラの動き + 脳の動き)」の形。行動が２段階に分かれている場合はそれも記載する。
+
     例:
     着地狩り 急降下回避着地狩り
     状況：相手大ジャンプ1個分上 相手ジャンプなし
-    行動：引きステ(暴れケア) + 暴れ&回避確認 → DA差し返し or 横スマ
+    正解：引きステ(暴れケア) + 暴れ&回避確認 → DA差し返し or 横スマ
 
     プレイヤー面(11~13)の場合は「トリガー(事象)」→「アクション(対処)」とする。
 
@@ -547,7 +577,6 @@ def analyze_text_with_gemini(transcript_text, date_hint, raw_name_hint):
             data = {"student_name": "Unknown", "date": datetime.now().strftime('%Y-%m-%d'), "next_action": "Check Logs"}
             
     return data, report, time_log, mermaid_code
-
 def text_to_notion_blocks(text):
     blocks = []
     lines = text.split('\n')

@@ -1,0 +1,10 @@
+{
+  "timestamp": "2026-01-21T04:46:35.525493",
+  "approvals": {
+    "feature_1": true,
+    "feature_2": true,
+    "feature_3": false,
+    "llm_model": "flash"
+  },
+  "calc_version": "1.0"
+}

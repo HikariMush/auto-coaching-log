@@ -21,6 +21,9 @@ from datetime import datetime
 import dspy
 import google.generativeai as genai
 
+# LLM Model Configuration
+LLM_MODEL = "gemini-2-5-flash"  # Updated to Gemini 2.5 Flash
+
 # Configuration
 DATA_DIR = Path(__file__).parent.parent.parent / 'data'
 TRAINING_DATA_FILE = DATA_DIR / 'training_data.jsonl'

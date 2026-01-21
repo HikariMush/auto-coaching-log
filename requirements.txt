@@ -1,9 +1,21 @@
+# Core Dependencies
 discord.py
-requests
-google-genai
 python-dotenv
-# (以下既存のもの)
+google-genai
+requests
+
+# DSPy Framework
+dspy-ai
+
+# Pinecone Vector DB (Updated name)
+pinecone
+
+# AI/ML Services
 groq
 google-auth
 google-api-python-client
+google-generativeai
+
+# Utilities
 patool
+gitpython

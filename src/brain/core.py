@@ -148,12 +148,53 @@ def search_theory(query):
 
 # --- 4. Brain Module ---
 class SmashBrain(dspy.Module):
+    """
+    === DSPy Reasoning Engine (Legacy Type A) ===
+    
+    STUDENT COMPONENT: Reasoning orchestrator combining Intent Classification + Context Retrieval + Answer Generation
+    
+    This is the legacy Type A architecture (before Type B refactoring in model.py).
+    Maintained for backward compatibility. New code should use SmashCoach (Type B).
+    
+    === Pipeline ===
+    1. IntentClassifier (Reflex LM): Determine info source (frame_data vs theory)
+    2. Search Dispatch: Query SQLite (frame_data) or Pinecone (theory)
+    3. CoachAnswer (Thinking LM): Generate response using ChainOfThought reasoning
+    
+    === Optimization Paths ===
+    - dspy.Teleprompter: Auto-tune IntentClassifier and CoachAnswer prompts
+    - dspy.BootstrapFewShot: Learn from user /teach corrections
+    - Dual-Model Strategy: Reflex for classification (fast), Thinking for generation (quality)
+    """
     def __init__(self):
         super().__init__()
         self.classify = dspy.ChainOfThought(IntentClassifier)
         self.generate = dspy.ChainOfThought(CoachAnswer)
     
     def forward(self, question):
+        """
+        === DSPy Forward Pass ===
+        
+        Orchestrates two-stage reasoning:
+        1. Intent Classification: Determines whether to use frame_data or theory
+        2. Context-Aware Generation: Generates coaching response based on classified intent
+        
+        Args:
+            question: User's coaching query (str)
+        
+        Returns:
+            response.answer: Coaching advice as string
+        
+        === Implementation Details ===
+        - Uses asyncio.to_thread() compatibility (blocking I/O safe in Discord context)
+        - Dynamic model selection: Reflex for fast classification, Thinking for quality generation
+        - Fallback: If search fails, still attempts to generate response from question context
+        
+        === Redefinability ===
+        - LM models: Can be swapped via dspy.context(lm=...)
+        - Retrieval sources: Can be extended to support additional databases
+        - Signatures: IntentClassifier and CoachAnswer prompts are dspy.Signature (tunable)
+        """
         # 1. 意図分類 (Reflex Model: 最強のFlashを使用)
         with dspy.context(lm=reflex_lm):
             classification = self.classify(question=question)

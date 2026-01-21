@@ -414,4 +414,12 @@ async def ask(interaction: discord.Interaction, question: str):
     except Exception as e:
         await interaction.channel.send(f"⚠️ スレッド作成エラー: {e}")
 
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    # ファイルが直接実行された場合のみBotを起動
+    if not DISCORD_TOKEN:
+        print("❌ DISCORD_TOKEN environment variable not set")
+        print("💡 Set it with: export DISCORD_TOKEN='your_token_here'")
+        exit(1)
+    
+    print("🤖 Starting Discord Bot...")
+    bot.run(DISCORD_TOKEN)

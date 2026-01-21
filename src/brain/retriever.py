@@ -17,7 +17,7 @@ Physics/Theory Dependency:
 
 import os
 import dspy
-from google import genai
+import google.generativeai as genai
 from pinecone import Pinecone
 from typing import List, Optional
 

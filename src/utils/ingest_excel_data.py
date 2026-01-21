@@ -10,6 +10,8 @@ Usage:
 import os
 import json
 import sys
+import time
+import argparse
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
@@ -50,7 +52,7 @@ def load_excel_workbook() -> openpyxl.Workbook:
         raise FileNotFoundError(f"Excel file not found: {EXCEL_FILE}")
     
     print(f"📂 Loading Excel file: {EXCEL_FILE.name}")
-    wb = openpyxl.load_workbook(EXCEL_FILE, data_only=False)
+    wb = openpyxl.load_workbook(EXCEL_FILE, data_only=True)  # 数式の結果値を取得
     print(f"✅ Found {len(wb.sheetnames)} character sheets\n")
     
     return wb
@@ -171,10 +173,11 @@ def format_technique_text(character: str, section: str, data: str) -> str:
     return "\n".join(lines)
 
 
-def embed_text(genai_client: Any, text: str) -> Optional[List[float]]:
+def embed_text(genai_client: Any, text: str, delay: float = 0.5) -> Optional[List[float]]:
     """Generate embedding for text using Gemini embedding-001"""
     
     try:
+        time.sleep(delay)  # Rate limit protection
         response = genai_client.embed_content(
             model="models/embedding-001",
             content=text,
@@ -186,47 +189,99 @@ def embed_text(genai_client: Any, text: str) -> Optional[List[float]]:
         return None
 
 
-def save_to_pinecone(pc: Pinecone, character: str, section: str, data: str,
-                     embedding: List[float], batch_id: int) -> bool:
-    """Save technique data to Pinecone"""
+def generate_section_metadata(genai_client: Any, character: str, section_name: str,
+                              entries_preview: str, delay: float = 1.0) -> Dict[str, Any]:
+    """
+    Quick LLM analysis for a single section's techniques
+    Returns structured metadata for DSPy use
+    """
     
     try:
-        # Get or create index
-        index_name = "smash-coaching"
+        time.sleep(delay)  # Rate limit protection
+        prompt = f"""
+キャラクター: {character}
+セクション: {section_name}
+
+技データ:
+{entries_preview}
+
+JSON形式で分析結果を返してください:
+{{
+  "section_type": "弱攻撃/強攻撃など",
+  "common_damage_range": "ダメージ幅",
+  "avg_startup": "平均発生",
+  "general_use": "一般的な用途",
+  "combo_rating": "high/medium/low"
+}}
+
+JSON形式のみ。
+"""
+        
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        response = model.generate_content(prompt, generation_config={"max_output_tokens": 300})
+        
+        json_str = response.text.strip()
+        if json_str.startswith("```"):
+            json_str = json_str.split("```")[1]
+            if json_str.startswith("json"):
+                json_str = json_str[4:]
+            json_str = json_str.strip()
+        
+        return json.loads(json_str)
+    
+    except Exception as e:
+        return {
+            'section_type': section_name,
+            'common_damage_range': '不明',
+            'avg_startup': '不明',
+            'general_use': '技データ',
+            'combo_rating': 'medium'
+        }
+
+
+def save_to_pinecone(pc: Pinecone, character: str, section: str, data: str,
+                     embedding: List[float], batch_id: int,
+                     llm_metadata: Optional[Dict[str, Any]] = None) -> bool:
+    """Save technique data to Pinecone with LLM metadata"""
+    
+    try:
+        index_name = "smash-coach-index"
         try:
             index = pc.Index(index_name)
         except:
-            print(f"📌 Creating Pinecone index: {index_name}")
-            pc.create_index(
-                name=index_name,
-                dimension=768,
-                metric="cosine"
-            )
-            index = pc.Index(index_name)
+            return False
         
-        # Create unique ID
-        char_clean = character.replace(' ', '_').replace('・', '-')
-        section_clean = section.replace(' ', '_')
-        vector_id = f"excel_{char_clean}_{section_clean}_{batch_id}"
+        # Create unique ID (ASCII only for Pinecone)
+        import hashlib
+        char_hash = hashlib.md5(character.encode('utf-8')).hexdigest()[:8]
+        section_hash = hashlib.md5(section.encode('utf-8')).hexdigest()[:8]
+        vector_id = f"excel_{char_hash}_{section_hash}_{batch_id}"
         
-        # Prepare metadata
+        # Base metadata
         metadata = {
             'character': character,
             'section': section,
             'source': 'excel_ingestion',
-            'ingested_at': datetime.now().isoformat(),
-            'data_preview': data[:200],
+            'data_preview': data[:300],
         }
         
-        # Upsert to Pinecone
-        index.upsert(vectors=[
-            (vector_id, embedding, metadata)
-        ])
+        # Add LLM metadata if available
+        if llm_metadata:
+            metadata.update({
+                'attack_type': str(llm_metadata.get('attack_type', section))[:100],
+                'damage': str(llm_metadata.get('damage', '不明'))[:50],
+                'startup': str(llm_metadata.get('startup', '不明'))[:30],
+                'combo_potential': str(llm_metadata.get('combo_potential', 'unknown'))[:20],
+                'role': str(llm_metadata.get('role', '不明'))[:100],
+                'dspy_context': str(llm_metadata.get('dspy_context', ''))[:200],
+            })
         
+        # Upsert
+        index.upsert(vectors=[(vector_id, embedding, metadata)])
         return True
     
     except Exception as e:
-        print(f"⚠️  Failed to save to Pinecone: {e}")
+        print(f"⚠️  Failed to save: {e}")
         return False
 
 
@@ -259,107 +314,101 @@ def ingest_excel_data(genai_client: Any, pc: Pinecone, dry_run: bool = False,
     """Main ingestion workflow"""
     
     print("\n" + "="*70)
-    print("📊 Excel + Text Data Ingestion")
+    print("📊 Excel Data → Pinecone Ingestion")
     print("="*70 + "\n")
     
-    # Load workbook
     wb = load_excel_workbook()
-    
-    # Load raw text data
-    print("📚 Loading raw text data...")
     text_data = load_raw_text_data()
     print(f"✅ Found {len(text_data)} text files\n")
     
-    # Load ingestion state
     state = get_ingestion_state()
-    
-    # Process each character sheet
     ingested_count = 0
     failed_count = 0
     
     for sheet_idx, sheet_name in enumerate(wb.sheetnames[1:], start=1):
         
-        # Skip if already ingested and not resuming
         if sheet_name in state['ingested_sheets'] and not resume:
             continue
         
-        # Extract character name
         match = re.search(r'[0-9０-９]+\.\s*(.+)', sheet_name)
         character_name = match.group(1) if match else sheet_name
         
-        print(f"[{sheet_idx}/{len(wb.sheetnames)-1}] Processing: {character_name}")
+        print(f"[{sheet_idx:3d}/{len(wb.sheetnames)-1}] {character_name}")
         
         try:
-            # Extract sections from Excel
             sheet = wb[sheet_name]
             sections = extract_excel_sections(sheet, character_name)
             
-            # Process each section
+            # Generate metadata for each section
+            section_metadata = {}
+            for section_name, entries in sections.items():
+                if entries:
+                    preview = "\n".join(entries[:5])  # First 5 entries as preview
+                    if not dry_run:
+                        meta = generate_section_metadata(genai_client, character_name, section_name, preview)
+                        section_metadata[section_name] = meta
+                        print(f"    ✅ {section_name}")
+            
+            # Process each entry
             entry_idx = 0
             for section_name, entries in sections.items():
-                if not entries:
-                    continue
-                
-                print(f"  📍 {section_name}: {len(entries)} entries")
-                
                 for entry in entries:
                     if not entry or len(entry) < 5:
                         continue
                     
                     try:
-                        # Format text
                         text = format_technique_text(character_name, section_name, entry)
                         
                         if dry_run:
-                            print(f"    [DRY-RUN] Would embed: {text[:80]}...")
                             ingested_count += 1
                         else:
-                            # Generate embedding
                             embedding = embed_text(genai_client, text)
-                            
                             if not embedding:
                                 failed_count += 1
                                 continue
                             
-                            # Save to Pinecone
-                            success = save_to_pinecone(pc, character_name, section_name,
-                                                     entry, embedding, entry_idx)
+                            llm_meta = section_metadata.get(section_name, {})
+                            success = save_to_pinecone(
+                                pc, character_name, section_name,
+                                entry, embedding, entry_idx, llm_metadata=llm_meta
+                            )
                             
                             if success:
                                 ingested_count += 1
+                                # 進捗表示
+                                if ingested_count % 5 == 0:
+                                    print(f"      📊 進捗: {ingested_count}エントリ完了")
+                                
+                                # 10エントリごとに状態保存
+                                if ingested_count % 10 == 0:
+                                    state['ingested_entries'] = ingested_count
+                                    state['failed_entries'] = failed_count
+                                    save_ingestion_state(state)
+                                    print(f"      💾 状態保存: {ingested_count}エントリ")
                             else:
                                 failed_count += 1
                     
                     except Exception as e:
-                        print(f"    ⚠️  Entry {entry_idx} failed: {e}")
                         failed_count += 1
                     
                     entry_idx += 1
             
-            # Mark sheet as ingested
             state['ingested_sheets'].append(sheet_name)
-            state['ingested_entries'] += ingested_count
-            
-            print(f"  ✅ Complete\n")
+            state['ingested_entries'] = ingested_count
+            state['failed_entries'] = failed_count
+            print(f"    ✅ 完了: {len([e for s in sections.values() for e in s])}エントリ処理")
         
         except Exception as e:
-            print(f"  ❌ Failed: {e}\n")
+            print(f"  ❌ {e}")
             failed_count += 1
     
-    # Save final state
     if not dry_run:
         save_ingestion_state(state)
     
-    # Summary
-    print("="*70)
-    print("📊 Ingestion Summary")
-    print("="*70)
-    print(f"✅ Ingested: {ingested_count} entries")
-    print(f"❌ Failed: {failed_count} entries")
-    print(f"📋 Sheets processed: {len(state['ingested_sheets'])}")
-    if not dry_run:
-        print(f"💾 State saved to: {INGESTION_STATE_FILE}")
-    print()
+    print("\n" + "="*70)
+    print(f"✅ Ingested: {ingested_count} | ❌ Failed: {failed_count}")
+    print(f"📋 Sheets: {len(state['ingested_sheets'])}")
+    print("="*70 + "\n")
 
 
 def main():

@@ -61,8 +61,8 @@ class PineconeRetriever(dspy.Retrieve):
     def __init__(
         self,
         index_name: str = "smash-zettel",
-        top_k: int = 5,
-        similarity_threshold: float = 0.5,
+        top_k: int = 15,  # 5 → 15（網羅性向上）
+        similarity_threshold: float = 0.35,  # 0.5 → 0.35（より幅広い関連情報）
     ):
         """
         Initialize the PineconeRetriever.

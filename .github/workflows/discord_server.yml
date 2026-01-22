@@ -1,9 +1,10 @@
-name: Run Discord Bot
+name: Run Discord Bot (DISABLED)
 
+# DISABLED: Bot should run locally or in dedicated server, not in GitHub Actions
 on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch: # 手動実行ボタンも有効化
+  # push:
+  #   branches: [ "main" ]
+  workflow_dispatch: # 手動実行ボタンのみ有効化
 
 jobs:
   run-bot:

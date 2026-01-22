@@ -144,10 +144,15 @@ class FrameDataAnswer(dspy.Signature):
     
     ハルシネーション（データの捏造）は厳禁です。
     提供されたデータのみを使用し、存在しない情報を創作しないでください。
+    
+    **スレッド文脈の保持**：
+    historyに過去の会話がある場合、それを考慮して回答してください。
+    ただし、数値データはframe_dataに記載されたものだけを使用すること。
     """
     frame_data = dspy.InputField(desc="SQLiteから取得した正確なフレームデータ。この数値を絶対に改変しないこと。")
+    history = dspy.InputField(desc="これまでの会話履歴（同じスレッド内の場合）")
     question = dspy.InputField(desc="ユーザーの質問")
-    answer = dspy.OutputField(desc="frame_dataの数値をそのまま使った正確な回答。数値の改変・推測・概算は絶対禁止。")
+    answer = dspy.OutputField(desc="frame_dataの数値をそのまま使った正確な回答。historyを考慮するが、数値の改変・推測・概算は絶対禁止。")
 
 class CoachAnswer(dspy.Signature):
     """
@@ -541,7 +546,8 @@ class SmashBrain(dspy.Module):
         # フレームデータの場合は専用のSignatureを使用（ハルシネーション防止）
         if is_frame_data_query and "===正確なフレームデータ===" in context:
             print("🛡️ Using FrameDataAnswer signature (hallucination prevention)")
-            response = self.frame_answer(frame_data=context, question=question)
+            # スレッド文脈を保持したままフレームデータを正確に回答
+            response = self.frame_answer(frame_data=context, history=history, question=question)
         else:
             # 通常の回答生成
             response = self.generate(context=context, history=history, question=question)

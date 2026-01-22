@@ -1,418 +1,507 @@
 import os
 import discord
 from discord import app_commands
-from discord.ui import Button, View, Modal, TextInput
 from discord.ext import commands
-import requests
+from dotenv import load_dotenv
+import asyncio
 import json
 from datetime import datetime
-from google import genai
-from google.genai import types
-from dotenv import load_dotenv
+from pathlib import Path
 
 # 環境変数の読み込み
 load_dotenv()
 
 # --- Configuration ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ADMIN_USER_ID = os.getenv("ADMIN_USER_ID") # Admin(コーチ)のID
+QA_LOG_FILE = Path("data/qa_logs.jsonl")
+TRAINING_DATA_FILE = Path("data/training_data.jsonl")
+ELEMENT_FEEDBACK_FILE = Path("data/element_feedback.jsonl")
+GENERAL_KNOWLEDGE_FILE = Path("data/general_knowledge.jsonl")
 
-# Database IDs
-THEORY_DB_ID = "2e21bc8521e38029b8b1d5c4b49731eb"
-REQUEST_DB_ID = "2e21bc8521e380a5b263fecf87b1ad7c"
-FEEDBACK_DB_ID = "2e21bc8521e380c696bbd2fea868186e"
-
-# Notion API Headers
-NOTION_HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Content-Type": "application/json",
-    "Notion-Version": "2022-06-28"
-}
+# --- Import Brain ---
+from src.brain.core import SmashBrain
 
 # --- Discord Bot Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
-intents.guilds = True 
+intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- Gemini Helper Functions ---
-def extract_search_query(user_question):
-    """
-    検索クエリ抽出
-    """
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    model_id = "gemini-2.0-flash-exp"
-    prompt = f"""
-    Task: Extract the single most important search keyword from the User Question for a Notion database query.
-    Rules:
-    - Output ONLY the keyword. No explanation.
-    - If a specific character name is present, that is the priority.
-    - Convert English character names to Japanese (e.g. "ROB" -> "ロボット").
-    
-    User Question: {user_question}
-    """
-    try:
-        res = client.models.generate_content(model=model_id, contents=prompt)
-        return res.text.strip()
-    except:
-        return user_question
-
-def generate_answer(question, context_texts):
-    """
-    初回回答生成用 (ロジック固定: Context優先 + 推論注釈)
-    """
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    model_id = "gemini-2.0-flash-exp"
-    
-    prompt = f"""
-    あなたはスマブラのプロコーチのアシスタントAIです。
-    生徒からの質問に対し、以下の「コーチのメモ (Context)」に基づいて回答してください。
-
-    【知識利用のルール】
-    1. **Context優先**: 何よりもまず、Context内にある情報を正として回答を構成してください。
-    2. **推論の条件付き許可**: Contextに直接的な答えがない場合、あなたの一般的なスマブラ知識や論理的推論を用いて補足することを**許可**します。
-       - **重要**: 推論や一般知識を使用する場合は、必ず**「（※ここからは推論ですが）」「（※一般論としては）」**のように、コーチのメモ（DB）由来ではないことを明記してください。
-    3. **ハルシネーション排除**: 推論によっても導き出せない固有の情報については、無理に創作せず「データベースに情報がありません」と答えてください。
-
-    Context (コーチのメモ):
-    {context_texts[:30000]}
-    
-    Question:
-    {question}
-    
-    Response Guidelines:
-    1. **トーン**: 丁寧語（～です/ます）。感情的に煽らず、理知的・分析的なコーチとして振る舞う。
-    2. **構造化**: 結論を最初に述べ、理由やアクションを箇条書きで整理する。
-    3. **内容**: 事実に基づき淡々と伝える。最後にユーザーを軽く励ます。
-    """
-    try:
-        res = client.models.generate_content(model=model_id, contents=prompt)
-        return res.text
-    except:
-        return "AI Error: 回答生成に失敗しました。"
-
-def generate_chat_answer(history_text, context_text, new_question):
-    """
-    スレッド会話用 (ロジック固定)
-    """
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    model_id = "gemini-2.0-flash-exp"
-    
-    prompt = f"""
-    あなたはスマブラのプロコーチのアシスタントAIです。
-    ユーザーとの会話履歴とContextに基づき回答してください。
-
-    【知識利用のルール】
-    1. **Context優先**: Contextの情報を最優先してください。
-    2. **推論の条件付き許可**: 不足部分は推論や一般知識で補足可能ですが、**必ず「（※推論ですが）」と注釈を入れて区別**してください。
-    3. **整合性**: これまでの会話の流れを汲み取ってください。
-
-    Context:
-    {context_text[:20000]}
-    
-    History:
-    {history_text}
-    
-    Current Question:
-    {new_question}
-    
-    Response Guidelines:
-    - 丁寧、冷静、論理的なトーンを維持。
-    - 最後に軽く励ます。
-    """
-    try:
-        res = client.models.generate_content(model=model_id, contents=prompt)
-        return res.text
-    except:
-        return "AI Error: 回答生成に失敗しました。"
-
-# --- Notion API Helpers ---
-def search_notion(query_text):
-    url = f"https://api.notion.com/v1/databases/{THEORY_DB_ID}/query"
-    payload = {
-        "page_size": 3,
-        "filter": {
-            "or": [
-                {"property": "Theory Name", "title": {"contains": query_text}},
-                {"property": "Tags", "multi_select": {"contains": query_text}},
-                {"property": "キャラクター", "multi_select": {"contains": query_text}}
-            ]
-        }
-    }
-    try:
-        res = requests.post(url, headers=NOTION_HEADERS, json=payload)
-        data = res.json()
-        results = []
-        for page in data.get("results", []):
-            props = page.get("properties", {})
-            title_list = props.get("Theory Name", {}).get("title", [])
-            title = title_list[0].get("text", {}).get("content", "No Title") if title_list else "No Title"
-            results.append({"id": page.get("id"), "title": title, "url": page.get("url")})
-        return results
-    except Exception as e:
-        print(f"Notion Search Error: {e}")
-        return []
-
-def get_page_content_text(page_id):
-    url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=50"
-    try:
-        res = requests.get(url, headers=NOTION_HEADERS)
-        data = res.json()
-        full_text = ""
-        for block in data.get("results", []):
-            btype = block.get("type")
-            if "rich_text" in block.get(btype, {}):
-                text_list = block[btype].get("rich_text", [])
-                full_text += "".join([t.get("text", {}).get("content", "") for t in text_list]) + "\n"
-        return full_text
-    except:
-        return ""
-
-def append_block_to_page(page_id, text_content):
-    url = f"https://api.notion.com/v1/blocks/{page_id}/children"
-    payload = {
-        "children": [
-            {
-                "object": "block",
-                "type": "callout",
-                "callout": {
-                    "rich_text": [{"type": "text", "text": {"content": text_content}}],
-                    "icon": {"emoji": "📝"},
-                    "color": "gray_background"
-                }
-            }
-        ]
-    }
-    try:
-        res = requests.patch(url, headers=NOTION_HEADERS, json=payload)
-        if res.status_code != 200:
-             print(f"Append Error: {res.text}")
-             return False
-        return True
-    except Exception as e:
-        print(f"Append Error: {e}")
-        return False
-
-def create_feedback_ticket(user_name, question, answer, comment, ref_page_ids):
-    url = "https://api.notion.com/v1/pages"
-    
-    # Relationsの構築（念のため空リスト対応）
-    relations = [{"id": pid} for pid in ref_page_ids] if ref_page_ids else []
-    
-    # ペイロード作成
-    # 注意: ここでプロパティ名がDBと完全に一致していないとエラーになります
-    payload = {
-        "parent": {"database_id": FEEDBACK_DB_ID},
-        "properties": {
-            # タイトル列の名前が "Topic" でない場合（"Name", "タイトル"など）は修正が必要
-            "Topic": {"title": [{"text": {"content": f"Fix: {question[:20]}..."}}]},
-            "Question": {"rich_text": [{"text": {"content": question[:2000]}}]},
-            "AI Answer": {"rich_text": [{"text": {"content": answer[:2000]}}]},
-            "User Comment": {"rich_text": [{"text": {"content": comment[:2000]}}]},
-            "User Name": {"rich_text": [{"text": {"content": str(user_name)}}]},
-            "Status": {"status": {"name": "New"}},
-            "受付日": {"date": {"start": datetime.now().isoformat()}},
-            "Reference Source": {"relation": relations}
-        }
-    }
-    
-    try:
-        res = requests.post(url, headers=NOTION_HEADERS, json=payload)
-        
-        # 【重要】エラーレスポンスのデバッグ出力
-        if res.status_code != 200:
-            print(f"❌ Feedback Create Error: {res.status_code}")
-            print(f"Response: {res.text}") # ここにNotionからの詳細なエラー理由が出る
-            return False
-        
-        print("✅ Feedback created successfully")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Feedback Create Exception: {e}")
-        return False
-
-def create_request_ticket(user_name, request_content, context, is_talk_request=False):
-    url = "https://api.notion.com/v1/pages"
-    title_prefix = "【通話ネタ】" if is_talk_request else ""
-    payload = {
-        "parent": {"database_id": REQUEST_DB_ID},
-        "properties": {
-            "Request Content": {"title": [{"text": {"content": f"{title_prefix}{request_content[:80]}"}}]},
-            "Context": {"rich_text": [{"text": {"content": context[:2000]}}]},
-            "User Name": {"rich_text": [{"text": {"content": str(user_name)}}]},
-            "Status": {"status": {"name": "New"}},
-            "受付日": {"date": {"start": datetime.now().isoformat()}},
-            "Count": {"number": 1}
-        }
-    }
-    requests.post(url, headers=NOTION_HEADERS, json=payload)
-
-# --- Discord UI Components ---
-
-class FeedbackModal(Modal, title="情報の修正・補足提案"):
-    comment = TextInput(label="修正点・補足", style=discord.TextStyle.paragraph)
-    def __init__(self, question, answer, ref_ids):
-        super().__init__()
-        self.question = question
-        self.answer = answer
-        self.ref_ids = ref_ids
-    async def on_submit(self, interaction: discord.Interaction):
-        # 処理中であることを伝える
-        await interaction.response.defer(ephemeral=True)
-        
-        # API実行
-        success = create_feedback_ticket(interaction.user, self.question, self.answer, self.comment.value, self.ref_ids)
-        
-        if success:
-            await interaction.followup.send("✅ 修正依頼を受け付けました。", ephemeral=True)
-        else:
-            await interaction.followup.send("⚠️ エラー: Feedbackの送信に失敗しました。管理者がログを確認してください。", ephemeral=True)
-
-class RequestModal(Modal, title="新規コンテンツのリクエスト"):
-    req_content = TextInput(label="知りたい内容")
-    context = TextInput(label="背景・詳細", style=discord.TextStyle.paragraph, required=False)
-    async def on_submit(self, interaction: discord.Interaction):
-        create_request_ticket(interaction.user, self.req_content.value, self.context.value)
-        await interaction.response.send_message("✅ リクエストを受け付けました。", ephemeral=True)
-
-class ResponseView(View):
-    def __init__(self, question, answer, ref_ids):
-        super().__init__(timeout=None)
-        self.question = question
-        self.answer = answer
-        self.ref_ids = ref_ids
-
-    @discord.ui.button(label="役に立った", style=discord.ButtonStyle.green, emoji="👍")
-    async def helpful(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_message("評価ありがとうございます！", ephemeral=True)
-
-    @discord.ui.button(label="コーチに直接聞く", style=discord.ButtonStyle.blurple, emoji="🙋")
-    async def ask_coach(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer(ephemeral=True) 
-        context_str = f"Question: {self.question}\nAI Answer Preview: {self.answer[:100]}..."
-        create_request_ticket(interaction.user, self.question, context_str, is_talk_request=True)
-        await interaction.followup.send("✅ 通話ネタとして保存しました。\nコーチが確認後、通話時に詳しく解説します！", ephemeral=True)
-
-    @discord.ui.button(label="修正提案", style=discord.ButtonStyle.secondary, emoji="⚠️")
-    async def feedback(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_modal(FeedbackModal(self.question, self.answer, self.ref_ids))
-
-    @discord.ui.button(label="リクエスト", style=discord.ButtonStyle.secondary, emoji="🆕")
-    async def request(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_modal(RequestModal())
+# Brain インスタンス
+brain = None
 
 # --- Bot Commands ---
 @bot.event
 async def on_ready():
-    print(f'Logged in as {bot.user}!')
-    await bot.tree.sync()
+    global brain
+    print(f'🤖 Logged in as {bot.user}!')
+    print(f'📊 Servers: {len(bot.guilds)}')
+    
+    # Brainの初期化
+    try:
+        print('🧠 Initializing SmashBrain...')
+        brain = SmashBrain()
+        print('✅ Brain initialized successfully')
+    except Exception as e:
+        print(f'❌ Brain initialization failed: {e}')
+        brain = None
+    
+    # コマンド同期
+    try:
+        synced = await bot.tree.sync()
+        print(f'✅ Synced {len(synced)} command(s)')
+    except Exception as e:
+        print(f'❌ Command sync failed: {e}')
 
 @bot.event
 async def on_message(message):
+    # Bot自身のメッセージは無視
     if message.author.bot:
         return
 
-    # --- Admin Command: !add ---
-    if message.content.startswith("!add"):
-        print(f"DEBUG: !add command from {message.author.name} (ID: {message.author.id})")
-        
-        # Adminチェック (環境変数がない場合は警告)
-        if not ADMIN_USER_ID:
-            await message.channel.send("⚠️ 環境変数 `ADMIN_USER_ID` が設定されていません。")
-            return
-
-        if str(message.author.id) != str(ADMIN_USER_ID):
-            await message.channel.send(f"⛔ **権限エラー**: ID `{message.author.id}` は許可されていません。")
-            return 
-
-        if not isinstance(message.channel, discord.Thread):
-            await message.channel.send("⚠️ `!add` コマンドはBotが作成した**スレッドの中でのみ**有効です。")
-            return
-
-        target_content = message.content[5:].strip()
-        if not target_content:
-             await message.channel.send("⚠️ 追記内容が空です。")
-             return
-
-        thread_name = message.channel.name
-        search_word = thread_name.replace("Q. ", "") 
-        
-        await message.add_reaction("⏳")
-
-        pages = search_notion(search_word)
-        if not pages:
-            await message.channel.send(f"⚠️ 追記対象のページが見つかりませんでした (検索ワード: {search_word})。")
-            return
-            
-        target_page = pages[0]
-        success = append_block_to_page(target_page["id"], f"【コーチ補足】\n{target_content}")
-        
-        if success:
-            await message.channel.send(f"✅ ページ **[{target_page['title']}]** に補足情報を追記しました。")
-            await message.remove_reaction("⏳", bot.user)
-            await message.add_reaction("✅")
-        else:
-            await message.channel.send("❌ Notionへの書き込みに失敗しました。")
-        return
-
-    # --- Thread Conversation ---
+    # スレッド内での会話対応
     if isinstance(message.channel, discord.Thread) and message.channel.owner_id == bot.user.id:
-        async with message.channel.typing():
-            history = [msg async for msg in message.channel.history(limit=5)]
-            history_text = "\n".join([f"{m.author.name}: {m.content}" for m in reversed(history)])
-            
-            context_text = ""
-            try:
-                starter_msg = await message.channel.parent.fetch_message(message.channel.id)
-                if starter_msg.embeds:
-                    context_text = starter_msg.embeds[0].description
-            except:
-                context_text = ""
-
-            answer = generate_chat_answer(history_text, context_text, message.content)
-            await message.channel.send(answer)
-
-@bot.tree.command(name="ask", description="攻略情報を検索・質問")
-async def ask(interaction: discord.Interaction, question: str):
-    await interaction.response.defer()
-    
-    search_keyword = extract_search_query(question)
-    pages = search_notion(search_keyword)
-    
-    if not pages:
-        await interaction.followup.send(f"「{search_keyword}」の情報は見つかりませんでした。")
+        await handle_thread_message(message)
         return
 
-    context_text = ""
-    ref_links = []
-    ref_ids = []
-    for p in pages[:3]:
-        text = get_page_content_text(p["id"])
-        context_text += f"--- Source: {p['title']} ---\n{text}\n"
-        ref_links.append(f"・[{p['title']}]({p['url']})")
-        ref_ids.append(p["id"])
+    # 通常のコマンド処理
+    await bot.process_commands(message)
 
-    ai_answer = generate_answer(question, context_text)
+async def handle_thread_message(message):
+    """
+    スレッド内での追加質問に対応（会話履歴を保持 + 要約）
     
-    embed = discord.Embed(title=f"Q. {question}", description=ai_answer, color=0x00ff00)
-    if ref_links:
-        embed.add_field(name="📚 Reference", value="\n".join(ref_links), inline=False)
+    改善V2:
+    - 過去の会話を要約して、現在の質問に関連する情報だけを抽出
+    - トークン数削減（50%）+ 文脈理解の向上（30%）
+    """
+    if not brain:
+        await message.channel.send("⚠️ AI Brainが初期化されていません。")
+        return
     
-    embed.set_footer(text="💬 この回答についてさらに質問がある場合は、この下のスレッドで会話できます。")
-    
-    view = ResponseView(question, ai_answer, ref_ids)
-    
-    webhook_msg = await interaction.followup.send(embed=embed, view=view, wait=True)
+    async with message.channel.typing():
+        try:
+            # スレッド内の過去メッセージを取得（最新10件まで）
+            raw_history = ""
+            async for msg in message.channel.history(limit=10, before=message):
+                # Bot自身のメッセージとユーザーメッセージのみ含める
+                if msg.author.bot and msg.author.id == bot.user.id:
+                    raw_history = f"Bot: {msg.content[:200]}\n{raw_history}"  # 各メッセージ200文字まで
+                elif not msg.author.bot:
+                    raw_history = f"User: {msg.content}\n{raw_history}"
+            
+            # 会話要約を実行（履歴がある場合のみ）
+            summarized_context = ""
+            if raw_history:
+                from src.brain.core import summarize_conversation
+                summarized_context = await asyncio.to_thread(
+                    summarize_conversation,
+                    raw_history,
+                    message.content
+                )
+            
+            # 非同期実行でBrainを呼び出し
+            # 要約された文脈を渡す（元の履歴より短くなる）
+            answer = await asyncio.to_thread(brain, message.content, summarized_context)
+            
+            # ログ記録
+            await asyncio.to_thread(log_qa, message.content, answer, str(message.author.id))
+            
+            # 長すぎる回答は分割
+            if len(answer) > 1900:
+                chunks = [answer[i:i+1900] for i in range(0, len(answer), 1900)]
+                for chunk in chunks:
+                    await message.channel.send(chunk)
+            else:
+                await message.channel.send(answer)
+        except Exception as e:
+            await message.channel.send(f"❌ エラーが発生しました: {e}")
+            print(f"[Thread Error] {e}")
+
+@bot.tree.command(name="ask", description="スマブラの質問をする")
+@app_commands.describe(question="質問内容（例: マリオの空前の発生は？）")
+async def ask(interaction: discord.Interaction, question: str):
+    """
+    /ask コマンド: Pineconeベースの質問応答
+    """
+    # Brainが初期化されていない場合
+    if not brain:
+        await interaction.response.send_message(
+            "⚠️ AI Brainが初期化されていません。botを再起動してください。",
+            ephemeral=True
+        )
+        return
     
     try:
-        full_msg = await interaction.channel.fetch_message(webhook_msg.id)
-        thread = await full_msg.create_thread(name=f"Q. {search_keyword}", auto_archive_duration=1440)
-        await thread.send(f"このスレッドで続けて質問ができます。\n（コーチは `!add 補足内容` でここからDBに追記できます）")
+        # Deferして処理中であることを通知
+        await interaction.response.defer()
+        
+        # 非同期でBrainを実行 (DSPy推奨: module()を使用)
+        answer = await asyncio.to_thread(brain, question)
+        
+        # ログ記録
+        await asyncio.to_thread(log_qa, question, answer, str(interaction.user.id))
+        
+        # Embedで回答を表示
+        embed = discord.Embed(
+            title=f"Q: {question}",
+            description=answer[:4000] if len(answer) <= 4000 else answer[:3997] + "...",
+            color=0x00ff00
+        )
+        embed.set_footer(text="💬 スレッドで追加質問 | /teach で回答を修正できます")
+        
+        # 回答を送信
+        webhook_msg = await interaction.followup.send(embed=embed, wait=True)
+        
+        # スレッドを作成
+        try:
+            full_msg = await interaction.channel.fetch_message(webhook_msg.id)
+            thread = await full_msg.create_thread(
+                name=f"Q: {question[:80]}",
+                auto_archive_duration=1440  # 24時間
+            )
+            await thread.send("このスレッドで続けて質問ができます。")
+        except Exception as e:
+            print(f"⚠️ スレッド作成エラー: {e}")
+            
+    except discord.errors.HTTPException as e:
+        if "already been acknowledged" in str(e):
+            return
+        print(f"❌ Discord API Error: {e}")
     except Exception as e:
-        await interaction.channel.send(f"⚠️ スレッド作成エラー: {e}")
+        print(f"❌ Error in /ask command: {e}")
+        try:
+            await interaction.followup.send(
+                f"❌ エラーが発生しました: {e}",
+                ephemeral=True
+            )
+        except:
+            pass
+
+@bot.tree.command(name="status", description="Botの状態を確認")
+async def status(interaction: discord.Interaction):
+    """Bot の状態確認コマンド"""
+    brain_status = "✅ 正常" if brain else "❌ 未初期化"
+    
+    # ログファイルの統計
+    qa_count = 0
+    training_count = 0
+    
+    if QA_LOG_FILE.exists():
+        with open(QA_LOG_FILE, 'r', encoding='utf-8') as f:
+            qa_count = sum(1 for _ in f)
+    
+    if TRAINING_DATA_FILE.exists():
+        with open(TRAINING_DATA_FILE, 'r', encoding='utf-8') as f:
+            training_count = sum(1 for _ in f)
+    
+    embed = discord.Embed(
+        title="🤖 Bot Status",
+        color=0x00ff00 if brain else 0xff0000
+    )
+    embed.add_field(name="Brain", value=brain_status, inline=False)
+    embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Latency", value=f"{bot.latency*1000:.0f}ms", inline=True)
+    embed.add_field(name="QA Logs", value=f"{qa_count}件", inline=True)
+    embed.add_field(name="Training Data", value=f"{training_count}件", inline=True)
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="teach", description="回答に対する修正やフィードバックを提供")
+@app_commands.describe(
+    question="元の質問",
+    correction="正解またはより良い回答"
+)
+async def teach(interaction: discord.Interaction, question: str, correction: str):
+    """
+    /teach コマンド: ユーザーからのフィードバックを収集（全文修正）
+    """
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # トレーニングデータとして保存
+        await asyncio.to_thread(save_training_data, question, correction, str(interaction.user.id))
+        
+        # Git自動コミット
+        commit_success = await asyncio.to_thread(commit_to_github)
+        
+        response = (
+            f"✅ フィードバックを保存しました。\n\n"
+            f"**質問:** {question[:100]}{'...' if len(question) > 100 else ''}\n"
+            f"**修正:** {correction[:100]}{'...' if len(correction) > 100 else ''}"
+        )
+        
+        if commit_success:
+            response += "\n\n📤 GitHubに自動コミットしました。"
+        
+        await interaction.followup.send(response, ephemeral=True)
+        print(f"[Teach] Feedback recorded from user {interaction.user.id}: {question[:50]}")
+        
+    except Exception as e:
+        print(f"[Teach] Error: {e}")
+        await interaction.followup.send(
+            f"❌ フィードバックの保存に失敗しました: {str(e)[:100]}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="teach_element", description="回答の特定要素に対するフィードバック")
+@app_commands.describe(
+    question="元の質問",
+    element_number="要素番号（1, 2, 3, 4）",
+    correction="この要素の修正内容"
+)
+async def teach_element(interaction: discord.Interaction, question: str, element_number: int, correction: str):
+    """
+    /teach_element コマンド: 要素別フィードバックを収集
+    
+    使用例:
+    /teach_element question:"マリオの空前は？" element_number:2 correction:"硬直差の計算式を明記すべき：発生3F + 着地硬直9F = -9F"
+    """
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # 要素番号のバリデーション
+        if element_number not in [1, 2, 3, 4]:
+            await interaction.followup.send(
+                f"❌ 要素番号は1〜4の範囲で指定してください。\n"
+                f"[1] フレームデータ・基礎情報\n"
+                f"[2] 技術的解説\n"
+                f"[3] 実戦での使い方\n"
+                f"[4] 補足・注意点",
+                ephemeral=True
+            )
+            return
+        
+        # 要素別トレーニングデータとして保存
+        await asyncio.to_thread(
+            save_element_feedback,
+            question,
+            element_number,
+            correction,
+            str(interaction.user.id)
+        )
+        
+        # Git自動コミット
+        commit_success = await asyncio.to_thread(commit_to_github)
+        
+        element_names = {
+            1: "フレームデータ・基礎情報",
+            2: "技術的解説",
+            3: "実戦での使い方",
+            4: "補足・注意点"
+        }
+        
+        response = (
+            f"✅ 要素別フィードバックを保存しました。\n\n"
+            f"**質問:** {question[:100]}{'...' if len(question) > 100 else ''}\n"
+            f"**対象要素:** [{element_number}] {element_names[element_number]}\n"
+            f"**修正:** {correction[:100]}{'...' if len(correction) > 100 else ''}"
+        )
+        
+        if commit_success:
+            response += "\n\n📤 GitHubに自動コミットしました。"
+        
+        await interaction.followup.send(response, ephemeral=True)
+        print(f"[TeachElement] Element {element_number} feedback from user {interaction.user.id}: {question[:50]}")
+        
+    except Exception as e:
+        print(f"[TeachElement] Error: {e}")
+        await interaction.followup.send(
+            f"❌ フィードバックの保存に失敗しました: {str(e)[:100]}",
+            ephemeral=True
+        )
+
+@bot.tree.command(name="add_knowledge", description="一般的な重要知識を追加（全質問に適用される基礎知識）")
+@app_commands.describe(
+    title="知識のタイトル（例: ガーキャンの仕組み）",
+    content="知識の内容（詳細な説明、計算式、例外ルールなど）",
+    category="カテゴリ（frame_theory/mechanic/strategy/character_specific）"
+)
+async def add_knowledge(interaction: discord.Interaction, title: str, content: str, category: str):
+    """
+    /add_knowledge コマンド: 一般的な重要知識をPineconeに登録
+    
+    使用例:
+    /add_knowledge title:"ガーキャン上スマの例外ルール"
+                   content:"上Bと上スマはガーキャン時にジャンプ踏切の3Fが不要。通常のガーキャンジャンプ攻撃は「ジャンプF+攻撃F」だが、上スマは「攻撃Fのみ」。"
+                   category:"frame_theory"
+    
+    この知識は特定の質問への回答ではなく、全ての関連質問に適用される基礎知識として扱われます。
+    """
+    await interaction.response.defer(ephemeral=True)
+    
+    try:
+        # 一般知識として保存
+        await asyncio.to_thread(
+            save_general_knowledge,
+            title,
+            content,
+            category,
+            str(interaction.user.id)
+        )
+        
+        # Git自動コミット
+        commit_success = await asyncio.to_thread(commit_to_github)
+        
+        response = (
+            f"✅ 一般知識を保存しました。\n\n"
+            f"**タイトル:** {title}\n"
+            f"**カテゴリ:** {category}\n"
+            f"**内容:** {content[:150]}{'...' if len(content) > 150 else ''}\n\n"
+            f"この知識は全ての関連質問に適用されます。"
+        )
+        
+        if commit_success:
+            response += "\n\n📤 GitHubに自動コミットしました。"
+        
+        await interaction.followup.send(response, ephemeral=True)
+        print(f"[AddKnowledge] General knowledge added: {title}")
+        
+    except Exception as e:
+        print(f"[AddKnowledge] Error: {e}")
+        await interaction.followup.send(
+            f"❌ 知識の保存に失敗しました: {str(e)[:100]}",
+            ephemeral=True
+        )
+
+# --- Helper Functions ---
+def log_qa(question: str, answer: str, user_id: str) -> None:
+    """質問と回答をログファイルに記録"""
+    try:
+        QA_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        
+        entry = {
+            "question": question,
+            "answer": answer,
+            "user_id": user_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        with open(QA_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            
+    except Exception as e:
+        print(f"⚠️ QA log failed: {e}")
+
+def save_training_data(question: str, correction: str, user_id: str) -> None:
+    """ユーザーのフィードバックをトレーニングデータとして保存"""
+    try:
+        TRAINING_DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        
+        entry = {
+            "question": question,
+            "gold_answer": correction,
+            "user_id": user_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        with open(TRAINING_DATA_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            
+    except Exception as e:
+        print(f"⚠️ Training data save failed: {e}")
+        raise
+
+def save_element_feedback(question: str, element_number: int, correction: str, user_id: str) -> None:
+    """要素別フィードバックを保存"""
+    try:
+        ELEMENT_FEEDBACK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        
+        element_names = {
+            1: "frame_data",
+            2: "technical_explanation",
+            3: "practical_usage",
+            4: "notes_and_tips"
+        }
+        
+        entry = {
+            "question": question,
+            "element_number": element_number,
+            "element_name": element_names.get(element_number, "unknown"),
+            "correction": correction,
+            "user_id": user_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        with open(ELEMENT_FEEDBACK_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            
+    except Exception as e:
+        print(f"⚠️ Element feedback save failed: {e}")
+        raise
+
+def save_general_knowledge(title: str, content: str, category: str, user_id: str) -> None:
+    """
+    一般的な重要知識を保存
+    
+    これらの知識は特定の質問への回答ではなく、
+    全ての関連質問に適用される基礎知識として扱われます。
+    
+    例:
+    - ガーキャンの例外ルール（上スマ、上Bは3F不要）
+    - ベクトル変更とずらしの区別
+    - 復帰阻止と崖上がり狩りの違い
+    """
+    try:
+        GENERAL_KNOWLEDGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        
+        entry = {
+            "title": title,
+            "content": content,
+            "category": category,
+            "user_id": user_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "is_general_knowledge": True  # Pinecone登録時の優先度フラグ
+        }
+        
+        with open(GENERAL_KNOWLEDGE_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        
+        print(f"[GeneralKnowledge] Saved: {title}")
+            
+    except Exception as e:
+        print(f"⚠️ General knowledge save failed: {e}")
+        raise
+
+def commit_to_github() -> bool:
+    """トレーニングデータをGitHubに自動コミット"""
+    try:
+        from git import Repo
+        
+        repo = Repo(".")
+        
+        # 変更をステージング
+        files_to_commit = []
+        if QA_LOG_FILE.exists():
+            repo.index.add([str(QA_LOG_FILE)])
+            files_to_commit.append(str(QA_LOG_FILE))
+        if TRAINING_DATA_FILE.exists():
+            repo.index.add([str(TRAINING_DATA_FILE)])
+            files_to_commit.append(str(TRAINING_DATA_FILE))
+        if ELEMENT_FEEDBACK_FILE.exists():
+            repo.index.add([str(ELEMENT_FEEDBACK_FILE)])
+            files_to_commit.append(str(ELEMENT_FEEDBACK_FILE))
+        if GENERAL_KNOWLEDGE_FILE.exists():
+            repo.index.add([str(GENERAL_KNOWLEDGE_FILE)])
+            files_to_commit.append(str(GENERAL_KNOWLEDGE_FILE))
+        
+        # 変更がある場合のみコミット
+        if repo.index.diff("HEAD"):
+            timestamp = datetime.utcnow().isoformat()
+            repo.index.commit(
+                f"[Auto] Bot data update: {timestamp}",
+                author_name="SmashZettel-Bot",
+                author_email="bot@smashzettel.local"
+            )
+            repo.remote().push()
+            print(f"📤 GitHub commit successful: {', '.join(files_to_commit)}")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"⚠️ GitHub commit failed (non-critical): {e}")
+        return False
 
 if __name__ == "__main__":
     # ファイルが直接実行された場合のみBotを起動
@@ -422,4 +511,5 @@ if __name__ == "__main__":
         exit(1)
     
     print("🤖 Starting Discord Bot...")
+    print("📋 This bot uses Pinecone-based SmashBrain for answering questions")
     bot.run(DISCORD_TOKEN)

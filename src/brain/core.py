@@ -154,6 +154,25 @@ class FrameDataAnswer(dspy.Signature):
     question = dspy.InputField(desc="ユーザーの質問")
     answer = dspy.OutputField(desc="frame_dataの数値をそのまま使った正確な回答。historyを考慮するが、数値の改変・推測・概算は絶対禁止。")
 
+class CharacterOverview(dspy.Signature):
+    """
+    キャラクター全体の概要を説明し、深掘りできるジャンルを提示する。
+    
+    **目的**：
+    - キャラクターの特徴、強み、弱みを簡潔に説明
+    - フレームデータを基に主要な技を紹介
+    - さらに詳しく知りたいジャンル（技カテゴリ）をリスト形式で提示
+    
+    **構成**：
+    [1] キャラクター概要（特徴、立ち回りの傾向）
+    [2] 主要な技の紹介（フレームデータから）
+    [3] さらに詳しく知りたい場合（技カテゴリ別の質問例を提示）
+    """
+    character = dspy.InputField(desc="キャラクター名")
+    frame_data = dspy.InputField(desc="そのキャラの全技データ（SQLiteから取得）")
+    question = dspy.InputField(desc="ユーザーの質問")
+    answer = dspy.OutputField(desc="構造化された概要と深掘りガイド。[1]概要、[2]主要技、[3]深掘り質問例の形式。")
+
 class CoachAnswer(dspy.Signature):
     """
     あなたは経験豊富なスマブラコーチです。Contextと会話履歴に基づき、冷静かつ客観的な分析と実用的なアドバイスを提供してください。
@@ -248,6 +267,10 @@ def search_frame_data(char_name, move_name):
     SQLiteからフレームデータを検索（ハルシネーション防止版）
     
     正確な数値データのみを返し、LLMによる推測を防ぐ
+    
+    Args:
+        char_name: キャラクター名
+        move_name: 技名（空の場合は全技を返す）
     """
     if not os.path.exists(FRAME_DB_PATH):
         return "【エラー】フレームデータベースが見つかりません"
@@ -255,30 +278,52 @@ def search_frame_data(char_name, move_name):
     conn = sqlite3.connect(FRAME_DB_PATH)
     c = conn.cursor()
     
-    query = """
-        SELECT
-            c.name,
-            m.move_name,
-            m.move_category,
-            m.startup,
-            m.active_frames,
-            m.total_frames,
-            m.base_damage,
-            m.damage_1v1,
-            m.landing_lag,
-            m.shield_advantage,
-            m.note
-        FROM moves m
-        JOIN characters c ON m.char_id = c.id
-        WHERE c.name LIKE ? AND m.move_name LIKE ?
-    """
+    # 技名が指定されていない場合は全技を検索
+    if not move_name or move_name == "None" or move_name == "":
+        query = """
+            SELECT
+                c.name,
+                m.move_name,
+                m.move_category,
+                m.startup,
+                m.active_frames,
+                m.total_frames,
+                m.base_damage,
+                m.damage_1v1,
+                m.landing_lag,
+                m.shield_advantage,
+                m.note
+            FROM moves m
+            JOIN characters c ON m.char_id = c.id
+            WHERE c.name LIKE ?
+            ORDER BY m.move_category, m.id
+        """
+        c.execute(query, (f'%{char_name}%',))
+    else:
+        query = """
+            SELECT
+                c.name,
+                m.move_name,
+                m.move_category,
+                m.startup,
+                m.active_frames,
+                m.total_frames,
+                m.base_damage,
+                m.damage_1v1,
+                m.landing_lag,
+                m.shield_advantage,
+                m.note
+            FROM moves m
+            JOIN characters c ON m.char_id = c.id
+            WHERE c.name LIKE ? AND m.move_name LIKE ?
+        """
+        c.execute(query, (f'%{char_name}%', f'%{move_name}%'))
     
-    c.execute(query, (f'%{char_name}%', f'%{move_name}%'))
     rows = c.fetchall()
     conn.close()
     
     if not rows:
-        return f"【データなし】{char_name}の{move_name}に関するフレームデータが見つかりませんでした。"
+        return f"【データなし】{char_name}の{move_name if move_name else '技'}に関するフレームデータが見つかりませんでした。"
     
     # 構造化されたデータとして返す
     result = f"=== {char_name}の{move_name} 正確なフレームデータ ===\n\n"
@@ -489,6 +534,7 @@ class SmashBrain(dspy.Module):
         self.classify = dspy.ChainOfThought(IntentClassifier)
         self.generate = dspy.ChainOfThought(CoachAnswer)
         self.frame_answer = dspy.ChainOfThought(FrameDataAnswer)
+        self.char_overview = dspy.ChainOfThought(CharacterOverview)
     
     def forward(self, question, history=""):
         """
@@ -532,19 +578,43 @@ class SmashBrain(dspy.Module):
         # 2. 情報検索
         context = ""
         is_frame_data_query = False
+        is_character_overview = False
         
         if "frame" in intent or "data" in intent:
-            if char:
-                context = search_frame_data(char, move if move else "")
+            if char and move:
+                # 技が指定されている場合
+                context = search_frame_data(char, move)
                 is_frame_data_query = True
+            elif char:
+                # キャラのみ指定：概要モードへ
+                context = search_frame_data(char, "")
+                is_character_overview = True
             else:
+                context = search_theory(question)
+        elif char and move:
+            # intentがtheoryでもキャラと技が両方抽出された場合はフレームデータを検索
+            context = search_frame_data(char, move)
+            is_frame_data_query = True
+        elif char and not move:
+            # キャラ名のみの質問：概要を返す
+            frame_context = search_frame_data(char, "")
+            if "【データなし】" not in frame_context:
+                context = frame_context
+                is_character_overview = True
+            else:
+                # フレームデータが見つからない場合は理論を検索
                 context = search_theory(question)
         else:
             context = search_theory(question)
             
         # 3. 回答生成 (Thinking Model: 最強のPro/Expを使用)
+        
+        # キャラクター概要モード：概要 + 深掘りジャンル提示
+        if is_character_overview and "===正確なフレームデータ===" in context:
+            print(f"📖 Using CharacterOverview mode for {char}")
+            response = self.char_overview(character=char, frame_data=context, question=question)
         # フレームデータの場合は専用のSignatureを使用（ハルシネーション防止）
-        if is_frame_data_query and "===正確なフレームデータ===" in context:
+        elif is_frame_data_query and "===正確なフレームデータ===" in context:
             print("🛡️ Using FrameDataAnswer signature (hallucination prevention)")
             # スレッド文脈を保持したままフレームデータを正確に回答
             response = self.frame_answer(frame_data=context, history=history, question=question)

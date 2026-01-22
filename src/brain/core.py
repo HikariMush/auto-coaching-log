@@ -154,24 +154,46 @@ class FrameDataAnswer(dspy.Signature):
     question = dspy.InputField(desc="ユーザーの質問")
     answer = dspy.OutputField(desc="frame_dataの数値をそのまま使った正確な回答。historyを考慮するが、数値の改変・推測・概算は絶対禁止。")
 
-class CharacterOverview(dspy.Signature):
+class InsufficientQueryHandler(dspy.Signature):
     """
-    キャラクター全体の概要を説明し、深掘りできるジャンルを提示する。
+    質問内容が不足している場合に、関連する話題を提示して深掘りを促す。
     
-    **目的**：
-    - キャラクターの特徴、強み、弱みを簡潔に説明
-    - フレームデータを基に主要な技を紹介
-    - さらに詳しく知りたいジャンル（技カテゴリ）をリスト形式で提示
+    **教訓（ヒカリ事例）**：
+    - 「ヒカリ」という単語だけでは質問が不明確
+    - 関連する話題を複数提示し、ユーザーに選択させる
+    - 各話題について具体的な質問例を示す
     
-    **構成**：
-    [1] キャラクター概要（特徴、立ち回りの傾向）
-    [2] 主要な技の紹介（フレームデータから）
-    [3] さらに詳しく知りたい場合（技カテゴリ別の質問例を提示）
+    **対応パターン**：
+    1. キャラ名のみ → キャラの特徴、主要技、立ち回り、対策など
+    2. 技名のみ → どのキャラの技か、どんな情報が欲しいか
+    3. 曖昧な用語 → その用語が関連する具体的なトピック
+    
+    **出力形式**：
+    [1] 提示された単語の簡単な説明
+    [2] 関連する話題（3-5個）
+    [3] 各話題の具体的な質問例
+    
+    例：
+    入力: 「ヒカリ」
+    出力:
+    [1] ヒカリは『ゼノブレイド2』から参戦した軽量級の剣士です。
+    [2] 関連する話題:
+        ① キャラ性能・能力値
+        ② 主要技のフレームデータ
+        ③ 立ち回りと戦術
+        ④ コンボルート
+        ⑤ キャラ対策
+    [3] 具体的な質問例:
+        ① 「ヒカリの体重や走行速度は？」
+        ② 「ヒカリの空前の発生フレームは？」
+        ③ 「ヒカリの立ち回りで意識すべきことは？」
+        ④ 「ヒカリの下投げコンボは？」
+        ⑤ 「ヒカリの対策を教えて」
     """
-    character = dspy.InputField(desc="キャラクター名")
-    frame_data = dspy.InputField(desc="そのキャラの全技データ（SQLiteから取得）")
-    question = dspy.InputField(desc="ユーザーの質問")
-    answer = dspy.OutputField(desc="構造化された概要と深掘りガイド。[1]概要、[2]主要技、[3]深掘り質問例の形式。")
+    keyword = dspy.InputField(desc="ユーザーが提示した単語（キャラ名、技名、用語など）")
+    available_data = dspy.InputField(desc="利用可能なデータ（フレームデータ、理論など）")
+    question = dspy.InputField(desc="ユーザーの元の質問")
+    answer = dspy.OutputField(desc="[1]簡単な説明、[2]関連話題リスト、[3]具体的な質問例。ユーザーが深掘りしやすい構成。")
 
 class CoachAnswer(dspy.Signature):
     """
@@ -534,7 +556,7 @@ class SmashBrain(dspy.Module):
         self.classify = dspy.ChainOfThought(IntentClassifier)
         self.generate = dspy.ChainOfThought(CoachAnswer)
         self.frame_answer = dspy.ChainOfThought(FrameDataAnswer)
-        self.char_overview = dspy.ChainOfThought(CharacterOverview)
+        self.insufficient_query = dspy.ChainOfThought(InsufficientQueryHandler)
     
     def forward(self, question, history=""):
         """
@@ -575,10 +597,19 @@ class SmashBrain(dspy.Module):
         char = classification.character
         move = classification.move
         
-        # 2. 情報検索
+        # 2. 質問の充足性をチェック
+        # 質問が短すぎる、または文脈が少ない場合は不足質問として扱う
+        is_insufficient = False
+        keyword = None
+        
+        # 質問が非常に短い（15文字以下）または疑問文でない場合
+        if len(question.strip()) < 15 and '？' not in question and '?' not in question:
+            is_insufficient = True
+            keyword = question.strip()
+        
+        # 3. 情報検索
         context = ""
         is_frame_data_query = False
-        is_character_overview = False
         
         if "frame" in intent or "data" in intent:
             if char and move:
@@ -586,9 +617,14 @@ class SmashBrain(dspy.Module):
                 context = search_frame_data(char, move)
                 is_frame_data_query = True
             elif char:
-                # キャラのみ指定：概要モードへ
-                context = search_frame_data(char, "")
-                is_character_overview = True
+                # キャラのみ指定：不足質問として扱う
+                frame_context = search_frame_data(char, "")
+                if "【データなし】" not in frame_context:
+                    context = frame_context
+                    is_insufficient = True
+                    keyword = char
+                else:
+                    context = search_theory(question)
             else:
                 context = search_theory(question)
         elif char and move:
@@ -596,23 +632,38 @@ class SmashBrain(dspy.Module):
             context = search_frame_data(char, move)
             is_frame_data_query = True
         elif char and not move:
-            # キャラ名のみの質問：概要を返す
+            # キャラ名のみの質問：不足質問として扱う
             frame_context = search_frame_data(char, "")
             if "【データなし】" not in frame_context:
                 context = frame_context
-                is_character_overview = True
+                is_insufficient = True
+                keyword = char
             else:
                 # フレームデータが見つからない場合は理論を検索
-                context = search_theory(question)
+                theory_context = search_theory(question)
+                if "関連する理論が見つかりませんでした" not in theory_context:
+                    context = theory_context
+                    is_insufficient = True
+                    keyword = question.strip()
+                else:
+                    context = theory_context
         else:
             context = search_theory(question)
+            # 理論検索でもデータが少ない場合は不足質問として扱う
+            if "関連する理論が見つかりませんでした" in context:
+                is_insufficient = True
+                keyword = question.strip()
             
-        # 3. 回答生成 (Thinking Model: 最強のPro/Expを使用)
+        # 4. 回答生成 (Thinking Model: 最強のPro/Expを使用)
         
-        # キャラクター概要モード：概要 + 深掘りジャンル提示
-        if is_character_overview and "===正確なフレームデータ===" in context:
-            print(f"📖 Using CharacterOverview mode for {char}")
-            response = self.char_overview(character=char, frame_data=context, question=question)
+        # 不足質問モード：関連話題を提示して深掘りを促す
+        if is_insufficient and keyword:
+            print(f"💡 Insufficient query detected: '{keyword}' - providing topic suggestions")
+            response = self.insufficient_query(
+                keyword=keyword,
+                available_data=context[:2000],  # データの先頭2000文字
+                question=question
+            )
         # フレームデータの場合は専用のSignatureを使用（ハルシネーション防止）
         elif is_frame_data_query and "===正確なフレームデータ===" in context:
             print("🛡️ Using FrameDataAnswer signature (hallucination prevention)")

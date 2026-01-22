@@ -20,27 +20,56 @@ from datetime import datetime
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GENERAL_KNOWLEDGE_FILE = Path("data/general_knowledge.jsonl")
+INGESTION_STATE_FILE = Path("data/general_knowledge_ingestion_state.json")
+
+def load_ingestion_state():
+    """ingestion状態を読み込み"""
+    if INGESTION_STATE_FILE.exists():
+        with open(INGESTION_STATE_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {"ingested_timestamps": []}
+
+def save_ingestion_state(state):
+    """ingestion状態を保存"""
+    INGESTION_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(INGESTION_STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 def load_general_knowledge():
-    """一般知識を読み込み"""
+    """一般知識を読み込み（未処理のみ）"""
     if not GENERAL_KNOWLEDGE_FILE.exists():
         print(f"❌ General knowledge file not found: {GENERAL_KNOWLEDGE_FILE}")
         return []
     
+    state = load_ingestion_state()
+    ingested_timestamps = set(state.get("ingested_timestamps", []))
+    
     entries = []
+    skipped = 0
     with open(GENERAL_KNOWLEDGE_FILE, 'r', encoding='utf-8') as f:
         for line in f:
             if line.strip():
                 try:
-                    entries.append(json.loads(line))
+                    entry = json.loads(line)
+                    timestamp = entry.get('timestamp', '')
+                    
+                    # すでに処理済みの場合はスキップ
+                    if timestamp in ingested_timestamps:
+                        skipped += 1
+                        continue
+                    
+                    entries.append(entry)
                 except json.JSONDecodeError:
                     continue
+    
+    if skipped > 0:
+        print(f"⏭️  Skipped {skipped} already ingested entries")
     
     return entries
 
 def ingest_to_pinecone(entries):
     """
-    一般知識をPineconeに登録
+    一般知識をPineconeに登録（重複処理を防ぐ）
     
     メタデータ:
     - is_general_knowledge: True（検索時に高優先度）
@@ -58,8 +87,13 @@ def ingest_to_pinecone(entries):
     # Gemini初期化
     genai.configure(api_key=GEMINI_API_KEY)
     
+    # ingestion状態を読み込み
+    state = load_ingestion_state()
+    ingested_timestamps = state.get("ingested_timestamps", [])
+    
     print(f"\n📊 Ingesting {len(entries)} general knowledge entries...")
     
+    success_count = 0
     for i, entry in enumerate(entries, 1):
         try:
             title = entry.get('title', 'Unknown')
@@ -91,12 +125,24 @@ def ingest_to_pinecone(entries):
                 }
             }])
             
+            # ingestion成功：タイムスタンプを記録
+            if timestamp not in ingested_timestamps:
+                ingested_timestamps.append(timestamp)
+            
             print(f"  [{i}/{len(entries)}] ✅ {title}")
+            success_count += 1
             
         except Exception as e:
             print(f"  [{i}/{len(entries)}] ❌ Error: {e}")
     
-    print(f"\n✅ Ingestion complete!")
+    # ingestion状態を保存
+    state["ingested_timestamps"] = ingested_timestamps
+    state["last_ingestion"] = datetime.now().isoformat()
+    state["total_ingested"] = len(ingested_timestamps)
+    save_ingestion_state(state)
+    
+    print(f"\n✅ Ingestion complete! ({success_count}/{len(entries)} succeeded)")
+    print(f"📋 Total knowledge entries: {len(ingested_timestamps)}")
 
 def main():
     print("="*70)

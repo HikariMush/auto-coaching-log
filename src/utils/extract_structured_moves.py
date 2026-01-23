@@ -44,7 +44,8 @@ def create_database():
             base_damage REAL,
             damage_1v1 REAL,
             landing_lag INTEGER,
-            shield_advantage TEXT,
+            shield_hitstun INTEGER,
+            shield_advantage INTEGER,
             note TEXT,
             raw_data TEXT,
             FOREIGN KEY (char_id) REFERENCES characters (id),
@@ -140,22 +141,29 @@ def parse_ground_moves(df: pd.DataFrame, start_row: int) -> List[Dict]:
         else:
             continue
         
+        # 発生フレームを判定持続から抽出
+        active_str = str(row[2]) if pd.notna(row[2]) else None
+        startup = None
+        if active_str:
+            startup = extract_number(active_str.split('-')[0])
+        
         # 数値データを抽出
         move_data = {
             'move_name': move_name,
             'move_category': current_category or '地上攻撃',
-            'active_frames': str(row[2]) if pd.notna(row[2]) else None,
+            'startup': startup,
+            'active_frames': active_str,
             'total_frames': extract_number(row[3]),
             'base_damage': extract_float(row[4]),
             'damage_1v1': extract_float(row[5]),
-            'shield_advantage': str(row[6]) if pd.notna(row[6]) else None,
+            'shield_hitstun': extract_number(row[6]),  # ガード硬直
             'note': str(row[7]) if pd.notna(row[7]) else None,
         }
         
-        # 発生フレームを判定持続から抽出
-        if move_data['active_frames']:
-            startup = extract_number(move_data['active_frames'].split('-')[0])
-            move_data['startup'] = startup
+        # ガード硬直差を計算：全体F - 発生F - ガード硬直F
+        if move_data['total_frames'] and move_data['startup'] and move_data['shield_hitstun']:
+            shield_adv = move_data['total_frames'] - move_data['startup'] - move_data['shield_hitstun']
+            move_data['shield_advantage'] = shield_adv
         
         moves.append(move_data)
     
@@ -198,22 +206,31 @@ def parse_aerial_moves(df: pd.DataFrame, start_row: int) -> List[Dict]:
         if sub_name and sub_name not in ['NaN', 'nan']:
             move_name = f"{move_name}_{sub_name}"
         
+        # 発生フレームを判定持続から抽出
+        active_str = str(row[2]) if pd.notna(row[2]) else None
+        startup = None
+        if active_str:
+            startup = extract_number(active_str.split('-')[0])
+        
         # 数値データを抽出
         move_data = {
             'move_name': move_name,
             'move_category': '空中攻撃',
-            'active_frames': str(row[2]) if pd.notna(row[2]) else None,
+            'startup': startup,
+            'active_frames': active_str,
             'total_frames': extract_number(row[3]),
             'base_damage': extract_float(row[4]),
             'damage_1v1': extract_float(row[5]),
+            'shield_hitstun': extract_number(row[7]),  # ガード硬直（列7）
             'landing_lag': extract_number(row[8]),
             'note': str(row[17]) if pd.notna(row[17]) else None,
         }
         
-        # 発生フレームを判定持続から抽出
-        if move_data['active_frames']:
-            startup = extract_number(move_data['active_frames'].split('-')[0])
-            move_data['startup'] = startup
+        # 空中技のガード硬直差を計算
+        # 空中技の場合: 着地隙 - ガード硬直F （負の値なら攻撃側が不利）
+        if move_data['landing_lag'] is not None and move_data['shield_hitstun'] is not None:
+            shield_adv = move_data['landing_lag'] - move_data['shield_hitstun']
+            move_data['shield_advantage'] = shield_adv
         
         moves.append(move_data)
     
@@ -278,11 +295,11 @@ def save_to_database(character_name: str, moves: List[Dict]):
     for move in moves:
         try:
             cursor.execute('''
-                INSERT OR REPLACE INTO moves 
-                (char_id, move_name, move_category, startup, active_frames, 
-                 total_frames, base_damage, damage_1v1, landing_lag, 
-                 shield_advantage, note)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO moves
+                (char_id, move_name, move_category, startup, active_frames,
+                 total_frames, base_damage, damage_1v1, landing_lag,
+                 shield_hitstun, shield_advantage, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 char_id,
                 move.get('move_name'),
@@ -293,6 +310,7 @@ def save_to_database(character_name: str, moves: List[Dict]):
                 move.get('base_damage'),
                 move.get('damage_1v1'),
                 move.get('landing_lag'),
+                move.get('shield_hitstun'),
                 move.get('shield_advantage'),
                 move.get('note')
             ))

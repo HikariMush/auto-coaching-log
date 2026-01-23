@@ -269,12 +269,13 @@ def create_coach(
     # Quality: Equivalent to 1.5 Pro
     # Speed: 5x faster than 2.0 Flash
     # Cost: Same as 2.0 Flash ($0.02/100 trials)
+    # DSPy 3.x uses LiteLLM integration via dspy.LM
     try:
-        lm = dspy.Google(model="models/gemini-2-5-flash", api_key=api_key)
+        lm = dspy.LM(model="gemini/gemini-2.0-flash-exp", api_key=api_key)
     except Exception as e:
-        print(f"[Warning] 2.5 Flash initialization failed: {e}. Using fallback.")
-        # Fallback to 1.5 Pro if 2.5 Flash not available
-        lm = dspy.Google(model="models/gemini-1-5-pro", api_key=api_key)
+        print(f"[Warning] 2.0 Flash initialization failed: {e}. Using fallback.")
+        # Fallback to 1.5 Flash if 2.0 not available
+        lm = dspy.LM(model="gemini/gemini-1.5-flash", api_key=api_key)
 
     dspy.settings.configure(lm=lm)
 

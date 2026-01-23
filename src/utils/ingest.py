@@ -16,7 +16,7 @@ Usage:
 import os
 import glob
 import time
-from google import genai
+import google.generativeai as genai
 from pinecone import Pinecone, ServerlessSpec
 from typing import List, Dict, Any
 
@@ -165,12 +165,16 @@ def embed_documents(
                 title=doc["title"],
             )
 
+            # Use ASCII-safe ID (Pinecone requirement)
+            vector_id = f"doc_{i:04d}"
+            
             vectors.append(
                 {
-                    "id": doc["filename"],  # Use filename as unique ID
+                    "id": vector_id,
                     "values": result["embedding"],
                     "metadata": {
                         "title": doc["title"],
+                        "filename": doc["filename"],
                         "text": doc["text"][:2000],  # Limit metadata text size
                     },
                 }

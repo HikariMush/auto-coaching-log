@@ -1,9 +1,14 @@
-name: SZ Auto Logger Ultimate
+name: Auto Coaching Log Processor
 
 on:
   workflow_dispatch: # 手動実行ボタン（テスト用）
   schedule:
-    - cron: '0 0,12 * * *' # 毎日 UTC 0:00(JST 9:00) と 12:00(JST 21:00)
+    - cron: '*/15 * * * *' # 15分ごと（1日96回）
+
+# 並列実行を防止（前の実行が終わるまで次の実行を待つ）
+concurrency:
+  group: coaching-log-processing
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -28,7 +33,7 @@ jobs:
           pip install google-genai groq patool google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
 
       # --- Step 1: Log Generation (事実の記録) ---
-      - name: Run Auto Logger (main.py)
+      - name: Run Auto Logger (coaching_log_processor.py)
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -36,7 +41,7 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
-        run: python main.py
+        run: python coaching_log_processor.py
 
       # --- Step 2: Knowledge Generalization (解釈の蓄積) ---
       # main.py が成功した場合のみ、続けて実行される

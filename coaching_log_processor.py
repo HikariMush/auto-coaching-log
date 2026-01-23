@@ -635,13 +635,16 @@ def notion_create_page_heavy(db_id, props, children):
     res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": props, "children": children[:100]})
     if res.status_code != 200:
         print(f"⚠️ Initial Post Failed ({res.status_code}). Retrying with SAFE MODE...", flush=True)
+        print(f"   Error Details: {res.text}", flush=True)
         safe_props = {}
         for key, val in props.items():
             if "title" in val: safe_props[key] = val; break
         if not safe_props:
-             content_text = props.get("名前", {}).get("title", [{}])[0].get("text", {}).get("content", "Log")
+             # 日本語プロパティ（コーチDB）と英語プロパティ（生徒DB）の両方に対応
+             content_text = props.get("名前", props.get("Name", {})).get("title", [{}])[0].get("text", {}).get("content", "Log")
              safe_props = {"Name": {"title": [{"text": {"content": content_text}}]}}
-        date_val = props.get("日付", {}).get("date", {}).get("start", "Unknown")
+        # 日付も両方のプロパティに対応
+        date_val = props.get("日付", props.get("Date", {})).get("date", {}).get("start", "Unknown")
         error_note = {"object": "block", "type": "callout", "callout": {"rich_text": [{"text": {"content": f"⚠️ Date Prop Missing. Date: {date_val}"}}]}}
         children.insert(0, error_note)
         res = requests.post("https://api.notion.com/v1/pages", headers=HEADERS, json={"parent": {"database_id": db_id}, "properties": safe_props, "children": children[:100]})
@@ -822,17 +825,23 @@ def main():
                 chunk_text = full_text[i:i+1900]
                 final_blocks.append({"object": "block", "type": "paragraph", "paragraph": {"rich_text": [{"text": {"content": chunk_text}}]}})
             
-            props = {
-                "名前": {"title": [{"text": {"content": f"{precise_datetime} {oname} 通話ログ"}}]}, 
+            # コーチ側のFallback DB用プロパティ（日本語）
+            fallback_props = {
+                "名前": {"title": [{"text": {"content": f"{precise_datetime} {oname} 通話ログ"}}]},
                 "日付": {"date": {"start": date_only}}
             }
 
             print("💾 Saving to Fallback DB (All Data)...")
-            notion_create_page_heavy(sanitize_id(FINAL_FALLBACK_DB_ID), copy.deepcopy(props), copy.deepcopy(final_blocks))
+            notion_create_page_heavy(sanitize_id(FINAL_FALLBACK_DB_ID), copy.deepcopy(fallback_props), copy.deepcopy(final_blocks))
             
+            # 生徒DB用プロパティ（英語 - Notion DB標準）
             if did and did != FINAL_FALLBACK_DB_ID:
+                student_props = {
+                    "Name": {"title": [{"text": {"content": f"{precise_datetime} {oname} 通話ログ"}}]},
+                    "Date": {"date": {"start": date_only}}
+                }
                 print(f"👤 Saving to Student DB ({oname})...")
-                notion_create_page_heavy(sanitize_id(did), copy.deepcopy(props), copy.deepcopy(final_blocks))
+                notion_create_page_heavy(sanitize_id(did), copy.deepcopy(student_props), copy.deepcopy(final_blocks))
             
             # Artifacts
             processed_folder_id = ensure_processed_folder()

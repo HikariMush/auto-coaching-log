@@ -23,20 +23,50 @@ A self-evolving AI coaching system that leverages RAG (Retrieval-Augmented Gener
 ├── requirements.txt               # Python dependencies
 ├── Dockerfile                     # Container definition
 ├── README.md                      # This file
-├── data/
-│   └── training_data.jsonl        # User corrections (Gold Standards)
-└── src/
-    ├── __init__.py
-    ├── main.py                    # Discord Bot entry point (async)
-    ├── brain/
-    │   ├── __init__.py
-    │   ├── raw_data/              # Knowledge base (*.txt files)
-    │   ├── retriever.py           # Pinecone + DSPy Retriever
-    │   ├── model.py               # Type B Coaching Logic
-    │   └── core.py                # (Legacy: frame data)
-    └── utils/
-        ├── __init__.py
-        └── ingest.py              # Data vectorization & Pinecone upload
+├── discord_bot.py                 # Discord Bot (Main - 推奨)
+├── coaching_log_processor.py      # コーチングログ自動処理
+├── .github/
+│   └── workflows/
+│       ├── auto_coaching_log.yml  # コーチングログ処理（15分ごと）
+│       ├── discord_bot.yml        # Discord Bot起動
+│       └── data_management.yml    # データ管理
+├── data/                          # Data files
+│   ├── training_data.jsonl        # User corrections (Gold Standards)
+│   ├── general_knowledge.jsonl    # General knowledge data
+│   ├── element_feedback.jsonl     # Element feedback data
+│   ├── qa_logs.jsonl              # Q&A logs
+│   └── ...                        # Other data files
+├── docs/                          # Documentation
+│   ├── PROJECT_GUIDE.md           # Project guide
+│   ├── BOT_USER_GUIDE.md          # Bot user guide
+│   ├── DSPY_DESIGN.md             # DSPy design documentation
+│   └── ...                        # Other documentation
+├── logs/                          # Log files
+│   └── excel_ingestion_log*.txt   # Ingestion logs
+├── plans/                         # Planning documents
+│   └── *.md                       # Various planning documents
+├── scripts/                       # Utility scripts
+│   ├── quickstart.sh              # Quick start script
+│   ├── setup_data.py              # Data setup script
+│   ├── ingest_general_knowledge.py # Knowledge ingestion
+│   └── ...                        # Other scripts
+├── src/                           # Source code
+│   ├── __init__.py
+│   ├── discord_bot_dspy.py        # Discord Bot (DSPy版・代替実装)
+│   ├── brain/
+│   │   ├── __init__.py
+│   │   ├── raw_data/              # Knowledge base (*.txt files)
+│   │   ├── retriever.py           # Pinecone + DSPy Retriever
+│   │   ├── model.py               # Type B Coaching Logic
+│   │   └── core.py                # Core logic
+│   └── utils/
+│       ├── __init__.py
+│       ├── ingest.py              # Data vectorization & Pinecone upload
+│       └── ...                    # Other utilities
+└── tests/                         # Test files
+    ├── test_integration.py        # Integration tests
+    ├── test_mario_extraction.py   # Mario data extraction tests
+    └── ...                        # Other test files
 ```
 
 ## 🚀 Quick Start
@@ -79,7 +109,11 @@ This script:
 ### 4. Run the Bot
 
 ```bash
-python -m src.main
+# メインのDiscord Bot（推奨）
+python discord_bot.py
+
+# または DSPy版
+python -m src.discord_bot_dspy
 ```
 
 The bot will:

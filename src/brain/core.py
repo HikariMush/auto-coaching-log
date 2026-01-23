@@ -313,6 +313,7 @@ def search_frame_data(char_name, move_name):
                 m.base_damage,
                 m.damage_1v1,
                 m.landing_lag,
+                m.shield_hitstun,
                 m.shield_advantage,
                 m.note
             FROM moves m
@@ -333,6 +334,7 @@ def search_frame_data(char_name, move_name):
                 m.base_damage,
                 m.damage_1v1,
                 m.landing_lag,
+                m.shield_hitstun,
                 m.shield_advantage,
                 m.note
             FROM moves m
@@ -348,10 +350,10 @@ def search_frame_data(char_name, move_name):
         return f"【データなし】{char_name}の{move_name if move_name else '技'}に関するフレームデータが見つかりませんでした。"
     
     # 構造化されたデータとして返す
-    result = f"=== {char_name}の{move_name} 正確なフレームデータ ===\n\n"
+    result = f"=== {char_name}の{move_name if move_name else '全技'} 正確なフレームデータ ===\n\n"
     
     for row in rows:
-        char, move, category, startup, active, total, base_dmg, dmg_1v1, landing, shield, note = row
+        char, move, category, startup, active, total, base_dmg, dmg_1v1, landing, shield_hitstun, shield_adv, note = row
         
         result += f"【技名】{move}\n"
         result += f"【カテゴリ】{category if category else '不明'}\n"
@@ -374,8 +376,12 @@ def search_frame_data(char_name, move_name):
         if landing is not None:
             result += f"【着地隙】{landing}F\n"
         
-        if shield:
-            result += f"【ガード硬直差】{shield}\n"
+        if shield_adv is not None:
+            # 正の値なら有利、負の値なら不利
+            if shield_adv > 0:
+                result += f"【ガード硬直差】+{shield_adv}F（防御側が有利）\n"
+            else:
+                result += f"【ガード硬直差】{shield_adv}F（攻撃側が不利）\n"
         
         if note:
             result += f"【備考】{note}\n"

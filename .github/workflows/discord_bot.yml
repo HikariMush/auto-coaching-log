@@ -1,10 +1,9 @@
-name: Run Discord Bot (DISABLED)
+name: Discord Bot (SmashZettel)
 
-# DISABLED: Bot should run locally or in dedicated server, not in GitHub Actions
 on:
-  # push:
-  #   branches: [ "main" ]
-  workflow_dispatch: # 手動実行ボタンのみ有効化
+  workflow_dispatch: # 手動実行ボタン
+  # 注意: Botは通常サーバーで常時起動すべき
+  # GitHub Actionsでの実行は開発・テスト用途のみ推奨
 
 jobs:
   run-bot:
@@ -28,9 +27,8 @@ jobs:
 
       - name: Run Discord Bot
         env:
-          # ここでSecretsを環境変数として渡している
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python discord_bot.py

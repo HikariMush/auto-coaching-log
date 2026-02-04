@@ -808,20 +808,20 @@ def main():
             full_text = transcribe_with_groq(chunks)
             
             # Analysis
-             meta, report, logs, mermaid_code = analyze_text_with_gemini(full_text, precise_datetime, candidate_raw_name)
-             
-             # DB Matching - Try registry key first if available
-             did = None
-             oname = meta['student_name']
-             
-             # Strategy 1: Use candidate_raw_name if it's a valid registry key
-             if candidate_raw_name and candidate_raw_name in STUDENT_REGISTRY:
-                 did = STUDENT_REGISTRY[candidate_raw_name]
-                 oname = candidate_raw_name
-                 print(f"✅ Direct Registry Match from filename: '{candidate_raw_name}' -> {did[:8]}...", flush=True)
-             else:
-                 # Strategy 2: Try to match Gemini's student_name result
-                 did, oname = find_best_student_match(meta['student_name'])
+            meta, report, logs, mermaid_code = analyze_text_with_gemini(full_text, precise_datetime, candidate_raw_name)
+            
+            # DB Matching - Try registry key first if available
+            did = None
+            oname = meta['student_name']
+            
+            # Strategy 1: Use candidate_raw_name if it's a valid registry key
+            if candidate_raw_name and candidate_raw_name in STUDENT_REGISTRY:
+                did = STUDENT_REGISTRY[candidate_raw_name]
+                oname = candidate_raw_name
+                print(f"✅ Direct Registry Match from filename: '{candidate_raw_name}' -> {did[:8]}...", flush=True)
+            else:
+                # Strategy 2: Try to match Gemini's student_name result
+                did, oname = find_best_student_match(meta['student_name'])
             
             # --- Build Notion Blocks (UPDATED) ---
             final_blocks = []

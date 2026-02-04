@@ -1,6 +1,64 @@
 # SmashZettel-Bot: Session Changelog & AI Thinking Flow
 
-**Session Date:** 2026-01-21  
+---
+
+## 🔧 SESSION: Student Notion Database Sync Fix
+**Session Date:** 2026-02-04
+**Commit:** 94756ef (Fix: Improve student name matching logic for Notion student DB sync)
+
+### ISSUE
+文字起こし結果ファイルが管理用データベースだけでなく生徒のNotionデータベースにも入らない問題が発生していた。
+
+### ROOT CAUSE
+- flacファイル名（例：「2-kiyamu.flac」）から「kiyamu」を正しく抽出
+- レジストリキーは「キャム kiyamu」という複合形式
+- Gemini分析後の生徒名マッチングが不完全で、レジストリの値（TargetID）を取得できなかった
+- 名前の不一致により `find_best_student_match()` が正確にマッチしていなかった
+
+### FIXES APPLIED
+
+#### 1. **Enhanced `find_best_student_match()` Function** (coaching_log_processor.py:244)
+```python
+# Strategy 2: Substring match 追加
+if query_lower in db_name.lower():
+    return STUDENT_REGISTRY[db_name], db_name  # ✅ "kiyamu" ⊂ "キャム kiyamu"
+
+# Strategy 3: Fuzzy match の改善
+cutoff を 0.4 → 0.5 に引き上げ  # より厳密に
+```
+
+#### 2. **Improved Logging in `detect_student_candidate_raw()`** (coaching_log_processor.py:303)
+- レジストリキー一覧を出力
+- マッチングプロセスの詳細をトレース可能に
+- デバッグ時の問題特定を容易に
+
+#### 3. **Filename-based Matching Priority** (coaching_log_processor.py:810)
+```python
+# Strategy 1: ファイル名から抽出したレジストリキーを直接使用
+if candidate_raw_name and candidate_raw_name in STUDENT_REGISTRY:
+    did = STUDENT_REGISTRY[candidate_raw_name]  # ✅ 直接 TargetID を取得
+    print(f"✅ Direct Registry Match from filename")
+else:
+    # Strategy 2: Gemini 分析結果でマッチングを試みる（フォールバック）
+    did, oname = find_best_student_match(meta['student_name'])
+```
+
+### RESULT
+✅ flacファイル名の生徒識別子が確実にレジストリと照合でき、生徒のNotionデータベースに正確にリンク
+✅ 生徒側のNotionページに自動ツッコミが復活
+
+### LOG OUTPUT EXPECTED
+```
+✅ Registry Match Found: File 'kiyamu' matches DB 'キャム kiyamu'
+✅ Direct Registry Match from filename: 'キャム kiyamu' -> [TargetID]...
+👤 Saving to Student DB (キャム kiyamu)...
+```
+
+---
+
+## 📊 SESSION BEFORE vs AFTER (2026-01-21)
+
+**Session Date:** 2026-01-21
 **Commit:** ebf9924 (Complete SmashZettel-Bot DSPy implementation)
 
 ---

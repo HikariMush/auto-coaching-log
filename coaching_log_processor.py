@@ -242,13 +242,36 @@ def load_student_registry():
     print(f"✅ Loaded {count} students into registry.", flush=True)
 
 def find_best_student_match(query_name):
-    if not query_name or not STUDENT_REGISTRY: return None, query_name
-    if query_name in STUDENT_REGISTRY: return STUDENT_REGISTRY[query_name], query_name
-    matches = difflib.get_close_matches(query_name, list(STUDENT_REGISTRY.keys()), n=1, cutoff=0.4)
-    if matches:
-        print(f"🎯 Fuzzy Match: '{query_name}' -> '{matches[0]}'", flush=True)
-        return STUDENT_REGISTRY[matches[0]], matches[0]
-    return None, query_name
+     """
+     生徒名を複数の戦略でレジストリにマッチングする。
+     1. 完全一致
+     2. 部分文字列一致（query_nameがレジストリキーに含まれる）
+     3. Fuzzy match（類似度）
+     """
+     if not query_name or not STUDENT_REGISTRY:
+         return None, query_name
+     
+     # Strategy 1: Exact match
+     if query_name in STUDENT_REGISTRY:
+         return STUDENT_REGISTRY[query_name], query_name
+     
+     query_lower = query_name.lower().strip()
+     
+     # Strategy 2: Substring match - query_name is contained in registry keys
+     # 例: query="kiyamu" でレジストリに "キャム kiyamu" がある場合にマッチ
+     for db_name in STUDENT_REGISTRY.keys():
+         if query_lower in db_name.lower():
+             print(f"✅ Substring Match: '{query_name}' found in '{db_name}'", flush=True)
+             return STUDENT_REGISTRY[db_name], db_name
+     
+     # Strategy 3: Fuzzy match with reasonable cutoff
+     matches = difflib.get_close_matches(query_name, list(STUDENT_REGISTRY.keys()), n=1, cutoff=0.5)
+     if matches:
+         print(f"🎯 Fuzzy Match: '{query_name}' -> '{matches[0]}'", flush=True)
+         return STUDENT_REGISTRY[matches[0]], matches[0]
+     
+     print(f"⚠️ No match found for: '{query_name}'. Returning None.", flush=True)
+     return None, query_name
 
 # --- Logic: Metadata Helpers ---
 
@@ -278,59 +301,68 @@ def extract_date_smart(filename, drive_created_time_iso):
     return now_jst.strftime('%Y-%m-%d %H:%M:%S'), now_jst.strftime('%Y-%m-%d')
 
 def detect_student_candidate_raw(file_list, original_archive_name):
-    """
-    ファイル名の一部が、Notionデータベース（STUDENT_REGISTRY）の登録名に含まれているかを厳密にチェックする。
-    例: ファイル名 '2-kiyamu.flac' (clean: kiyamu) -> DB名 'キャム kiyamu' に包含されるためヒット。
-    """
-    global STUDENT_REGISTRY
-    
-    ignore_files = ["raw.dat", "info.txt", "ds_store", "thumbs.db", "desktop.ini", "readme", "license"]
-    # hikariはコーチ（User）のため、候補から除外
-    ignore_names = ["hikari", "craig", "entrymonster", "bot", "ssb", "recording"] 
+     """
+     ファイル名の一部が、Notionデータベース（STUDENT_REGISTRY）の登録名に含まれているかを厳密にチェックする。
+     例: ファイル名 '2-kiyamu.flac' (clean: kiyamu) -> DB名 'キャム kiyamu' に包含されるためヒット。
+     """
+     global STUDENT_REGISTRY
+     
+     ignore_files = ["raw.dat", "info.txt", "ds_store", "thumbs.db", "desktop.ini", "readme", "license"]
+     # hikariはコーチ（User）のため、候補から除外
+     ignore_names = ["hikari", "craig", "entrymonster", "bot", "ssb", "recording"]
 
-    potential_candidates = []
+     potential_candidates = []
 
-    print("🔎 Scanning internal files for registry match...", flush=True)
-    
-    # 1. ファイルリストから候補文字列を抽出
-    for f in file_list:
-        basename = os.path.basename(f).lower()
-        if any(ign in basename for ign in ignore_files): continue
-        
-        name_part = os.path.splitext(basename)[0]
-        # "1-name", "2_name" などのプレフィクスを除去
-        clean_name = re.sub(r'^\d+[-_]?', '', name_part)
-        
-        if any(ign in clean_name for ign in ignore_names): continue
-        if len(clean_name) < 2: continue
-        
-        potential_candidates.append(clean_name)
+     print("🔎 Scanning internal files for registry match...", flush=True)
+     print(f"📝 Registry keys available: {list(STUDENT_REGISTRY.keys())}", flush=True)
+     
+     # 1. ファイルリストから候補文字列を抽出
+     for f in file_list:
+         basename = os.path.basename(f).lower()
+         if any(ign in basename for ign in ignore_files): continue
+         
+         name_part = os.path.splitext(basename)[0]
+         # "1-name", "2_name" などのプレフィクスを除去
+         clean_name = re.sub(r'^\d+[-_]?', '', name_part)
+         
+         if any(ign in clean_name for ign in ignore_names):
+             print(f"⏭️ Skipping ignore_name: '{clean_name}'", flush=True)
+             continue
+         if len(clean_name) < 2: continue
+         
+         print(f"✓ Candidate found: '{clean_name}'", flush=True)
+         potential_candidates.append(clean_name)
 
-    # 2. アーカイブ自体のファイル名も候補に加える
-    base_archive = os.path.basename(original_archive_name)
-    archive_clean = re.sub(r'\.zip|\.flac|\.mp3|\.wav', '', base_archive, flags=re.IGNORECASE)
-    archive_clean = re.sub(r'\d{4}-\d{2}-\d{2}', '', archive_clean).strip()
-    if len(archive_clean) > 2:
-        potential_candidates.append(archive_clean)
+     # 2. アーカイブ自体のファイル名も候補に加える
+     base_archive = os.path.basename(original_archive_name)
+     archive_clean = re.sub(r'\.zip|\.flac|\.mp3|\.wav', '', base_archive, flags=re.IGNORECASE)
+     archive_clean = re.sub(r'\d{4}-\d{2}-\d{2}', '', archive_clean).strip()
+     if len(archive_clean) > 2:
+         print(f"✓ Archive name candidate: '{archive_clean}'", flush=True)
+         potential_candidates.append(archive_clean)
 
-    # 3. データベース（Registry）との厳密な包含チェック
-    # ファイル名文字列(candidate) が DB名(db_name) に含まれているかを確認
-    if STUDENT_REGISTRY:
-        for candidate in potential_candidates:
-            cand_lower = candidate.lower()
-            for db_name in STUDENT_REGISTRY.keys():
-                # Registryキー（例: "キャム kiyamu"）の中に候補（"kiyamu"）が含まれるか
-                if cand_lower in db_name.lower():
-                    print(f"💡 Registry Match Found: File '{candidate}' matches DB '{db_name}'", flush=True)
-                    return db_name
+     # 3. データベース（Registry）との厳密な包含チェック
+     # ファイル名文字列(candidate) が DB名(db_name) に含まれているかを確認
+     if STUDENT_REGISTRY:
+         for candidate in potential_candidates:
+             cand_lower = candidate.lower()
+             for db_name in STUDENT_REGISTRY.keys():
+                 # Registryキー（例: "キャム kiyamu"）の中に候補（"kiyamu"）が含まれるか
+                 if cand_lower in db_name.lower():
+                     print(f"✅ Registry Match Found: File '{candidate}' matches DB '{db_name}'", flush=True)
+                     return db_name
+                 else:
+                     print(f"  ✗ Checking '{cand_lower}' against '{db_name.lower()}' - no match", flush=True)
+     else:
+         print(f"⚠️ STUDENT_REGISTRY is empty!", flush=True)
 
-    # 4. マッチしなかった場合、Geminiへのヒントとして候補文字列をそのまま返す（レガシー挙動）
-    if potential_candidates:
-        fallback = potential_candidates[0]
-        print(f"⚠️ No direct registry match. Using raw hint: {fallback}", flush=True)
-        return fallback
+     # 4. マッチしなかった場合、Geminiへのヒントとして候補文字列をそのまま返す（レガシー挙動）
+     if potential_candidates:
+         fallback = potential_candidates[0]
+         print(f"⚠️ No direct registry match. Using raw hint: {fallback}", flush=True)
+         return fallback
 
-    return None
+     return None
 
 # --- 3. Audio Pipeline ---
 
@@ -776,10 +808,20 @@ def main():
             full_text = transcribe_with_groq(chunks)
             
             # Analysis
-            meta, report, logs, mermaid_code = analyze_text_with_gemini(full_text, precise_datetime, candidate_raw_name)
-            
-            # DB Matching
-            did, oname = find_best_student_match(meta['student_name'])
+             meta, report, logs, mermaid_code = analyze_text_with_gemini(full_text, precise_datetime, candidate_raw_name)
+             
+             # DB Matching - Try registry key first if available
+             did = None
+             oname = meta['student_name']
+             
+             # Strategy 1: Use candidate_raw_name if it's a valid registry key
+             if candidate_raw_name and candidate_raw_name in STUDENT_REGISTRY:
+                 did = STUDENT_REGISTRY[candidate_raw_name]
+                 oname = candidate_raw_name
+                 print(f"✅ Direct Registry Match from filename: '{candidate_raw_name}' -> {did[:8]}...", flush=True)
+             else:
+                 # Strategy 2: Try to match Gemini's student_name result
+                 did, oname = find_best_student_match(meta['student_name'])
             
             # --- Build Notion Blocks (UPDATED) ---
             final_blocks = []

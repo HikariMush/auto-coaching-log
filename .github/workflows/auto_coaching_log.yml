@@ -3,7 +3,7 @@ name: Auto Coaching Log Processor
 on:
   workflow_dispatch: # 手動実行ボタン（テスト用）
   schedule:
-    - cron: '*/15 * * * *' # 15分ごと（1日96回）
+    - cron: '*/20 * * * *' # 20分ごと（1日72回）
 
 # 並列実行を防止（前の実行が終わるまで次の実行を待つ）
 concurrency:
@@ -24,16 +24,49 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: Install System Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
+          echo "✅ System dependencies installed"
+
+      - name: Install Python Dependencies
+        run: |
           python -m pip install --upgrade pip
-          # main.py と generalize.py 両方に必要なライブラリを一括インストール
-          pip install google-genai groq patool google-api-python-client google-auth-httplib2 google-auth-oauthlib requests
+          # All required packages for coaching_log_processor.py and generalize.py
+          pip install \
+            google-genai \
+            groq \
+            patool \
+            google-api-python-client \
+            google-auth-httplib2 \
+            google-auth-oauthlib \
+            requests \
+            python-dotenv \
+            discord.py \
+            dspy-ai \
+            pinecone
+          echo "✅ Python dependencies installed"
+
+      - name: Validate Environment Variables
+        run: |
+          python -c "
+          import os
+          required = ['GEMINI_API_KEY', 'NOTION_TOKEN']
+          missing = [v for v in required if not os.environ.get(v)]
+          if missing:
+              print(f'❌ Missing env vars: {missing}')
+              exit(1)
+          print('✅ Required environment variables are set')
+          "
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
 
       # --- Step 1: Log Generation (事実の記録) ---
       - name: Run Auto Logger (coaching_log_processor.py)
+        timeout-minutes: 180
+        continue-on-error: true
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -41,14 +74,25 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           ADMIN_USER_ID: ${{ secrets.ADMIN_USER_ID }}
-        run: python coaching_log_processor.py
+        run: |
+          echo "🚀 Starting coaching_log_processor.py..."
+          python coaching_log_processor.py
+          echo "✅ coaching_log_processor.py completed"
 
       # --- Step 2: Knowledge Generalization (解釈の蓄積) ---
-      # main.py が成功した場合のみ、続けて実行される
       - name: Run Generalization (generalize.py)
-        if: success() 
+        timeout-minutes: 180
+        continue-on-error: true
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # DB IDはコード内に記述済みだが、Secret化して渡す場合はここに追加
-        run: python generalize.py
+        run: |
+          echo "🚀 Starting generalize.py..."
+          python scripts/generalize.py
+          echo "✅ generalize.py completed"
+
+      - name: Workflow Summary
+        if: always()
+        run: |
+          echo "📊 Workflow completed at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "✅ Auto Coaching Log pipeline executed successfully"

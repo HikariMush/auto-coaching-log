@@ -1,10 +1,33 @@
 import os
+import sys
 import time
 import json
 import requests
 import re
 from google import genai
 from google.genai import types
+
+# --- Environment Variable Validation ---
+def validate_environment():
+    """環境変数をチェックし、不足している場合はエラーを出力して終了"""
+    required_vars = ["NOTION_TOKEN", "GEMINI_API_KEY"]
+    missing_vars = []
+    
+    for var in required_vars:
+        if not os.getenv(var):
+            missing_vars.append(var)
+    
+    if missing_vars:
+        print("❌ CRITICAL ERROR: Missing required environment variables!", flush=True)
+        for var in missing_vars:
+            print(f"   - {var}", flush=True)
+        print("\n📝 Please set these variables in your .env file or GitHub Actions secrets:", flush=True)
+        print("   NOTION_TOKEN: Your Notion integration token")
+        print("   GEMINI_API_KEY: Your Google Gemini API key")
+        sys.exit(1)
+
+# Run validation at script start
+validate_environment()
 
 # --- Config ---
 SOURCE_LOG_DB_ID = "2e01bc8521e380ffaf28c2ab9376b00d"
@@ -244,61 +267,121 @@ def save_theory(theory, log_id):
 # --- Main ---
 def main():
     global ACTIVE_MODEL_ID
-    print("--- Generalization Started (Dynamic Latest-Model Search Mode) ---")
+    print("--- Generalization Started (Dynamic Latest-Model Search Mode) ---", flush=True)
     
-    # 待機ループ: 有効なモデルが見つかるまで粘る
-    while True:
-        ACTIVE_MODEL_ID = resolve_best_model()
-        if ACTIVE_MODEL_ID:
-            break
-        print("⏳ Waiting 60s for models to become available...")
-        time.sleep(60)
-
-    has_more = True
-    while has_more:
-        query = {
-            "filter": {
-                "property": "AI処理済み",
-                "checkbox": {"equals": False}
-            },
-            "page_size": 10,
-            "sorts": [{"property": "日付", "direction": "descending"}]
-        }
+    try:
+        # 待機ループ: 有効なモデルが見つかるまで粘る
+        max_model_wait = 10  # 最大10回試行（最大600秒）
+        attempt = 0
+        while attempt < max_model_wait:
+            ACTIVE_MODEL_ID = resolve_best_model()
+            if ACTIVE_MODEL_ID:
+                print(f"✅ Model resolved: {ACTIVE_MODEL_ID}", flush=True)
+                break
+            attempt += 1
+            print(f"⏳ Waiting 60s for models to become available... (Attempt {attempt}/{max_model_wait})", flush=True)
+            time.sleep(60)
         
-        try:
-            res = requests.post(f"https://api.notion.com/v1/databases/{SOURCE_LOG_DB_ID}/query", headers=HEADERS, json=query)
-            logs = res.json().get("results", [])
-        except Exception as e:
-            print(f"❌ Failed to fetch logs: {e}")
-            time.sleep(10)
-            continue
+        if not ACTIVE_MODEL_ID:
+            print("❌ CRITICAL: Could not resolve any model after max attempts", flush=True)
+            sys.exit(1)
+
+        has_more = True
+        error_count = 0
+        max_consecutive_errors = 5
         
-        if not logs:
-            print("ℹ️ No more unprocessed logs found.")
-            has_more = False
-            break
-
-        print(f"🔍 Processing batch of {len(logs)} logs with {ACTIVE_MODEL_ID}...")
-
-        for log in logs:
-            print(f"\nProcessing Log: {log['id']}")
-            content = get_page_content(log["id"])
-            if len(content) < 30: 
-                mark_log_as_processed(log["id"])
+        while has_more:
+            query = {
+                "filter": {
+                    "property": "AI処理済み",
+                    "checkbox": {"equals": False}
+                },
+                "page_size": 10,
+                "sorts": [{"property": "日付", "direction": "descending"}]
+            }
+            
+            try:
+                res = requests.post(
+                    f"https://api.notion.com/v1/databases/{SOURCE_LOG_DB_ID}/query",
+                    headers=HEADERS,
+                    json=query,
+                    timeout=30
+                )
+                if res.status_code != 200:
+                    print(f"⚠️ Notion API error ({res.status_code}): {res.text[:200]}", flush=True)
+                    error_count += 1
+                    if error_count >= max_consecutive_errors:
+                        print(f"❌ Max consecutive errors reached. Exiting.", flush=True)
+                        break
+                    time.sleep(10)
+                    continue
+                
+                logs = res.json().get("results", [])
+                error_count = 0  # Reset error count on success
+                
+            except requests.exceptions.Timeout:
+                print(f"⚠️ Request timeout. Retrying...", flush=True)
+                error_count += 1
+                time.sleep(10)
+                continue
+            except Exception as e:
+                print(f"❌ Failed to fetch logs: {e}", flush=True)
+                error_count += 1
+                if error_count >= max_consecutive_errors:
+                    print(f"❌ Max consecutive errors reached. Exiting.", flush=True)
+                    break
+                time.sleep(10)
                 continue
             
-            theories = generate_theories(content)
-            
-            if not theories:
-                 mark_log_as_processed(log["id"])
-                 continue
+            if not logs:
+                print("ℹ️ No more unprocessed logs found.", flush=True)
+                has_more = False
+                break
 
-            for t in theories:
-                save_theory(t, log["id"])
-                time.sleep(1) 
-                
-            mark_log_as_processed(log["id"])
-            time.sleep(2)
+            print(f"🔍 Processing batch of {len(logs)} logs with {ACTIVE_MODEL_ID}...", flush=True)
+
+            for log in logs:
+                try:
+                    log_id = log.get('id')
+                    print(f"\n📄 Processing Log: {log_id}", flush=True)
+                    content = get_page_content(log_id)
+                    if len(content) < 30:
+                        print(f"   ⊘ Content too short, skipping", flush=True)
+                        mark_log_as_processed(log_id)
+                        continue
+                    
+                    theories = generate_theories(content)
+                    
+                    if not theories:
+                        print(f"   ⊘ No theories extracted, marking as processed", flush=True)
+                        mark_log_as_processed(log_id)
+                        continue
+
+                    for t in theories:
+                        save_theory(t, log_id)
+                        time.sleep(1)
+                    
+                    mark_log_as_processed(log_id)
+                    time.sleep(2)
+                    
+                except Exception as e:
+                    print(f"   ❌ Error processing log {log_id}: {e}", flush=True)
+                    try:
+                        mark_log_as_processed(log_id)
+                    except:
+                        pass
+                    continue
+        
+        print("\n✅ Generalization completed successfully", flush=True)
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Interrupted by user", flush=True)
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Fatal error in main loop: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
